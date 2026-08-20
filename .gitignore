@@ -1,0 +1,6 @@
+cache/
+__pycache__/
+*.pyc
+_test_write.xlsx
+*.xlsx
+config.json
