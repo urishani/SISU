@@ -47,7 +47,10 @@ WATCHED_FILES = (
     "field_map.py",
 )
 RELOAD_SENTINEL = APP_DIR / "cache" / ".reload"
+SCHEMA_EXCEL = APP_DIR / "master our program.xlsx"
 DEFAULT_EXCEL = APP_DIR / "Data enter - bulk - MASTER our program.xlsx"
+if not DEFAULT_EXCEL.exists() and SCHEMA_EXCEL.exists():
+    DEFAULT_EXCEL = SCHEMA_EXCEL
 NAVY = "#1F3651"
 BG = "#F4F1EA"
 WHITE = "#FFFFFF"

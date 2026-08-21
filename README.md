@@ -13,7 +13,9 @@ Or double-click `run.bat`.
 
 ## Excel file
 
-Point the app at your catalog workbook (`Data enter - bulk - MASTER our program.xlsx` or another `.xlsx`). Only orange header columns are filled. The workbook itself is not stored in this repository.
+`master our program.xlsx` is the shared table schema: header row only, including orange columns the app fills. It has no catalog data.
+
+Your working catalog (`Data enter - bulk - MASTER our program.xlsx`) stays on your machine and is not committed. Point the app at that file for day-to-day use. Only orange header columns are written.
 
 ## Settings
 
