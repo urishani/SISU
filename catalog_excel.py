@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from copy import copy
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
@@ -51,9 +53,21 @@ HEADER_TO_FIELD: dict[str, str] = {
     "israeli price (shekel)": "price_ils",
     "description (english)": "description_en",
     "description (hebrew)": "description_he",
+    "cover image url": "cover_image_url",
+    "cover page image url": "cover_image_url",
+    "cover page url": "cover_image_url",
+    "back image url": "back_image_url",
+    "back page image url": "back_image_url",
+    "back page url": "back_image_url",
     "comments": "comments",
     "keywords": "keywords",
 }
+
+ORANGE_FILL = PatternFill(fill_type="solid", fgColor="FFFFC000")
+REQUIRED_COLORED_HEADERS = (
+    "Cover image URL",
+    "Back image URL",
+)
 
 BLANK_FILLS = {
     None,
@@ -102,8 +116,27 @@ class CatalogWorkbook:
             raise FileNotFoundError(f"Excel file not found: {self.path}")
         self.workbook: Workbook = load_workbook(self.path)
         self.sheet: Worksheet = self.workbook.active
+        self._ensure_image_url_columns()
         self.all_columns: list[dict[str, Any]] = self._detect_all_columns()
         self.columns: list[dict[str, Any]] = [col for col in self.all_columns if col["colored"]]
+
+    def _ensure_image_url_columns(self) -> None:
+        existing = {str(cell.value or "").strip() for cell in self.sheet[1] if cell.value}
+        template = self.sheet["D1"]
+        column = self.sheet.max_column
+        for header in REQUIRED_COLORED_HEADERS:
+            if header in existing:
+                continue
+            column += 1
+            cell = self.sheet.cell(1, column, header)
+            if template.has_style:
+                cell.font = copy(template.font)
+                cell.border = copy(template.border)
+                cell.alignment = copy(template.alignment)
+                cell.number_format = template.number_format
+                cell.protection = copy(template.protection)
+            cell.fill = ORANGE_FILL
+            self.sheet.column_dimensions[get_column_letter(column)].width = 28
 
     def _detect_all_columns(self) -> list[dict[str, Any]]:
         columns: list[dict[str, Any]] = []

@@ -55,6 +55,8 @@ EXCEL_TARGETS: dict[str, str] = {
     "description": "Description (Hebrew)",
     "comments": "comments",
     "keywords": "Keywords",
+    "cover_image_url": "Cover image URL",
+    "back_image_url": "Back image URL",
 }
 
 CORE_FIELDS = {
@@ -74,6 +76,8 @@ CORE_FIELDS = {
     "price_ils",
     "description",
     "dimensions",
+    "cover_image_url",
+    "back_image_url",
 }
 
 LABEL_MAP_KEYS = {
@@ -262,11 +266,13 @@ def apply_field(book: Any, field: str, value: str) -> bool:
     from book_crawler import (
         apply_identifier,
         extract_year,
+        format_person_name,
         map_cover,
         parse_cm_triplet,
         parse_pages,
         parse_price,
         parse_weight_kg,
+        _looks_like_person_name,
     )
 
     value = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -280,7 +286,17 @@ def apply_field(book: Any, field: str, value: str) -> bool:
         book.publisher = value
         return True
     if field == "author" and empty("author"):
-        book.author = value
+        book.author = format_person_name(value) or value
+        return bool(book.author)
+    if field in {"author_en", "author_he"}:
+        formatted = format_person_name(value) or value
+        captured = book.captured_fields()
+        if formatted and not captured.get(field):
+            book.set_captured(field, formatted)
+            return True
+        return False
+    if field in {"cover_image_url", "back_image_url"} and empty(field):
+        setattr(book, field, value)
         return True
     if field == "title" and empty("title"):
         book.title = value
@@ -336,6 +352,13 @@ def apply_field(book: Any, field: str, value: str) -> bool:
     if field == "description" and empty("description"):
         book.description = value
         return True
+    if field == "translated":
+        captured = book.captured_fields()
+        text = format_person_name(value) if _looks_like_person_name(value) and len(value.split()) >= 2 else value
+        if text and not captured.get("translated"):
+            book.set_captured("translated", text)
+            return True
+        return False
     if field == "language":
         value = isolate_language(value)
         if not value:

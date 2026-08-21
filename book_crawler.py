@@ -85,6 +85,8 @@ FILLABLE_FIELDS = (
     "thickness_cm",
     "price_ils",
     "description",
+    "cover_image_url",
+    "back_image_url",
 )
 LABEL_MAP: dict[str, tuple[str, ...]] = {
     "publisher": ("publisher", "הוצאה", "הוצאה לאור", "מוציא לאור", "הוצאת", "manufacturer"),
@@ -180,6 +182,8 @@ class Book:
     thickness_cm: str = ""
     price_ils: str = ""
     description: str = ""
+    cover_image_url: str = ""
+    back_image_url: str = ""
     extra: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -433,8 +437,20 @@ class Book:
             "price_ils": format_price(self.price_ils),
             "description_he": desc_he,
             "description_en": desc_en,
+            "cover_image_url": clean(self.cover_image_url),
+            "back_image_url": clean(self.back_image_url),
             "url": self.url,
         }
+        if captured.get("author_en"):
+            author_en = captured.get("author_en") or author_en
+        if captured.get("author_he"):
+            author_he = captured.get("author_he") or author_he
+        fields["author_en"] = format_person_name(author_en)
+        fields["author_he"] = format_person_name(author_he)
+        if captured.get("translated"):
+            fields["translated"] = format_person_name(captured["translated"]) if _looks_like_person_name(
+                captured["translated"]
+            ) else captured["translated"]
         for name, value in captured.items():
             if name not in fields or not fields[name]:
                 fields[name] = value
@@ -497,6 +513,88 @@ def split_lang(text: str | None) -> tuple[str, str]:
     if has_hebrew(text):
         return text, ""
     return "", text
+
+
+_NAME_PARTICLES = {
+    "da",
+    "de",
+    "del",
+    "della",
+    "der",
+    "di",
+    "el",
+    "la",
+    "le",
+    "van",
+    "von",
+    "bin",
+    "ibn",
+    "al",
+    "ben",
+    "mac",
+    "mc",
+    "בן",
+    "בת",
+    "אל",
+    "אבן",
+    "דה",
+    "די",
+    "ואן",
+    "פון",
+}
+
+
+def _looks_like_person_name(text: str | None) -> bool:
+    value = clean(text)
+    if not value:
+        return False
+    compact = value.casefold()
+    if compact in {"yes", "no", "true", "false", "כן", "לא", "y", "n"}:
+        return False
+    if re.fullmatch(r"[\d\s\-]+", value):
+        return False
+    words = value.split()
+    return 1 <= len(words) <= 8
+
+
+def _split_people(text: str) -> list[str]:
+    value = clean(text)
+    if not value:
+        return []
+    if re.search(r"\s+(?:and|&|/|ו)\s+", value, re.I) or ";" in value:
+        parts = re.split(r"\s+(?:and|&|/|ו)\s+|;", value, flags=re.I)
+        return [clean(part) for part in parts if clean(part)]
+    if "," in value:
+        left, right = value.split(",", 1)
+        if len(left.split()) >= 2 and len(right.split()) >= 2:
+            return [clean(left), clean(right)]
+    return [value]
+
+
+def _format_one_person(name: str) -> str:
+    value = clean(name)
+    if not value:
+        return ""
+    if "," in value:
+        family, given = (part.strip() for part in value.split(",", 1))
+        if family and given:
+            return f"{family}, {given}"
+        return value
+    tokens = value.split()
+    if len(tokens) == 1:
+        return value
+    if len(tokens) >= 3 and tokens[-2].casefold() in _NAME_PARTICLES:
+        family = f"{tokens[-2]} {tokens[-1]}"
+        given = " ".join(tokens[:-2])
+        return f"{family}, {given}" if given else family
+    family = tokens[-1]
+    given = " ".join(tokens[:-1])
+    return f"{family}, {given}" if given else family
+
+
+def format_person_name(text: str | None) -> str:
+    people = [_format_one_person(part) for part in _split_people(text or "")]
+    return "; ".join(part for part in people if part)
 
 
 def normalize_name(text: str | None) -> str:
@@ -955,9 +1053,10 @@ def extract_book_from_html(html: str, url: str) -> Book:
     prefer_catalog_price(book, soup)
     book.year = extract_year(book.year)
     book.title = clean(book.title)
-    book.author = clean(book.author)
+    book.author = format_person_name(book.author) or clean(book.author)
     book.publisher = clean(book.publisher)
     book.description = clean(book.description)
+    fill_book_images(book, soup, url, html)
     book.mark_origin_fields()
     return book
 
@@ -989,6 +1088,147 @@ def normalize_url(base: str, href: str) -> str | None:
         return None
     cleaned = parsed._replace(fragment="")
     return urlunparse(cleaned)
+
+
+def _largest_srcset_url(srcset: str) -> str:
+    best = ""
+    best_width = -1
+    for part in srcset.split(","):
+        bits = part.strip().split()
+        if not bits:
+            continue
+        url = bits[0]
+        width = 0
+        if len(bits) > 1 and bits[1].lower().endswith("w"):
+            try:
+                width = int(bits[1][:-1])
+            except ValueError:
+                width = 0
+        if width >= best_width:
+            best_width = width
+            best = url
+    return best
+
+
+def _image_key(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.casefold().rstrip("/")
+    return path or url.casefold()
+
+
+def _absolute_image_url(page_url: str, raw: str) -> str:
+    href = (raw or "").strip()
+    if not href or href.startswith("data:"):
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    absolute = urljoin(page_url, href)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if parsed.scheme == "http":
+        parsed = parsed._replace(scheme="https")
+    return urlunparse(parsed._replace(fragment=""))
+
+
+def _image_url_from_tag(img: Tag, page_url: str) -> str:
+    srcset = str(img.get("srcset") or img.get("data-srcset") or "")
+    raw = _largest_srcset_url(srcset) if srcset else ""
+    if not raw:
+        raw = str(
+            img.get("data-zoom-src")
+            or img.get("data-original")
+            or img.get("data-src")
+            or img.get("content")
+            or img.get("src")
+            or ""
+        )
+    return _absolute_image_url(page_url, raw.split(" ")[0])
+
+
+def fill_book_images(book: Book, soup: BeautifulSoup, page_url: str, html: str = "") -> None:
+    skip_bits = ("logo", "icon", "sprite", "placeholder", "pixel", "blank", "spacer", "avatar", "badge", "payment")
+    cover_hints = ("cover", "front", "כריכה", "קדמ")
+    back_hints = ("back", "rear", "גב הספר", "אחור", "גב ")
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def remember(url: str, hint: str) -> None:
+        url = (url or "").strip()
+        if not url:
+            return
+        key = _image_key(url)
+        if not key or key in seen:
+            return
+        blob = f"{url} {hint}".casefold()
+        if any(bit in blob for bit in skip_bits):
+            return
+        seen.add(key)
+        found.append((url, hint.casefold()))
+
+    selectors = (
+        ".product__media img, media-gallery img, .product-gallery img, "
+        "#book-inr-main img, .product.media img, .fotorama img, "
+        "[data-media-id] img, .gallery img, img[itemprop='image'], "
+        ".product__media-item img, .product-image img"
+    )
+    for img in soup.select(selectors):
+        if not isinstance(img, Tag):
+            continue
+        hint_parts = [
+            str(img.get("alt") or ""),
+            " ".join(img.get("class") or []),
+            str(img.get("id") or ""),
+        ]
+        parent = img.parent
+        if isinstance(parent, Tag):
+            hint_parts.append(" ".join(parent.get("class") or []))
+            hint_parts.append(parent.get_text(" ", strip=True)[:80])
+        remember(_image_url_from_tag(img, page_url), " ".join(hint_parts))
+
+    for tag in soup.select(
+        ".product__media a[href], media-gallery a[href], .product-gallery a[href], "
+        "#book-inr-main a[href], [data-media-id] a[href]"
+    ):
+        href = str(tag.get("href") or "")
+        if re.search(r"\.(?:jpe?g|png|webp|gif)(?:\?|$)", href, re.I):
+            remember(_absolute_image_url(page_url, href), str(tag.get("aria-label") or tag.get_text(" ", strip=True)))
+
+    og = soup.select_one("meta[property='og:image'], meta[name='og:image']")
+    if og:
+        remember(_absolute_image_url(page_url, str(og.get("content") or "")), "cover og")
+
+    for item in json_ld_objects(html or ""):
+        image = item.get("image")
+        urls = image if isinstance(image, list) else [image] if image else []
+        for entry in urls:
+            if isinstance(entry, dict):
+                remember(_absolute_image_url(page_url, str(entry.get("url") or entry.get("contentUrl") or "")), "schema")
+            else:
+                remember(_absolute_image_url(page_url, str(entry or "")), "schema")
+
+    cover = ""
+    back = ""
+    leftovers: list[str] = []
+    for url, hint in found:
+        if not cover and any(token in hint or token in url.casefold() for token in cover_hints):
+            cover = url
+            continue
+        if not back and any(token in hint or token in url.casefold() for token in ("backcover", "back-cover", "rear", "אחור")):
+            back = url
+            continue
+        if not back and ("גב" in hint and "לוגו" not in hint):
+            back = url
+            continue
+        leftovers.append(url)
+    if not cover and leftovers:
+        cover = leftovers.pop(0)
+    if not back and leftovers:
+        back = leftovers[0]
+    if cover and not book.cover_image_url:
+        book.cover_image_url = cover
+    if back and _image_key(back) != _image_key(cover) and not book.back_image_url:
+        book.back_image_url = back
 
 
 def slugs_from_title(title: str) -> list[str]:

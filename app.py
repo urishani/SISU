@@ -832,13 +832,8 @@ class BookCatalogApp(tk.Tk):
         self._set_links(_book_link_items(book))
         description = fields["description_he"] or book.description or ""
         self._set_description(description)
-        new_fields = {part for part in (book.extra.get("new_fields") or "").split(",") if part}
-        desc_from = book.source_display("description")
-        if desc_from:
-            self.desc_new_label.configure(text=f"from {desc_from}")
-            self.desc_new_label.pack(side="left", padx=(8, 0))
-        elif "description" in new_fields:
-            self.desc_new_label.configure(text="new from publisher")
+        if "description" in new_fields:
+            self.desc_new_label.configure(text="new")
             self.desc_new_label.pack(side="left", padx=(8, 0))
         else:
             self.desc_new_label.pack_forget()
@@ -1369,8 +1364,6 @@ class BookCatalogApp(tk.Tk):
             display = value
             bg, fg = "#F4F1EA", "#1B1B1B"
             font = ("Segoe UI", 10)
-        if source and not empty:
-            display = f"{display}\nfrom {source}"
         if link and not empty:
             fg = "#0B57D0"
             font = ("Segoe UI", 10, "underline")
@@ -1440,7 +1433,8 @@ class BookCatalogApp(tk.Tk):
 
         def add_field(key: str, label: str, value: str) -> None:
             is_new = key in new_fields or book.is_external_source(_source_field_key(key))
-            self._add_detail_row(label, value, is_new=is_new, source=_field_source_label(book, key))
+            link = value if key in {"cover_image_url", "back_image_url"} and str(value or "").startswith("http") else ""
+            self._add_detail_row(label, value, is_new=is_new, link=link)
 
         columns = self.excel_columns or []
         if columns:
