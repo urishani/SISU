@@ -10,11 +10,32 @@ from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, FeatureNotFound, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 ProgressFn = Callable[[str], None]
+
+
+def _choose_html_parser() -> str:
+    for name in ("lxml", "html.parser"):
+        try:
+            BeautifulSoup("<p></p>", name)
+            return name
+        except Exception:
+            continue
+    return "html.parser"
+
+
+HTML_PARSER = _choose_html_parser()
+
+
+def parse_html(markup: str) -> BeautifulSoup:
+    markup = markup or ""
+    try:
+        return BeautifulSoup(markup, HTML_PARSER)
+    except FeatureNotFound:
+        return BeautifulSoup(markup, "html.parser")
 
 HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
@@ -94,9 +115,9 @@ LABEL_MAP: dict[str, tuple[str, ...]] = {
         "year",
         "release date",
     ),
-    "pages": ("pages", "number of pages", "עמודים", "מספר עמודים", "page count"),
+    "pages": ("pages", "number of pages", "עמודים", "מספר עמודים", "מס' עמודים", "page count"),
     "isbn": ("isbn", "isbn-13", "isbn13", 'מסת"ב', "מסתב", "מסת״ב"),
-    "danacode": ("danacode", "דנאקוד", "דאנאקוד", "דנא קוד", "דנא-קוד"),
+    "danacode": ("danacode", "דנאקוד", "דאנאקוד", "דאנא קוד", "דנא קוד", "דנא-קוד"),
     "upc": ("upc", "ean", "barcode", "ברקוד", "gtin"),
     "cover": ("cover", "cover type", "format", "book format", "כריכה", "סוג כריכה"),
     "weight": ("weight", "משקל"),
@@ -260,9 +281,22 @@ class Book:
 
     def merge_missing(self, other: "Book") -> list[str]:
         filled: list[str] = []
+        filled.extend(remember_danacode(self, other.danacode, other.field_source_url("danacode") or other.url))
         for name in FILLABLE_FIELDS:
+            if name == "danacode":
+                continue
             current = str(getattr(self, name, "") or "").strip()
             incoming = str(getattr(other, name, "") or "").strip()
+            if name == "price_ils" and incoming:
+                try:
+                    better = not current or float(format_price(incoming)) > float(format_price(current) or 0)
+                except ValueError:
+                    better = not current
+                if better:
+                    self.price_ils = incoming
+                    filled.append("price_ils")
+                    self.record_field_source("price_ils", other.field_source_url("price_ils") or other.url)
+                continue
             if not current and incoming:
                 setattr(self, name, incoming)
                 filled.append(name)
@@ -272,28 +306,71 @@ class Book:
         other_captured = other.captured_fields()
         captured = self.captured_fields()
         for name, incoming in other_captured.items():
+            if name == "language":
+                from field_map import isolate_language
+
+                incoming = isolate_language(incoming)
             if incoming and not captured.get(name):
                 captured[name] = incoming
                 filled.append(name)
                 self.record_field_source(name, other.field_source_url(name) or other.url)
         if captured:
             self._save_map("captured", captured)
-        if other.extra.get("page_fields") and not self.extra.get("page_fields"):
+        if other.extra.get("found_fields"):
+            self.extra["publisher_found"] = other.extra["found_fields"]
+        if other.extra.get("page_fields"):
             self.extra["page_fields"] = other.extra["page_fields"]
-        return filled
+        return list(dict.fromkeys(filled))
 
     def captured_fields(self) -> dict[str, str]:
-        return self._load_map("captured")
+        data = self._load_map("captured")
+        raw = data.get("language") or ""
+        if raw:
+            from field_map import isolate_language
+
+            cleaned = isolate_language(raw)
+            if cleaned != raw:
+                if cleaned:
+                    data["language"] = cleaned
+                else:
+                    data.pop("language", None)
+                self._save_map("captured", data)
+        return data
 
     def set_captured(self, name: str, value: str) -> None:
         data = self.captured_fields()
         text = str(value or "").strip()
+        if name == "language":
+            from field_map import isolate_language
+
+            text = isolate_language(text)
         if name and text and not data.get(name):
             data[name] = text
             self._save_map("captured", data)
 
     def unmatched_page_fields(self) -> list[tuple[str, str]]:
-        raw = self.extra.get("page_fields") or ""
+        return [(item["label"], item["value"]) for item in self._load_field_rows("page_fields")]
+
+    def publisher_found_fields(self) -> list[dict[str, str]]:
+        rows = self._load_field_rows("publisher_found")
+        if rows:
+            return rows
+        return self._load_field_rows("found_fields")
+
+    def danacode_short(self) -> str:
+        short = (
+            self.captured_fields().get("cat_number")
+            or self.extra.get("danacode_short")
+            or ""
+        ).strip()
+        digits = re.sub(r"\D", "", short)
+        long_code = re.sub(r"\D", "", self.danacode or "")
+        if digits and digits != long_code:
+            return digits
+        return ""
+
+    def _load_field_rows(self, key: str) -> list[dict[str, str]]:
+        raw = self.extra.get(key) or ""
         if not raw:
             return []
         try:
@@ -302,14 +379,15 @@ class Book:
             return []
         if not isinstance(data, list):
             return []
-        rows: list[tuple[str, str]] = []
+        rows: list[dict[str, str]] = []
         for item in data:
             if not isinstance(item, dict):
                 continue
             label = str(item.get("label") or "").strip()
             value = str(item.get("value") or "").strip()
+            field = str(item.get("field") or "").strip()
             if label and value:
-                rows.append((label, value))
+                rows.append({"label": label, "value": value, "field": field})
         return rows
 
     def mark_publisher_lookup(self, site: str, page: str = "", filled: list[str] | None = None, note: str = "") -> None:
@@ -343,6 +421,7 @@ class Book:
             "author_he": author_he,
             "upc": clean(self.upc),
             "danacode": clean(self.danacode),
+            "cat_number": self.danacode_short() or captured.get("cat_number", ""),
             "isbn": clean(self.isbn),
             "year": clean(self.year),
             "pages": clean(self.pages),
@@ -521,26 +600,57 @@ def apply_identifier(book: Book, raw: str) -> None:
     for kind, code in extract_codes(raw):
         if kind == "isbn" and not book.isbn:
             book.isbn = code
-        elif kind == "danacode" and not book.danacode:
-            book.danacode = code
+        elif kind == "danacode":
+            remember_danacode(book, code)
         elif kind == "upc" and not book.upc:
             book.upc = code
 
 
+def remember_danacode(book: Book, raw: str | None, source_url: str = "") -> list[str]:
+    """Keep the longer trade DanaCode and a shorter publisher/catalog code when both appear."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if len(digits) < 4:
+        return []
+    long_code = re.sub(r"\D", "", book.danacode or "")
+    short_code = re.sub(r"\D", "", book.danacode_short() or book.extra.get("danacode_short") or "")
+    url = (source_url or book.url or "").strip()
+    filled: list[str] = []
+
+    def set_short(code: str) -> None:
+        if not code or code == re.sub(r"\D", "", book.danacode or ""):
+            return
+        current_short = re.sub(r"\D", "", book.danacode_short() or book.extra.get("danacode_short") or "")
+        if current_short == code:
+            return
+        book.extra["danacode_short"] = code
+        book.set_captured("cat_number", code)
+        if url:
+            book.record_field_source("cat_number", url)
+        filled.append("cat_number")
+
+    if not long_code:
+        book.danacode = digits
+        if url:
+            book.record_field_source("danacode", url)
+        filled.append("danacode")
+        return filled
+    if digits == long_code:
+        return filled
+    if len(digits) > len(long_code):
+        set_short(long_code)
+        book.danacode = digits
+        if url:
+            book.record_field_source("danacode", url)
+        filled.append("danacode")
+        return filled
+    set_short(digits)
+    return filled
+
+
 def map_cover(text: str | None) -> str:
-    value = (text or "").lower().strip()
-    hebrew = (text or "").strip()
-    if hebrew in {"רכה", "כריכה רכה"} or "כריכה רכה" in hebrew or any(
-        word in value for word in ("paperback", "softcover", "soft cover")
-    ):
-        return "S"
-    if hebrew in {"קשה", "כריכה קשה"} or "כריכה קשה" in hebrew or any(
-        word in value for word in ("hardcover", "hard cover", "hardback")
-    ):
-        return "H"
-    if "board book" in value or "קרטון" in hebrew:
-        return "BB"
-    return ""
+    from field_map import cover_code
+
+    return cover_code(text)
 
 
 def parse_price(text: str | None) -> str:
@@ -560,6 +670,28 @@ def format_price(text: str | None) -> str:
         return f"{float(raw):.2f}"
     except ValueError:
         return str(text or "").strip()
+
+
+def prefer_catalog_price(book: Book, soup: BeautifulSoup) -> None:
+    """Use the list/catalog price when a sale price is shown struck through."""
+    catalog = ""
+    for block in soup.select(".price--on-sale .price__sale, .price__sale"):
+        struck = block.select_one("s, del, strike")
+        if struck:
+            catalog = parse_price(struck.get_text(" ", strip=True))
+            if catalog:
+                break
+    if not catalog:
+        for node in soup.find_all(string=re.compile(r"מחיר\s*קטלוגי|compare[-_ ]?at", re.I)):
+            parent = getattr(node, "parent", None)
+            if parent is None:
+                continue
+            container = parent.parent if parent.parent else parent
+            catalog = parse_price(container.get_text(" ", strip=True))
+            if catalog:
+                break
+    if catalog:
+        book.price_ils = catalog
 
 
 def parse_pages(text: str | None) -> str:
@@ -600,7 +732,7 @@ def parse_cm_triplet(text: str | None) -> tuple[str, str, str]:
 
 
 def json_ld_objects(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = parse_html(html)
     found: list[dict] = []
     for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
         raw = script.string or script.get_text() or ""
@@ -690,13 +822,23 @@ def labeled_value_pairs(soup: BeautifulSoup) -> dict[str, str]:
         if label and value and len(value) < 500:
             pairs.setdefault(label, value)
 
+    for row in soup.select(".flex"):
+        if not isinstance(row, Tag):
+            continue
+        value_el = row.select_one(".meta-value")
+        label_el = row.find(["b", "strong"])
+        if label_el and value_el:
+            remember(label_el.get_text(" ", strip=True), value_el.get_text(" ", strip=True))
+
     for prop in root.select("span.property, li, .additional-attributes-wrapper li, .product.attribute, tr"):
         if not isinstance(prop, Tag):
+            continue
+        if prop.select_one(".flex, .meta-value, .multicolumn-card"):
             continue
         strong = prop.find(["strong", "b", "th", "label"])
         if strong:
             label = strong.get_text(" ", strip=True)
-            clone = BeautifulSoup(str(prop), "lxml")
+            clone = parse_html(str(prop))
             strong_clone = clone.find(["strong", "b", "th", "label"])
             if strong_clone:
                 strong_clone.extract()
@@ -786,7 +928,7 @@ def fill_from_magento(book: Book, soup: BeautifulSoup) -> None:
 
 
 def extract_book_from_html(html: str, url: str) -> Book:
-    soup = BeautifulSoup(html, "lxml")
+    soup = parse_html(html)
     book = Book(url=url)
     for item in json_ld_objects(html):
         fill_from_schema(book, item)
@@ -810,6 +952,7 @@ def extract_book_from_html(html: str, url: str) -> Book:
             book.description = clean(ogd.get("content"))
     apply_identifier(book, url)
     book.cover_type = book.cover_type or map_cover(book.title)
+    prefer_catalog_price(book, soup)
     book.year = extract_year(book.year)
     book.title = clean(book.title)
     book.author = clean(book.author)
@@ -1149,7 +1292,7 @@ class BookCrawler:
 
             flush_candidates()
             return results
-        soup = BeautifulSoup(html, "lxml")
+        soup = parse_html(html)
 
         if is_product_page(soup, final_url):
             book = extract_book_from_html(html, final_url)
@@ -1188,7 +1331,7 @@ class BookCrawler:
                     try:
                         html, listing_url = self.fetch(listing_url)
                         self.report.listing_pages += 1
-                        soup = BeautifulSoup(html, "lxml")
+                        soup = parse_html(html)
                     except requests.RequestException:
                         self.report.listing_failed += 1
                         continue
@@ -1328,7 +1471,7 @@ class BookCrawler:
             except requests.RequestException:
                 html = ""
         if html:
-            soup = BeautifulSoup(html, "lxml")
+            soup = parse_html(html)
             if matched is None:
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
             elif fills_needed(matched, wanted) < len(wanted.missing_fields()) or not is_product_page(soup, resolved):
@@ -1354,7 +1497,7 @@ class BookCrawler:
                     html, final_url = self.fetch(candidate.url)
                 except requests.RequestException:
                     return candidate
-                soup = BeautifulSoup(html, "lxml")
+                soup = parse_html(html)
                 seen.add(_url_key(candidate.url))
                 richer = self._follow_book_cover_links(soup, final_url, book, seen, 0, candidate)
                 if richer:
@@ -1374,7 +1517,7 @@ class BookCrawler:
                     return found
             try:
                 html, final_url = self.fetch(origin + "/")
-                soup = BeautifulSoup(html, "lxml")
+                soup = parse_html(html)
                 homepage_links = collect_detail_links(soup, final_url, book) or collect_matching_links(
                     soup, final_url, book
                 )
@@ -1396,7 +1539,7 @@ class BookCrawler:
                     html, final_url = self.fetch(search_url)
                 except requests.RequestException:
                     continue
-                soup = BeautifulSoup(html, "lxml")
+                soup = parse_html(html)
                 page_book = extract_book_from_html(html, final_url)
                 matched = page_book if page_book.title and books_match(book, page_book) else None
                 if matched:
@@ -1453,6 +1596,13 @@ class BookCrawler:
             book.mark_publisher_lookup(publisher_url, note=note)
             return filled
         added = book.merge_missing(match)
+        findings = match.publisher_found_fields() or match._load_field_rows("found_fields")
+        if findings:
+            book.extra["publisher_found"] = json.dumps(findings, ensure_ascii=False)
+            self.progress("Fields found on the publisher book page:")
+            for item in findings:
+                mapped = item.get("field") or "not mapped"
+                self.progress(f"  {item['label']}: {item['value']}  [{mapped}]")
         if added:
             note = f"New from {host}: {', '.join(added)}"
             self.progress(note)

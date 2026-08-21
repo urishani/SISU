@@ -141,9 +141,72 @@ def load_aliases() -> dict[str, str]:
     return index
 
 
+_cover_values: dict[str, str] | None = None
+
+
+def load_cover_values() -> dict[str, str]:
+    global _cover_values
+    if _cover_values is not None:
+        return _cover_values
+    values: dict[str, str] = {}
+    if ALIASES_PATH.exists():
+        try:
+            raw = json.loads(ALIASES_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        mapping = raw.get("cover_values") if isinstance(raw, dict) else {}
+        if isinstance(mapping, dict):
+            for label, code in mapping.items():
+                key = normalize_label(str(label))
+                value = str(code or "").strip().upper()
+                if key and value in {"S", "H", "BB"}:
+                    values[key] = value
+    _cover_values = values
+    return values
+
+
+def isolate_language(value: str | None) -> str:
+    """Keep only the language itself when extra labels were glued into the same text."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    text = re.split(
+        r"\s+(?=שם הספר|שם המחבר|דאנאקוד|דנאקוד|דאנא קוד|ISBN|מסת|הוצאה|מס['׳]?\s*עמודים|סוג כריכה|ת\.\s*הוצאה)",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    text = re.sub(r"[:：].*$", "", text).strip(" :,-")
+    if len(text) > 40:
+        text = text.split()[0]
+    return text
+
+
+def cover_code(text: str | None) -> str:
+    compact = normalize_label(text or "")
+    if compact:
+        mapped = load_cover_values().get(compact)
+        if mapped:
+            return mapped
+    value = (text or "").lower().strip()
+    hebrew = (text or "").strip()
+    if hebrew in {"רכה", "רך", "כריכה רכה"} or "כריכה רכה" in hebrew or any(
+        word in value for word in ("paperback", "softcover", "soft cover")
+    ):
+        return "S"
+    if hebrew in {"קשה", "כריכה קשה"} or "כריכה קשה" in hebrew or any(
+        word in value for word in ("hardcover", "hard cover", "hardback")
+    ):
+        return "H"
+    if "board book" in value or "קרטון" in hebrew:
+        return "BB"
+    return ""
+
+
 def reload_aliases() -> None:
-    global _alias_index
+    global _alias_index, _cover_values
     _alias_index = None
+    _cover_values = None
     load_aliases()
 
 
@@ -231,15 +294,16 @@ def apply_field(book: Any, field: str, value: str) -> bool:
     if field == "isbn":
         before = book.isbn
         apply_identifier(book, value)
-        return book.isbn != before or book.danacode or book.upc
-    if field == "danacode" and empty("danacode"):
-        book.danacode = re.sub(r"\D", "", value)
-        return bool(book.danacode)
+        return book.isbn != before
+    if field == "danacode":
+        from book_crawler import remember_danacode
+
+        return bool(remember_danacode(book, value))
     if field == "upc" and empty("upc"):
         book.upc = re.sub(r"\D", "", value)
         return bool(book.upc)
     if field == "cover_type" and empty("cover_type"):
-        book.cover_type = map_cover(value)
+        book.cover_type = cover_code(value) or map_cover(value)
         return bool(book.cover_type)
     if field == "weight_kg" and empty("weight_kg"):
         book.weight_kg = parse_weight_kg(value)
@@ -272,6 +336,18 @@ def apply_field(book: Any, field: str, value: str) -> bool:
     if field == "description" and empty("description"):
         book.description = value
         return True
+    if field == "language":
+        value = isolate_language(value)
+        if not value:
+            return False
+        captured = book.captured_fields()
+        current = captured.get("language") or ""
+        cleaned = isolate_language(current)
+        if current and current == cleaned:
+            return False
+        captured["language"] = value
+        book._save_map("captured", captured)
+        return True
     if field in EXCEL_TARGETS and field not in CORE_FIELDS:
         captured = book.captured_fields()
         if value and not captured.get(field):
@@ -293,14 +369,20 @@ def apply_pairs(book: Any, pairs: dict[str, str]) -> list[str]:
 
 def attach_page_fields(book: Any, pairs: dict[str, str]) -> None:
     leftover: list[dict[str, str]] = []
+    found: list[dict[str, str]] = []
     for label, value in pairs.items():
-        if resolve_label(label):
+        field = resolve_label(label) or ""
+        if _noise(label, value) and not field:
             continue
-        if _noise(label, value):
+        snippet = value[:240]
+        found.append({"label": label, "value": snippet, "field": field})
+        if field or _noise(label, value):
             continue
-        leftover.append({"label": label, "value": value[:240]})
+        leftover.append({"label": label, "value": snippet})
         if len(leftover) >= 40:
             break
+    if found:
+        book.extra["found_fields"] = json.dumps(found, ensure_ascii=False)
     if leftover:
         book.extra["page_fields"] = json.dumps(leftover, ensure_ascii=False)
 
@@ -327,6 +409,13 @@ def collect_extra_pairs(soup: BeautifulSoup, html: str) -> dict[str, str]:
         if label and value and label not in pairs:
             pairs[label] = value
 
+    for row in soup.select(".flex"):
+        if not isinstance(row, Tag):
+            continue
+        value_el = row.select_one(".meta-value")
+        label_el = row.find(["b", "strong"])
+        if label_el and value_el:
+            remember(label_el.get_text(" ", strip=True), value_el.get_text(" ", strip=True))
     for row in soup.select("table tr, .product-attribute-specs-table tr, .additional-attributes-wrapper tr"):
         if not isinstance(row, Tag):
             continue

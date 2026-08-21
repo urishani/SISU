@@ -9,7 +9,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Or double-click `run.bat`.
+Or double-click `run.bat`. Search uses `lxml` when it is installed, and Python’s built-in HTML parser otherwise, so a clone does not fail with a missing tree-builder error.
 
 ## Excel file
 

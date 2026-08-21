@@ -100,6 +100,7 @@ class BookCatalogApp(tk.Tk):
         self._lookup_stop_btn: ttk.Button | None = None
         self._lookup_close_btn: ttk.Button | None = None
         self._lookup_running = False
+        self._found_popup: tk.Toplevel | None = None
         self._settings_popup: tk.Toplevel | None = None
         self._cancel = threading.Event()
         self._busy = False
@@ -1014,6 +1015,94 @@ class BookCatalogApp(tk.Tk):
             except tk.TclError:
                 pass
 
+    def _show_found_fields_popup(self, book: Book) -> None:
+        findings = book.publisher_found_fields()
+        if not findings:
+            return
+        self._close_found_fields_popup()
+        win = tk.Toplevel(self)
+        win.title("Fields found on the book page")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._close_found_fields_popup)
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Fields found on the book page", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(body, text=book.display_title(), wraplength=560).pack(anchor="w", pady=(2, 10))
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(wrap, bg=WHITE, highlightthickness=0)
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=WHITE)
+        inner.columnconfigure(0, weight=0)
+        inner.columnconfigure(1, weight=1)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        def _sync(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _sync)
+        canvas.bind("<Configure>", _sync)
+
+        def _on_mousewheel(event: tk.Event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        for row, item in enumerate(findings):
+            tk.Label(
+                inner,
+                text=item["label"],
+                bg=WHITE,
+                fg="#5A6570",
+                font=("Segoe UI", 10),
+                anchor="e",
+                justify="right",
+                wraplength=200,
+            ).grid(row=row, column=0, sticky="ne", padx=(12, 10), pady=6)
+            tk.Label(
+                inner,
+                text=item["value"],
+                bg=NEW_BG,
+                fg=NEW_FG,
+                font=("Segoe UI", 10),
+                anchor="w",
+                justify="left",
+                wraplength=340,
+                padx=10,
+                pady=6,
+            ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=4)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Close", command=self._close_found_fields_popup).pack(side="right")
+        self.update_idletasks()
+        width, height = 620, min(640, 180 + 36 * max(len(findings), 4))
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.minsize(480, 280)
+        win.lift()
+        win.focus_force()
+        self._found_popup = win
+
+    def _close_found_fields_popup(self) -> None:
+        win = self._found_popup
+        self._found_popup = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
     def _close_lookup_popup(self) -> None:
         self._lookup_running = False
         if self._lookup_bar is not None:
@@ -1158,6 +1247,8 @@ class BookCatalogApp(tk.Tk):
             )
         self._set_status(summary)
         self._complete_lookup_popup(summary)
+        if selected:
+            self._show_found_fields_popup(selected)
 
     def copy_description(self) -> None:
         text = self._description_text.strip()
@@ -1349,6 +1440,10 @@ class BookCatalogApp(tk.Tk):
                     value = captured.get(field, "")
                 if field == "price_ils":
                     value = format_price(value)
+                if field == "language":
+                    from field_map import isolate_language
+
+                    value = isolate_language(value)
                 add_field(field or header, header, value)
                 if field:
                     shown.add(field)
@@ -1366,21 +1461,36 @@ class BookCatalogApp(tk.Tk):
             if col.get("colored") or not field or field in shown:
                 continue
             value = fields.get(field) or captured.get(field) or ""
+            if field == "language":
+                from field_map import isolate_language
+
+                value = isolate_language(value)
             if value:
                 extra_rows.append((field, str(col["header"]), value))
                 shown.add(field)
         for name, value in captured.items():
             if name in shown or not value:
                 continue
-            extra_rows.append((name, name, value))
+            if name == "language":
+                from field_map import isolate_language
+
+                value = isolate_language(value)
+                if not value:
+                    continue
+            header = "Danacode (short)" if name == "cat_number" else name
+            extra_rows.append((name, header, value))
             shown.add(name)
+        short = book.danacode_short()
+        if short and "cat_number" not in shown:
+            extra_rows.append(("cat_number", "Danacode (short)", short))
+            shown.add("cat_number")
         if extra_rows:
             self._add_detail_section("Other catalog fields")
             for key, header, value in extra_rows:
                 add_field(key, header, value)
 
         leftover = book.unmatched_page_fields()
-        if leftover:
+        if leftover and not book.publisher_found_fields():
             self._add_detail_section("Also on the book page")
             for label, value in leftover[:20]:
                 self._add_detail_row(label, value)
@@ -1453,14 +1563,9 @@ def _book_urls(book: Book) -> list[str]:
 
 def _source_field_key(key: str) -> str:
     mapping = {
-        "title": "title",
         "title_he": "title",
-        "title_en": "title",
-        "author": "author",
         "author_he": "author",
-        "author_en": "author",
         "description_he": "description",
-        "description_en": "description",
     }
     return mapping.get(key, key)
 
