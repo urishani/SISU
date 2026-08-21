@@ -37,6 +37,7 @@ from publisher_sites import publishers_match, resolve_publisher_site
 APP_DIR = Path(__file__).resolve().parent
 WATCHED_FILES = (
     "app.py",
+    "app_update.py",
     "book_table.py",
     "book_crawler.py",
     "book_cache.py",
@@ -102,6 +103,8 @@ class BookCatalogApp(tk.Tk):
         self._lookup_running = False
         self._found_popup: tk.Toplevel | None = None
         self._settings_popup: tk.Toplevel | None = None
+        self._updating = False
+        self._update_declined = False
         self._cancel = threading.Event()
         self._busy = False
         self._ui_queue: queue.Queue = queue.Queue()
@@ -113,6 +116,7 @@ class BookCatalogApp(tk.Tk):
         self._mtimes = _source_mtimes()
         self.after(120, self._drain_queue)
         self.after(900, self._watch_for_reload)
+        self.after(2000, lambda: self.check_for_updates(silent=True))
 
     def _setup_style(self) -> None:
         style = ttk.Style(self)
@@ -137,6 +141,9 @@ class BookCatalogApp(tk.Tk):
             text="Crawl the first site, fill gaps from the next URLs, then write orange Excel columns",
             style="Sub.TLabel",
         ).pack(side="left", padx=12, pady=(18, 8))
+        ttk.Button(header, text="Check for updates", command=lambda: self.check_for_updates(silent=False)).pack(
+            side="right", padx=(0, 8), pady=12
+        )
         ttk.Button(header, text="Field report", command=self.open_field_report).pack(side="right", padx=(0, 8), pady=12)
         ttk.Button(header, text="Settings", command=self.open_settings).pack(side="right", padx=16, pady=12)
 
@@ -784,6 +791,14 @@ class BookCatalogApp(tk.Tk):
             elif kind == "more_error":
                 self._finish_more(None)
                 messagebox.showerror("Could not look up more details", str(payload))
+            elif kind == "update_result":
+                silent, info = payload
+                self._on_update_result(bool(silent), info)
+            elif kind == "update_error":
+                silent, text = payload
+                self._on_update_error(bool(silent), str(text))
+            elif kind == "update_applied":
+                self._finish_self_update()
         self.after(120, self._drain_queue)
 
     def _finish_search(self, books: list[Book], cancelled: bool, report: CrawlReport | None = None) -> None:
@@ -1527,8 +1542,110 @@ class BookCatalogApp(tk.Tk):
     def _set_status(self, text: str) -> None:
         self.status.set(text)
 
-    def _watch_for_reload(self) -> None:
+    def check_for_updates(self, silent: bool = False) -> None:
+        if self._updating:
+            return
         if self._busy:
+            if not silent:
+                messagebox.showinfo(
+                    "Update",
+                    "Wait until Search or More finishes, then check for updates again.",
+                )
+            else:
+                self.after(8000, lambda: self.check_for_updates(silent=True))
+            return
+        thread = threading.Thread(target=self._run_update_check, args=(silent,), daemon=True)
+        thread.start()
+
+    def _run_update_check(self, silent: bool) -> None:
+        from app_update import UpdateError, check_for_update
+
+        try:
+            info = check_for_update()
+        except UpdateError as exc:
+            self._ui_queue.put(("update_error", (silent, str(exc))))
+            return
+        except Exception as exc:
+            self._ui_queue.put(("update_error", (silent, str(exc))))
+            return
+        self._ui_queue.put(("update_result", (silent, info)))
+
+    def _on_update_result(self, silent: bool, info: object) -> None:
+        if info is None:
+            if silent:
+                return
+            messagebox.showinfo("Update", "SISU is already up to date.")
+            self._set_status("SISU is already up to date.")
+            return
+        if silent and self._update_declined:
+            self._set_status("A newer SISU version is available. Click Check for updates when you are ready.")
+            return
+        from app_update import UpdateInfo
+
+        if not isinstance(info, UpdateInfo):
+            return
+        if info.dirty:
+            messagebox.showwarning(
+                "Cannot update automatically",
+                "A newer SISU version is available, but this copy has local file changes "
+                "so it cannot update itself.\n\nUpdate this folder by hand, or wait until local changes are cleared.",
+            )
+            return
+        if not messagebox.askokcancel(
+            "Update SISU",
+            "A newer version of SISU is available.\n\n"
+            "If you continue, SISU will:\n"
+            "• download the update from GitHub\n"
+            "• install any new libraries\n"
+            "• close this window and start the new version\n\n"
+            "Finish any work you want to keep first.\n\n"
+            "Update and restart now?",
+        ):
+            self._update_declined = True
+            self._set_status("Update postponed. SISU will keep this version until you choose Check for updates.")
+            return
+        self._apply_self_update()
+
+    def _on_update_error(self, silent: bool, text: str) -> None:
+        self._updating = False
+        if self._busy:
+            return
+        self.search_btn.configure(state="normal")
+        if silent:
+            self._set_status("Could not check for SISU updates right now.")
+            return
+        messagebox.showerror("Update failed", text)
+
+    def _apply_self_update(self) -> None:
+        self._updating = True
+        self.search_btn.configure(state="disabled")
+        self.more_btn.configure(state="disabled")
+        self._set_status("Updating SISU from GitHub. The window will restart when it is done.")
+        thread = threading.Thread(target=self._run_self_update, daemon=True)
+        thread.start()
+
+    def _run_self_update(self) -> None:
+        from app_update import UpdateError, apply_update
+
+        try:
+            apply_update()
+        except UpdateError as exc:
+            self._ui_queue.put(("update_error", (False, str(exc))))
+            return
+        except Exception as exc:
+            self._ui_queue.put(("update_error", (False, str(exc))))
+            return
+        self._ui_queue.put(("update_applied", None))
+
+    def _finish_self_update(self) -> None:
+        messagebox.showinfo(
+            "Update complete",
+            "SISU has been updated. This window will close and the new version will open.",
+        )
+        self._restart_app("Restarting the updated SISU…")
+
+    def _watch_for_reload(self) -> None:
+        if self._busy or self._updating:
             self.after(1000, self._watch_for_reload)
             return
         current = _source_mtimes()
@@ -1544,11 +1661,15 @@ class BookCatalogApp(tk.Tk):
         self.after(800, self._watch_for_reload)
 
     def _hot_replace(self) -> None:
-        self._set_status("Code changed — restarting window, cache kept…")
+        self._restart_app("Code changed — restarting window, cache kept…")
+
+    def _restart_app(self, reason: str = "") -> None:
+        if reason:
+            self._set_status(reason)
         self.update_idletasks()
-        python = sys.executable
-        script = str(Path(__file__).resolve())
-        subprocess.Popen([python, script], cwd=str(APP_DIR), close_fds=True)
+        from app_update import restart_process
+
+        restart_process()
         self.after(150, self.destroy)
 
 

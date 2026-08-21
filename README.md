@@ -2,14 +2,15 @@
 
 Windows desktop app that crawls Israeli bookstore and publisher sites, lists books, and writes selected titles into the orange columns of a catalog Excel file.
 
+Git and Python are already installed, and this SISU folder is already on the computer.
+
 ## Run
 
-```bat
-pip install -r requirements.txt
-python app.py
-```
+Double-click `install.bat` once. It pulls the latest files, installs any new libraries, and puts a **SISU** icon on the desktop.
 
-Or double-click `run.bat`. Search uses `lxml` when it is installed, and Python’s built-in HTML parser otherwise, so a clone does not fail with a missing tree-builder error.
+Day to day, start from that desktop icon. After the app opens, it checks GitHub for a newer version. If one is found, it warns you, then updates, installs any new libraries, and restarts. **Check for updates** in the header does the same check on demand.
+
+Search uses `lxml` when it is installed, and Python’s built-in HTML parser otherwise.
 
 ## Excel file
 
