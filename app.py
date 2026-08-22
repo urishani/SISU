@@ -28,7 +28,7 @@ from app_config import (
     normalize_site_url,
     save_config,
 )
-from book_crawler import Book, BookCrawler, CrawlCancelled, CrawlReport, format_price, parse_site_urls, site_display_name, site_host
+from book_crawler import Book, BookCrawler, CrawlCancelled, CrawlReport, format_person_name, format_price, parse_site_urls, site_display_name, site_host
 from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
 from field_map import ALIASES_PATH, REPORT_JSON_PATH, reload_aliases, write_field_report
@@ -83,7 +83,13 @@ TAB_ON = "#C47B2B"
 TAB_OFF = "#D9D0C3"
 NEW_FG = "#146C43"
 NEW_BG = "#E4F7EA"
+ERROR_FG = "#B42318"
+ERROR_BG = "#FDECEC"
+FINAL_FG = "#0B57D0"
+FINAL_BG = "#E8F0FE"
 DEFAULT_URLS = "\n".join(DEFAULT_SEARCH_URLS)
+UPDATE_CHECK_FIRST_MS = 2_000
+UPDATE_CHECK_EVERY_MS = 15 * 60 * 1000
 
 
 class BookCatalogApp(tk.Tk):
@@ -133,7 +139,9 @@ class BookCatalogApp(tk.Tk):
         self._found_popup: tk.Toplevel | None = None
         self._settings_popup: tk.Toplevel | None = None
         self._updating = False
-        self._update_declined = False
+        self._update_check_running = False
+        self._update_declined_remote = ""
+        self._update_check_after: str | int | None = None
         self._cancel = threading.Event()
         self._busy = False
         self._ui_queue: queue.Queue = queue.Queue()
@@ -145,7 +153,7 @@ class BookCatalogApp(tk.Tk):
         self._mtimes = _source_mtimes()
         self.after(120, self._drain_queue)
         self.after(900, self._watch_for_reload)
-        self.after(2000, lambda: self.check_for_updates(silent=True))
+        self.after(UPDATE_CHECK_FIRST_MS, self._periodic_update_check)
 
     def _setup_style(self) -> None:
         style = ttk.Style(self)
@@ -331,9 +339,10 @@ class BookCatalogApp(tk.Tk):
         self.detail_canvas.grid(row=0, column=0, sticky="nsew")
         detail_scroll.grid(row=0, column=1, sticky="ns")
         self.detail_inner.columnconfigure(0, minsize=168)
-        self.detail_inner.columnconfigure(1, minsize=20)
+        self.detail_inner.columnconfigure(1, minsize=50)
         self.detail_inner.columnconfigure(2, weight=1)
         self._value_labels: list[tk.Label] = []
+        self._expanded_detail_keys: set[str] = set()
 
         def _sync_detail_scroll(_event=None) -> None:
             self.detail_canvas.configure(scrollregion=self.detail_canvas.bbox("all"))
@@ -1674,7 +1683,7 @@ class BookCatalogApp(tk.Tk):
             return
         self._close_lookup_popup()
 
-    def _complete_lookup_popup(self, summary: str) -> None:
+    def _complete_lookup_popup(self, summary: str, failed: bool = False) -> None:
         self._lookup_running = False
         if self._lookup_bar is not None:
             try:
@@ -1686,7 +1695,7 @@ class BookCatalogApp(tk.Tk):
                     self._lookup_bar["value"] = self._lookup_bar.cget("maximum")
                 except tk.TclError:
                     pass
-        self._lookup_title.set("Lookup finished")
+        self._lookup_title.set("Lookup failed" if failed else "Lookup finished")
         self._lookup_status.set(summary)
         self._lookup_hint.set("Read the crawl log above, then click Close.")
         self._append_lookup_log("")
@@ -1815,6 +1824,7 @@ class BookCatalogApp(tk.Tk):
         )
         remap: dict[str, str] = {}
         updated = 0
+        errors = 0
         try:
             for index, book in enumerate(books, start=1):
                 self._ui_queue.put(
@@ -1825,7 +1835,9 @@ class BookCatalogApp(tk.Tk):
                 filled = crawler.enrich_one_book(book)
                 if old_key != book.key():
                     remap[old_key] = book.key()
-                if filled:
+                if book.extra.get("lookup_error"):
+                    errors += 1
+                elif filled:
                     updated += 1
             save_working(self._current_payload())
             try:
@@ -1837,6 +1849,7 @@ class BookCatalogApp(tk.Tk):
                     "more_done",
                     {
                         "updated": updated,
+                        "errors": errors,
                         "total": len(books),
                         "cancelled": False,
                         "remap": remap,
@@ -1922,19 +1935,41 @@ class BookCatalogApp(tk.Tk):
         elif self._selected_book:
             self.more_btn.configure(state="normal")
         updated = int((payload or {}).get("updated") or 0)
+        errors = int((payload or {}).get("errors") or 0)
         total = int((payload or {}).get("total") or 0)
         publisher = (payload or {}).get("publisher") or "this publisher"
-        if payload and payload.get("cancelled"):
+        failed = False
+        err_note = ""
+        if selected:
+            err_note = (selected.extra.get("lookup_note") or "").strip()
+        if payload is None:
+            failed = True
+            summary = "Publisher lookup failed."
+        elif payload.get("cancelled"):
             summary = f"Stopped. Filled {updated} of {total} book(s) from {publisher}."
+        elif errors and updated:
+            summary = (
+                f"Filled missing details for {updated} of {total} book(s) from {publisher}. "
+                f"{errors} failed because the publisher site returned an error."
+            )
+        elif errors:
+            failed = True
+            if err_note:
+                summary = f"Publisher lookup failed for {publisher}. {err_note}"
+            else:
+                summary = (
+                    f"Publisher lookup failed for {publisher}. "
+                    "The site returned an error, so this is not a missing-book result."
+                )
         elif updated:
             summary = f"Filled missing details for {updated} of {total} book(s) from {publisher}. New fields are highlighted in green."
         else:
             summary = (
-                f"No new fields were added for {publisher}. "
-                "If a publisher book page was found, its link is in the book details."
+                f"No matching book page was found on the publisher site for {publisher}. "
+                "No new fields were added."
             )
         self._set_status(summary)
-        self._complete_lookup_popup(summary)
+        self._complete_lookup_popup(summary, failed=failed)
         if selected:
             self._show_found_fields_popup(selected)
 
@@ -1998,6 +2033,27 @@ class BookCatalogApp(tk.Tk):
         self._value_labels = []
         self._detail_row = 0
 
+    def _detail_first_line(self, text: str) -> str:
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return str(text or "").strip()
+
+    def _detail_is_long(self, text: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw or raw == "—":
+            return False
+        if "\n" in str(text).strip():
+            return True
+        return len(raw) > 110
+
+    def _detail_preview(self, text: str) -> str:
+        first = self._detail_first_line(text)
+        if len(first) > 110:
+            return first[:109].rstrip() + "…"
+        return first
+
     def _add_detail_section(self, title: str) -> None:
         tk.Label(
             self.detail_inner,
@@ -2017,8 +2073,13 @@ class BookCatalogApp(tk.Tk):
         is_new: bool = False,
         source: str = "",
         link: str = "",
+        is_error: bool = False,
+        field_key: str = "",
+        tone: str = "",
     ) -> None:
+        del source
         row = self._detail_row
+        key = field_key or label
         tk.Label(
             self.detail_inner,
             text=label,
@@ -2034,6 +2095,18 @@ class BookCatalogApp(tk.Tk):
             display = "—"
             bg, fg = "#EFEBE3", "#A09890"
             font = ("Segoe UI", 10)
+        elif tone == "final":
+            display = value
+            bg, fg = FINAL_BG, FINAL_FG
+            font = ("Segoe UI", 10)
+        elif tone == "approved":
+            display = value
+            bg, fg = NEW_BG, NEW_FG
+            font = ("Segoe UI", 10)
+        elif tone == "error" or is_error:
+            display = value
+            bg, fg = ERROR_BG, ERROR_FG
+            font = ("Segoe UI", 10)
         elif is_new:
             display = value
             bg, fg = NEW_BG, NEW_FG
@@ -2045,9 +2118,14 @@ class BookCatalogApp(tk.Tk):
         if link and not empty:
             fg = "#0B57D0"
             font = ("Segoe UI", 10, "underline")
+        expandable = (not empty) and self._detail_is_long(str(value))
+        expanded = key in self._expanded_detail_keys
+        shown = str(display)
+        if expandable and not expanded:
+            shown = self._detail_preview(str(value))
         val = tk.Label(
             self.detail_inner,
-            text=display,
+            text=shown,
             bg=bg,
             fg=fg,
             font=font,
@@ -2061,6 +2139,36 @@ class BookCatalogApp(tk.Tk):
         if link and not empty:
             val.configure(cursor="hand2")
             val.bind("<Button-1>", lambda _e, target=link: self._open_in_browser(target))
+        if expandable:
+            full = str(value)
+
+            def toggle(_key=key, _val=val, _full=full) -> None:
+                if _key in self._expanded_detail_keys:
+                    self._expanded_detail_keys.discard(_key)
+                    _val.configure(text=self._detail_preview(_full))
+                    more_btn.configure(text="More")
+                else:
+                    self._expanded_detail_keys.add(_key)
+                    _val.configure(text=_full)
+                    more_btn.configure(text="Less")
+
+            more_btn = tk.Button(
+                self.detail_inner,
+                text="Less" if expanded else "More",
+                command=toggle,
+                bg=WHITE,
+                fg="#0B57D0",
+                activebackground=WHITE,
+                activeforeground="#0B57D0",
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                font=("Segoe UI", 8),
+                cursor="hand2",
+                padx=0,
+                pady=0,
+            )
+            more_btn.grid(row=row, column=1, sticky="n", pady=6)
         self._detail_row += 1
 
     def _set_links(self, items: list[tuple[str, str]]) -> None:
@@ -2095,30 +2203,28 @@ class BookCatalogApp(tk.Tk):
         captured = book.captured_fields()
         shown: set[str] = set()
         self._clear_detail_panel()
+        self._expanded_detail_keys.clear()
         self._add_detail_section("Scan")
-        self._add_detail_row("Scanner ID", book.scanner_id or "—")
+        self._add_detail_row("Scanner ID", book.scanner_id or "—", field_key="scanner_id")
         workflow = "Final" if book.final else "Approved" if book.approved else "Not approved"
-        self._add_detail_row("Workflow", workflow)
-        self._add_detail_row("Status", book.scan_status or "—")
-        self._add_detail_row("Message", book.scan_message or "—")
+        tone = book.display_tone()
+        self._add_detail_row("Workflow", workflow, field_key="workflow", tone=tone)
+        self._add_detail_row("Status", book.status_label() or "—", field_key="scan_status", tone=tone)
+        self._add_detail_row("Message", book.scan_message or "—", field_key="scan_message", tone=tone)
         if note:
-            tk.Label(
-                self.detail_inner,
-                text=note,
-                bg=WHITE,
-                fg=NEW_FG,
-                font=("Segoe UI", 9),
-                anchor="w",
-                justify="left",
-                wraplength=420,
-            ).grid(row=self._detail_row, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 6))
-            self._detail_row += 1
+            self._add_detail_row(
+                "Lookup",
+                note,
+                is_new=not book.extra.get("lookup_error"),
+                is_error=bool(book.extra.get("lookup_error")),
+                field_key="lookup_note",
+            )
         self._add_detail_section("Catalog fields")
 
         def add_field(key: str, label: str, value: str) -> None:
             is_new = key in new_fields or book.is_external_source(_source_field_key(key))
             link = value if key in {"cover_image_url", "back_image_url"} and str(value or "").startswith("http") else ""
-            self._add_detail_row(label, value, is_new=is_new, link=link)
+            self._add_detail_row(label, value, is_new=is_new, link=link, field_key=key)
 
         columns = self.excel_columns or []
         if columns:
@@ -2280,6 +2386,12 @@ class BookCatalogApp(tk.Tk):
 
     def _prepare_books(self, books: list[Book]) -> None:
         for book in books:
+            if book.author:
+                book.author = format_person_name(book.author) or book.author
+            if book.translator:
+                book.translator = format_person_name(book.translator) or book.translator
+            if book.illustrator:
+                book.illustrator = format_person_name(book.illustrator) or book.illustrator
             if book.title:
                 book.refresh_scan_status()
             elif not book.scan_status:
@@ -2504,8 +2616,40 @@ class BookCatalogApp(tk.Tk):
     def _set_status(self, text: str) -> None:
         self.status.set(text)
 
+    def _schedule_update_check(self, delay_ms: int) -> None:
+        if self._updating:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._update_check_after is not None:
+            try:
+                self.after_cancel(self._update_check_after)
+            except tk.TclError:
+                pass
+        try:
+            self._update_check_after = self.after(delay_ms, self._periodic_update_check)
+        except tk.TclError:
+            self._update_check_after = None
+
+    def _periodic_update_check(self) -> None:
+        self._update_check_after = None
+        try:
+            if self._updating or not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self.check_for_updates(silent=True)
+        self._schedule_update_check(UPDATE_CHECK_EVERY_MS)
+
     def check_for_updates(self, silent: bool = False) -> None:
         if self._updating:
+            return
+        if self._update_check_running:
+            if not silent:
+                self._set_status("Already checking GitHub for a SISU update…")
             return
         if self._busy:
             if not silent:
@@ -2513,9 +2657,8 @@ class BookCatalogApp(tk.Tk):
                     "Update",
                     "Wait until Search or More finishes, then check for updates again.",
                 )
-            else:
-                self.after(8000, lambda: self.check_for_updates(silent=True))
             return
+        self._update_check_running = True
         thread = threading.Thread(target=self._run_update_check, args=(silent,), daemon=True)
         thread.start()
 
@@ -2533,18 +2676,22 @@ class BookCatalogApp(tk.Tk):
         self._ui_queue.put(("update_result", (silent, info)))
 
     def _on_update_result(self, silent: bool, info: object) -> None:
+        self._update_check_running = False
         if info is None:
             if silent:
                 return
             messagebox.showinfo("Update", "SISU is already up to date.")
             self._set_status("SISU is already up to date.")
             return
-        if silent and self._update_declined:
-            self._set_status("A newer SISU version is available. Click Check for updates when you are ready.")
+        if self._busy:
+            self.after(10_000, lambda: self._on_update_result(silent, info))
             return
         from app_update import UpdateInfo
 
         if not isinstance(info, UpdateInfo):
+            return
+        if silent and self._update_declined_remote == info.remote:
+            self._set_status("A newer SISU version is available. Click Check for updates when you are ready.")
             return
         if info.dirty:
             messagebox.showwarning(
@@ -2563,18 +2710,19 @@ class BookCatalogApp(tk.Tk):
             "Finish any work you want to keep first.\n\n"
             "Update and restart now?",
         ):
-            self._update_declined = True
-            self._set_status("Update postponed. SISU will keep this version until you choose Check for updates.")
+            self._update_declined_remote = info.remote
+            self._set_status("Update postponed. SISU will check GitHub again later, or click Check for updates.")
             return
+        self._update_declined_remote = ""
         self._apply_self_update()
 
     def _on_update_error(self, silent: bool, text: str) -> None:
+        self._update_check_running = False
         self._updating = False
         if self._busy:
             return
         self.search_btn.configure(state="normal")
         if silent:
-            self._set_status("Could not check for SISU updates right now.")
             return
         messagebox.showerror("Update failed", text)
 
@@ -2621,7 +2769,7 @@ class BookCatalogApp(tk.Tk):
             except OSError:
                 pass
         if sentinel or current != self._mtimes:
-            self._hot_replace()
+            self.after(400, self._hot_replace)
             return
         self.after(800, self._watch_for_reload)
 
@@ -2629,6 +2777,13 @@ class BookCatalogApp(tk.Tk):
         self._restart_app("Code changed — restarting window, cache kept…")
 
     def _restart_app(self, reason: str = "") -> None:
+        self._updating = True
+        if self._update_check_after is not None:
+            try:
+                self.after_cancel(self._update_check_after)
+            except tk.TclError:
+                pass
+            self._update_check_after = None
         if reason:
             self._set_status(reason)
         self.update_idletasks()

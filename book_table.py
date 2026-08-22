@@ -83,9 +83,9 @@ class BookTable(ttk.Frame):
             self.tree.column(key, anchor=anchor, stretch=key != "mark", width=80)
         self.tree.column("mark", width=MARK_WIDTH, stretch=False, anchor="center")
         self.tree.column("price", anchor="e")
-        self.tree.tag_configure("failed", background="#F8E4E4")
-        self.tree.tag_configure("approved", background="#E4F7EA")
-        self.tree.tag_configure("final", background="#E8E8E8")
+        self.tree.tag_configure("failed", background="#FDECEC", foreground="#B42318")
+        self.tree.tag_configure("approved", background="#E4F7EA", foreground="#146C43")
+        self.tree.tag_configure("final", background="#E8F0FE", foreground="#0B57D0")
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -228,12 +228,9 @@ class BookTable(ttk.Frame):
         )
 
     def _row_tags(self, book: Book) -> tuple[str, ...]:
-        if book.final:
-            return ("final",)
-        if book.approved:
-            return ("approved",)
-        if book.scan_status == "failed":
-            return ("failed",)
+        tone = book.display_tone()
+        if tone:
+            return ("failed" if tone == "error" else tone,)
         return ()
 
     def _reload(self) -> None:

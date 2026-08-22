@@ -298,7 +298,7 @@ def apply_field(book: Any, field: str, value: str) -> bool:
         book.author = format_person_name(value) or value
         return bool(book.author)
     if field in {"author_en", "author_he"}:
-        formatted = format_person_name(value) or value
+        formatted = format_person_name(value, hebrew=(field == "author_he")) or value
         captured = book.captured_fields()
         if formatted and not captured.get(field):
             book.set_captured(field, formatted)

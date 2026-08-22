@@ -37,6 +37,64 @@ def parse_html(markup: str) -> BeautifulSoup:
     except FeatureNotFound:
         return BeautifulSoup(markup, "html.parser")
 
+
+class SiteError(Exception):
+    """The website returned a failure page or could not be reached."""
+
+    def __init__(self, message: str, url: str = "") -> None:
+        super().__init__(message)
+        self.url = url
+
+
+def site_error_message(html: str, status: int | None = None, url: str = "") -> str | None:
+    """Return a user-facing error if the response is a dead or WordPress error page."""
+    del url
+    status = int(status or 0)
+    soup = parse_html(html or "")
+    title = clean(soup.title.get_text(" ", strip=True) if soup.title else "")
+    error_page = soup.select_one("#error-page")
+    heading = ""
+    source = error_page or soup
+    h1 = source.find("h1") if source else None
+    if h1:
+        heading = clean(h1.get_text(" ", strip=True))
+    if not heading and error_page:
+        paragraph = error_page.find("p")
+        heading = clean(paragraph.get_text(" ", strip=True) if paragraph else "")
+    blob = f"{title}\n{heading}\n{(html or '')[:8000]}"
+    lower = blob.casefold()
+    wp_title = ("wordpress" in title.casefold() and "error" in title.casefold()) or (
+        "וורדפרס" in title and "שגיאה" in title
+    )
+    wp_die = error_page is not None or soup.select_one(".wp-die-message") is not None
+    critical = (
+        "critical error on this website" in lower
+        or "this site is experiencing technical difficulties" in lower
+        or "שגיאה קריטית" in blob
+    )
+    if not (status >= 500 or wp_title or wp_die or critical):
+        return None
+    detail = heading or title
+    if wp_title or wp_die or critical or "וורדפרס" in blob or "wordpress" in title.casefold():
+        status_bit = f" (HTTP {status})" if status else ""
+        if detail:
+            return f"The site reported a WordPress error{status_bit}: {detail}"
+        return f"The site reported a WordPress error{status_bit}."
+    if status >= 500:
+        if detail:
+            return f"The site returned HTTP {status}: {detail}"
+        return f"The site returned HTTP {status}."
+    return None
+
+
+def request_failure_message(exc: BaseException, url: str) -> str:
+    host = urlparse(url).netloc or url
+    if isinstance(exc, requests.Timeout):
+        return f"Timed out while opening {host}."
+    if isinstance(exc, requests.ConnectionError):
+        return f"Could not connect to {host}."
+    return f"Could not open {host}: {exc.__class__.__name__}."
+
 HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 ISBN_RE = re.compile(r"(?:97[89][-\s]?)?(?:\d[-\s]?){9,12}[\dXx]")
@@ -319,6 +377,15 @@ class Book:
             return "—"
         return "Approve"
 
+    def display_tone(self) -> str:
+        if self.final:
+            return "final"
+        if self.approved:
+            return "approved"
+        if (self.scan_status or "") == "failed" or self.extra.get("lookup_error"):
+            return "error"
+        return ""
+
     def status_label(self) -> str:
         if self.final:
             return "Final"
@@ -512,13 +579,24 @@ class Book:
                 rows.append({"label": label, "value": value, "field": field})
         return rows
 
-    def mark_publisher_lookup(self, site: str, page: str = "", filled: list[str] | None = None, note: str = "") -> None:
+    def mark_publisher_lookup(
+        self,
+        site: str,
+        page: str = "",
+        filled: list[str] | None = None,
+        note: str = "",
+        error: bool = False,
+    ) -> None:
         if site:
             self.extra["publisher_site"] = site
         if page:
             self.extra["publisher_page"] = page
         self.extra["new_fields"] = ",".join(filled or [])
         self.extra["lookup_note"] = note
+        if error:
+            self.extra["lookup_error"] = "1"
+        else:
+            self.extra.pop("lookup_error", None)
 
     def matches_year(self, year: str | None, include_unknown: bool = False) -> bool:
         if not year:
@@ -568,8 +646,8 @@ class Book:
             author_en = captured.get("author_en") or author_en
         if captured.get("author_he"):
             author_he = captured.get("author_he") or author_he
-        fields["author_en"] = format_person_name(author_en)
-        fields["author_he"] = format_person_name(author_he)
+        fields["author_en"] = format_person_name(author_en, hebrew=False)
+        fields["author_he"] = format_person_name(author_he, hebrew=True)
         legacy = captured.get("translated") or ""
         if not fields["translator"] and _looks_like_person_name(legacy) and len(legacy.split()) >= 2:
             fields["translator"] = format_person_name(legacy)
@@ -603,8 +681,11 @@ class CrawlReport:
     enriched: int = 0
     from_cache: bool = False
     cancelled: bool = False
+    error: str = ""
 
     def summary(self) -> str:
+        if self.error:
+            return f"Search failed: {self.error}"
         if self.from_cache:
             return f"From cache: {self.matched} book(s) loaded. No pages fetched."
         parts = [
@@ -700,10 +781,18 @@ def _split_people(text: str) -> list[str]:
     return [value]
 
 
-def _format_one_person(name: str) -> str:
+def _format_one_person(name: str, hebrew: bool | None = None) -> str:
     value = clean(name)
     if not value:
         return ""
+    if hebrew is None:
+        hebrew = has_hebrew(value)
+    if hebrew:
+        if "," in value:
+            family, given = (part.strip() for part in value.split(",", 1))
+            if family and given:
+                return f"{given} {family}"
+        return value
     if "," in value:
         family, given = (part.strip() for part in value.split(",", 1))
         if family and given:
@@ -721,8 +810,8 @@ def _format_one_person(name: str) -> str:
     return f"{family}, {given}" if given else family
 
 
-def format_person_name(text: str | None) -> str:
-    people = [_format_one_person(part) for part in _split_people(text or "")]
+def format_person_name(text: str | None, hebrew: bool | None = None) -> str:
+    people = [_format_one_person(part, hebrew=hebrew) for part in _split_people(text or "")]
     return "; ".join(part for part in people if part)
 
 
@@ -1842,7 +1931,7 @@ class BookCrawler:
         self.progress = progress or (lambda _msg: None)
         self.report = CrawlReport()
         self.session = requests.Session()
-        retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 500, 502, 503, 504))
+        retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -1862,11 +1951,18 @@ class BookCrawler:
 
     def fetch(self, url: str) -> tuple[str, str]:
         self._check_cancel()
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
+        try:
+            response = self.session.get(url, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise SiteError(request_failure_message(exc, url), url=url) from exc
         response.encoding = response.apparent_encoding or response.encoding
+        html = response.text or ""
+        failure = site_error_message(html, response.status_code, response.url or url)
+        if failure:
+            raise SiteError(failure, url=response.url or url)
+        response.raise_for_status()
         time.sleep(self.delay_seconds)
-        return response.text, response.url
+        return html, response.url
 
     def _book_and_html(self, product_url: str, remember: bool = True) -> tuple[Book | None, str, str]:
         from book_cache import get_page_book, remember_page_book, save_page_cache
@@ -1903,9 +1999,10 @@ class BookCrawler:
         try:
             html, final_url = self.fetch(start_url)
             self.report.listing_pages += 1
-        except requests.RequestException:
+        except (SiteError, requests.RequestException) as exc:
             self.report.listing_failed += 1
-            self.progress("Could not open the start URL.")
+            self.report.error = str(exc) if isinstance(exc, SiteError) else "Could not open the start URL."
+            self.progress(self.report.error)
             from field_map import flush_candidates
 
             flush_candidates()
@@ -1957,7 +2054,7 @@ class BookCrawler:
                         html, listing_url = self.fetch(listing_url)
                         self.report.listing_pages += 1
                         soup = parse_html(html)
-                    except requests.RequestException:
+                    except (SiteError, requests.RequestException):
                         self.report.listing_failed += 1
                         continue
                 for product_url in collect_product_links(soup, listing_url):
@@ -1981,7 +2078,7 @@ class BookCrawler:
                 seen_products.add(product_url)
                 try:
                     book = self._book_from_url(product_url)
-                except requests.RequestException as exc:
+                except (SiteError, requests.RequestException) as exc:
                     self.report.product_failed += 1
                     stub = Book(url=product_url)
                     stub.mark_scan_failed(f"Could not open the book page: {exc.__class__.__name__}: {exc}")
@@ -2108,7 +2205,7 @@ class BookCrawler:
         seen.add(key)
         try:
             candidate, html, resolved = self._book_and_html(product_url, remember=remember)
-        except requests.RequestException:
+        except (SiteError, requests.RequestException):
             return None
         listing = is_query_listing_url(resolved or product_url)
         matched = candidate if candidate and candidate.title and books_match(wanted, candidate) else None
@@ -2119,7 +2216,7 @@ class BookCrawler:
         if not html:
             try:
                 html, resolved = self.fetch(resolved or product_url)
-            except requests.RequestException:
+            except (SiteError, requests.RequestException):
                 html = ""
         if html:
             soup = parse_html(html)
@@ -2156,7 +2253,7 @@ class BookCrawler:
                 return candidate
             try:
                 html, final_url = self.fetch(candidate.url)
-            except requests.RequestException:
+            except (SiteError, requests.RequestException):
                 return candidate
             soup = parse_html(html)
             seen.add(_url_key(candidate.url))
@@ -2167,6 +2264,16 @@ class BookCrawler:
                 return richer
             return candidate
 
+        home_html = ""
+        home_url = origin.rstrip("/") + "/"
+        try:
+            home_html, home_url = self.fetch(home_url)
+            seen.add(_url_key(home_url))
+        except SiteError:
+            raise
+        except requests.RequestException:
+            home_html = ""
+
         def consider(product_url: str, remember: bool) -> Book | None:
             return self._consider_book_page(product_url, book, seen, remember=remember)
 
@@ -2176,19 +2283,16 @@ class BookCrawler:
                 if found:
                     self.progress(f"Found book page: {found.url}")
                     return found
-            try:
-                html, final_url = self.fetch(origin + "/")
-                soup = parse_html(html)
-                homepage_links = collect_detail_links(soup, final_url, book) or collect_matching_links(
-                    soup, final_url, book
+            if home_html:
+                soup = parse_html(home_html)
+                homepage_links = collect_detail_links(soup, home_url, book) or collect_matching_links(
+                    soup, home_url, book
                 )
                 for product_url in homepage_links[:8]:
                     found = consider(product_url, remember=False)
                     if found:
                         self.progress(f"Found book page: {found.url}")
                         return found
-            except requests.RequestException:
-                pass
         queries = [value for value in (book.isbn, book.display_title(), f"{book.title} {book.author}") if value]
         for query in queries:
             for search_url in self.search_urls_for_query(site_url, query):
@@ -2198,7 +2302,7 @@ class BookCrawler:
                 seen.add(key)
                 try:
                     html, final_url = self.fetch(search_url)
-                except requests.RequestException:
+                except (SiteError, requests.RequestException):
                     continue
                 soup = parse_html(html)
                 if is_search_results_page(soup, final_url):
@@ -2268,11 +2372,15 @@ class BookCrawler:
                 match = self.find_matching_product(publisher_url, book, try_slugs=True)
             except CrawlCancelled:
                 raise
-            except requests.RequestException as exc:
-                note = f"Could not open {host}: {exc.__class__.__name__}"
+            except SiteError as exc:
+                note = str(exc)
                 self.progress(note)
-                book.mark_publisher_lookup(publisher_url, note=note)
-                book.refresh_scan_status()
+                book.mark_publisher_lookup(publisher_url, note=note, error=True)
+                return filled
+            except requests.RequestException as exc:
+                note = request_failure_message(exc, publisher_url)
+                self.progress(note)
+                book.mark_publisher_lookup(publisher_url, note=note, error=True)
                 return filled
             if not match:
                 note = f"No matching book page found on {host}."
@@ -2343,6 +2451,9 @@ class BookCrawler:
                     match = self.find_matching_product(extra_url, book)
                 except CrawlCancelled:
                     raise
+                except SiteError as exc:
+                    self.progress(str(exc))
+                    break
                 except requests.RequestException:
                     continue
                 if not match:
