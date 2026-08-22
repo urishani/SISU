@@ -14,8 +14,7 @@ WEIGHTS = {
     "title": 2.0,
     "author": 0.9,
     "year": 0.45,
-    "status": 0.7,
-    "action": 0.7,
+    "status": 0.8,
     "publisher": 0.9,
     "code": 0.8,
     "price": 0.5,
@@ -26,7 +25,6 @@ HEADINGS = {
     "author": "Author",
     "year": "Year",
     "status": "Status",
-    "action": "Action",
     "publisher": "Publisher",
     "code": "ISBN / code",
     "price": "Price ₪",
@@ -49,13 +47,11 @@ class BookTable(ttk.Frame):
         on_select: Callable[[Book], None] | None = None,
         on_check: Callable[[], None] | None = None,
         on_publisher: Callable[[Book], None] | None = None,
-        on_action: Callable[[Book], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.on_select = on_select
         self.on_check = on_check
         self.on_publisher = on_publisher
-        self.on_action = on_action
         self.books: list[Book] = []
         self.order: list[int] = []
         self.checked: set[str] = set()
@@ -68,7 +64,7 @@ class BookTable(ttk.Frame):
         style.configure("Books.Treeview", font=("Segoe UI", 10), rowheight=ROW_HEIGHT)
         style.configure("Books.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
-        columns = ("mark", "title", "author", "year", "status", "action", "publisher", "code", "price")
+        columns = ("mark", "title", "author", "year", "status", "publisher", "code", "price")
         self.tree = ttk.Treeview(
             self,
             columns=columns,
@@ -80,7 +76,7 @@ class BookTable(ttk.Frame):
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
             if key == "price":
                 anchor = "e"
-            elif key in {"mark", "author", "year", "status", "action", "publisher", "code"}:
+            elif key in {"mark", "author", "year", "status", "publisher", "code"}:
                 anchor = "center"
             else:
                 anchor = "w"
@@ -90,10 +86,14 @@ class BookTable(ttk.Frame):
         self.tree.tag_configure("failed", background="#F8E4E4")
         self.tree.tag_configure("approved", background="#E4F7EA")
         self.tree.tag_configure("final", background="#E8E8E8")
-        scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        scroll_y = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scroll_x = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Motion>", self._on_motion)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -226,7 +226,6 @@ class BookTable(ttk.Frame):
             book.author,
             book.year,
             book.status_label(),
-            book.workflow_label(),
             book.publisher,
             book.identity_code() or book.scanner_id,
             format_price(book.price_ils),
@@ -235,10 +234,10 @@ class BookTable(ttk.Frame):
     def _row_tags(self, book: Book) -> tuple[str, ...]:
         if book.final:
             return ("final",)
-        if book.scan_status == "failed":
-            return ("failed",)
         if book.approved:
             return ("approved",)
+        if book.scan_status == "failed":
+            return ("failed",)
         return ()
 
     def _reload(self) -> None:
@@ -285,7 +284,7 @@ class BookTable(ttk.Frame):
             self.tree.configure(cursor="")
             return
         column = self._column_at(event)
-        self.tree.configure(cursor="hand2" if column in {"publisher", "action"} else "")
+        self.tree.configure(cursor="hand2" if column == "publisher" else "")
 
     def _on_click(self, event: tk.Event) -> None:
         if self.tree.identify("region", event.x, event.y) != "cell":
@@ -305,9 +304,6 @@ class BookTable(ttk.Frame):
             values[0] = "☑" if key in self.checked else "☐"
             self.tree.item(row, values=values)
             self._after_check_change()
-            return
-        if column == "action" and self.on_action and book.workflow_label() != "—":
-            self.after_idle(lambda b=book: self.on_action(b))
             return
         if column == "publisher" and self.on_publisher:
             self.after_idle(lambda b=book: self.on_publisher(b))

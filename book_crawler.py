@@ -256,6 +256,10 @@ class Book:
         return "Approve"
 
     def status_label(self) -> str:
+        if self.final:
+            return "Final"
+        if self.approved:
+            return "Approved"
         return self.scan_status or "successful"
 
     def _load_map(self, key: str) -> dict[str, str]:

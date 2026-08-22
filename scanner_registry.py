@@ -98,7 +98,7 @@ def _record(scanner_id: str) -> dict[str, Any]:
 
 
 def attach_book(book: Book) -> str:
-    """Give this book a stable scanner ID and restore approval / Excel / final flags."""
+    """Give this book a stable scanner ID. Approval and Final stay on the current list."""
     data = load_registry()
     fingerprints = scanner_fingerprints(book)
     found = ""
@@ -116,9 +116,6 @@ def attach_book(book: Book) -> str:
     for key in scanner_fingerprints(book):
         data["fingerprints"][key] = found
     record = _record(found)
-    book.approved = bool(record.get("approved"))
-    book.excel_passed = bool(record.get("excel_passed"))
-    book.final = bool(record.get("final"))
     return found
 
 

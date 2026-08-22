@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import copy
 from pathlib import Path
 from typing import Any
+import re
+import shutil
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
@@ -245,6 +247,22 @@ class CatalogWorkbook:
             written += 1
         return written, skipped, written_ids, skipped_ids
 
+    def remove_scanner_ids(self, scanner_ids: set[str] | list[str]) -> int:
+        wanted = {str(item).strip() for item in scanner_ids if str(item).strip()}
+        if not wanted:
+            return 0
+        scanner_col = next((c["index"] for c in self.all_columns if c["field"] == "scanner_id"), None)
+        if not scanner_col:
+            return 0
+        rows = [
+            row
+            for row in range(2, self.sheet.max_row + 1)
+            if str(self.sheet.cell(row, scanner_col).value or "").strip() in wanted
+        ]
+        for row in reversed(rows):
+            self.sheet.delete_rows(row, 1)
+        return len(rows)
+
     def save(self) -> Path:
         try:
             self.workbook.save(self.path)
@@ -253,3 +271,28 @@ class CatalogWorkbook:
             fallback = self.path.with_name(f"{self.path.stem} - filled{self.path.suffix}")
             self.workbook.save(fallback)
             return fallback
+
+
+_UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*]')
+
+
+def list_excel_filename(title: str, list_id: str = "") -> str:
+    cleaned = _UNSAFE_FILENAME.sub("_", (title or "New").strip())
+    cleaned = " ".join(cleaned.split()).strip(" .") or "New"
+    cleaned = cleaned[:80]
+    suffix = str(list_id or "").strip()
+    if suffix:
+        return f"SISU - {cleaned[:68]} [{suffix[:12]}].xlsx"
+    return f"SISU - {cleaned}.xlsx"
+
+
+def ensure_list_workbook(path: str | Path, schema: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return target
+    source = Path(schema)
+    if not source.exists():
+        raise FileNotFoundError(f"Excel schema was not found: {source}")
+    shutil.copy2(source, target)
+    return target

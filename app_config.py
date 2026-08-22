@@ -31,6 +31,7 @@ def _defaults() -> dict:
         "browser": "chrome",
         "browser_path": "",
         "publishers": {},
+        "excel_dir": "",
     }
 
 
@@ -85,6 +86,8 @@ def _normalize(raw: dict) -> dict:
         browser = "chrome"
     data["browser"] = browser
     data["browser_path"] = str(raw.get("browser_path") or "").strip()
+    excel_dir = str(raw.get("excel_dir") or "").strip()
+    data["excel_dir"] = excel_dir
     publishers: dict[str, str] = {}
     incoming = raw.get("publishers") or {}
     if isinstance(incoming, dict):

@@ -5,15 +5,17 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from dataclasses import asdict
 
@@ -28,21 +30,23 @@ from app_config import (
 )
 from book_crawler import Book, BookCrawler, CrawlCancelled, CrawlReport, format_price, parse_site_urls, site_display_name, site_host
 from book_table import ROW_STATUSES, BookTable
-from catalog_excel import CatalogWorkbook
+from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
 from field_map import ALIASES_PATH, REPORT_JSON_PATH, reload_aliases, write_field_report
 from hebrew_view import HebrewDescription
 from publisher_sites import publishers_match, resolve_publisher_site
-from scanner_registry import attach_book, attach_books, mark_excel_ids, persist_book_state
+from scanner_registry import attach_book, attach_books, persist_book_state
 from scan_lists import (
     books_from_payload,
     build_payload,
     default_scan_title,
+    DEFAULT_SEARCH_URLS,
     delete_named,
     empty_payload,
     list_summaries,
     load_named,
     load_stash,
     load_working,
+    merge_search_urls,
     rename_named,
     save_named,
     save_stash,
@@ -79,24 +83,19 @@ TAB_ON = "#C47B2B"
 TAB_OFF = "#D9D0C3"
 NEW_FG = "#146C43"
 NEW_BG = "#E4F7EA"
-DEFAULT_URLS = "\n".join(
-    (
-        "https://www.booknet.co.il/ספרים-חדשים",
-        "https://www.e-vrit.co.il/",
-        "https://www.nli.org.il/he/search?materialType=books",
-    )
-)
+DEFAULT_URLS = "\n".join(DEFAULT_SEARCH_URLS)
 
 
 class BookCatalogApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("SISU Book Catalog Filler")
-        self.geometry("1280x780")
-        self.minsize(1020, 640)
+        self.geometry("1280x820")
+        self.minsize(1100, 720)
         self.configure(bg=BG)
 
-        self.excel_path = tk.StringVar(value=str(DEFAULT_EXCEL if DEFAULT_EXCEL.exists() else ""))
+        self.excel_path = tk.StringVar(value="")
+        self._excel_dir = Path(str(load_config().get("excel_dir") or "").strip() or APP_DIR)
         self.year = tk.StringVar(value="2026")
         self.max_pages = tk.IntVar(value=5)
         self.include_unknown = tk.BooleanVar(value=True)
@@ -115,6 +114,7 @@ class BookCatalogApp(tk.Tk):
         self._list_created_at = ""
         self._list_notes = ""
         self._list_report: dict = {}
+        self._skip_cache_restore = False
         self._lists_popup: tk.Toplevel | None = None
         self._selected_book: Book | None = None
         self._description_text = ""
@@ -179,74 +179,84 @@ class BookCatalogApp(tk.Tk):
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=14, pady=12)
+        self._layout_body = body
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(5, weight=1)
 
-        lists = ttk.LabelFrame(body, text="Scan list")
-        lists.pack(fill="x", pady=(0, 8))
+        lists = ttk.LabelFrame(body, text="Scan list", padding=(10, 8, 10, 12))
+        lists.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         lists.columnconfigure(1, weight=1)
-        ttk.Label(lists, text="Title").grid(row=0, column=0, sticky="e", padx=(10, 8), pady=6)
+        ttk.Label(lists, text="Title").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=(0, 4))
         self.list_title_entry = ttk.Entry(lists, textvariable=self.list_title)
-        self.list_title_entry.grid(row=0, column=1, sticky="ew", pady=6)
-        self.list_title_entry.bind("<FocusOut>", lambda _e: self._persist_working())
+        self.list_title_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        self.list_title_entry.bind("<FocusOut>", lambda _e: self._on_list_title_change())
         list_btns = ttk.Frame(lists)
-        list_btns.grid(row=0, column=2, padx=10, pady=6, sticky="e")
+        list_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Button(list_btns, text="New", command=self.new_working_list).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Stash", command=self.stash_working_list).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Restore stash", command=self.restore_stash).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Save list", command=self.save_current_list).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Open lists…", command=self.open_lists_manager).pack(side="left")
-        ttk.Label(lists, textvariable=self.list_status, wraplength=1100).grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8)
-        )
+        self.list_status_label = ttk.Label(lists, textvariable=self.list_status, wraplength=1, justify="left")
+        self.list_status_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 2))
 
-        form = ttk.LabelFrame(body, text="Search")
-        form.pack(fill="x")
+        form = ttk.LabelFrame(body, text="Search", padding=(10, 8, 10, 14))
+        form.grid(row=1, column=0, sticky="ew")
         form.columnconfigure(1, weight=1)
 
-        ttk.Label(form, text="Excel file").grid(row=0, column=0, sticky="e", padx=(10, 8), pady=6)
-        ttk.Entry(form, textvariable=self.excel_path).grid(row=0, column=1, columnspan=3, sticky="ew", pady=6)
+        ttk.Label(form, text="List Excel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=6)
+        self.excel_entry = ttk.Entry(form, textvariable=self.excel_path, state="readonly")
+        self.excel_entry.grid(row=0, column=1, columnspan=3, sticky="ew", pady=6)
         excel_btns = ttk.Frame(form)
-        excel_btns.grid(row=0, column=4, padx=10, pady=6, sticky="e")
-        ttk.Button(excel_btns, text="Browse…", command=self.browse_excel).pack(side="left")
-        ttk.Button(excel_btns, text="Open", command=self.open_excel).pack(side="left", padx=(6, 0))
+        excel_btns.grid(row=0, column=4, padx=(10, 0), pady=6, sticky="e")
+        self.excel_folder_btn = ttk.Button(excel_btns, text="Folder…", command=self.browse_excel_folder)
+        self.excel_folder_btn.pack(side="left")
+        self.excel_open_btn = ttk.Button(excel_btns, text="Open", command=self.open_excel)
+        self.excel_open_btn.pack(side="left", padx=(6, 0))
+        self.excel_share_btn = ttk.Button(excel_btns, text="Share", command=self.share_excel)
+        self.excel_share_btn.pack(side="left", padx=(6, 0))
 
-        ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(10, 8), pady=6)
+        ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=6)
         url_wrap = ttk.Frame(form)
-        url_wrap.grid(row=1, column=1, columnspan=4, sticky="ew", pady=6, padx=(0, 10))
+        url_wrap.grid(row=1, column=1, columnspan=4, sticky="ew", pady=6)
         url_wrap.columnconfigure(0, weight=1)
-        self.url_text = tk.Text(url_wrap, height=4, wrap="none", font=("Segoe UI", 10), undo=True)
-        url_scroll = ttk.Scrollbar(url_wrap, orient="vertical", command=self.url_text.yview)
-        self.url_text.configure(yscrollcommand=url_scroll.set)
+        self.url_text = tk.Text(url_wrap, height=4, wrap="none", font=("Segoe UI", 10), undo=True, padx=6, pady=4)
+        url_scroll_y = ttk.Scrollbar(url_wrap, orient="vertical", command=self.url_text.yview)
+        url_scroll_x = ttk.Scrollbar(url_wrap, orient="horizontal", command=self.url_text.xview)
+        self.url_text.configure(yscrollcommand=url_scroll_y.set, xscrollcommand=url_scroll_x.set)
         self.url_text.grid(row=0, column=0, sticky="ew")
-        url_scroll.grid(row=0, column=1, sticky="ns")
+        url_scroll_y.grid(row=0, column=1, sticky="ns")
+        url_scroll_x.grid(row=1, column=0, sticky="ew")
         self.url_text.insert("1.0", DEFAULT_URLS)
 
-        ttk.Label(form, text="Year").grid(row=2, column=0, sticky="e", padx=(10, 8), pady=6)
+        ttk.Label(form, text="Year").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=6)
         self.year_entry = ttk.Entry(form, textvariable=self.year, width=10)
         self.year_entry.grid(row=2, column=1, sticky="w", pady=6)
         ttk.Label(form, text="Max listing pages").grid(row=2, column=2, sticky="e", padx=(16, 8))
         self.pages_spin = ttk.Spinbox(form, from_=1, to=40, textvariable=self.max_pages, width=6)
         self.pages_spin.grid(row=2, column=3, sticky="w")
         buttons = ttk.Frame(form)
-        buttons.grid(row=2, column=4, sticky="e", padx=10, pady=6)
+        buttons.grid(row=2, column=4, sticky="e", padx=(10, 0), pady=6)
         self.search_btn = ttk.Button(buttons, text="Search", command=self.start_search, style="Accent.TButton")
-        self.search_btn.pack(side="left", padx=4)
+        self.search_btn.pack(side="left", padx=(0, 4))
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
-        self.stop_btn.pack(side="left", padx=4)
+        self.stop_btn.pack(side="left")
 
         checks = ttk.Frame(form)
-        checks.grid(row=3, column=1, columnspan=4, sticky="w", pady=(0, 8))
+        checks.grid(row=3, column=1, columnspan=4, sticky="w", pady=(0, 4))
         self.unknown_check = ttk.Checkbutton(
             checks, text="Also keep books with no year listed", variable=self.include_unknown
         )
         self.unknown_check.pack(side="left")
 
-        ttk.Label(body, textvariable=self.colored_info, wraplength=1180).pack(anchor="w", pady=(8, 4))
+        self.colored_info_label = ttk.Label(body, textvariable=self.colored_info, wraplength=1, justify="left")
+        self.colored_info_label.grid(row=2, column=0, sticky="ew", pady=(8, 4))
         self.progress = ttk.Progressbar(body, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 4))
-        ttk.Label(body, textvariable=self.summary, wraplength=1180).pack(anchor="w", pady=(0, 8))
+        self.progress.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        self.summary_label = ttk.Label(body, textvariable=self.summary, wraplength=1, justify="left")
+        self.summary_label.grid(row=4, column=0, sticky="ew", pady=(0, 8))
 
         split = ttk.Panedwindow(body, orient="horizontal")
-        split.pack(fill="both", expand=True)
         list_frame = ttk.Frame(split)
         detail_frame = ttk.Frame(split, style="Card.TFrame")
         split.add(list_frame, weight=3)
@@ -257,19 +267,36 @@ class BookCatalogApp(tk.Tk):
             on_select=self.show_book,
             on_check=self._on_check_change,
             on_publisher=self.ask_publisher_lookup,
-            on_action=self.handle_book_action,
         )
         filter_bar = ttk.Frame(list_frame)
-        filter_bar.pack(fill="x", pady=(0, 4))
-        ttk.Label(filter_bar, text="Filter").pack(side="left")
+        filter_bar.pack(fill="x", pady=(0, 6))
+        filter_top = ttk.Frame(filter_bar)
+        filter_top.pack(fill="x")
+        ttk.Label(filter_top, text="Filter").pack(side="left")
         self._filter_vars: dict[str, tk.BooleanVar] = {}
+        first_keys = {"checked", "approved", "failed", "successful"}
         for key, label in ROW_STATUSES:
+            if key not in first_keys:
+                continue
             var = tk.BooleanVar(value=False)
             self._filter_vars[key] = var
-            ttk.Checkbutton(filter_bar, text=label, variable=var, command=self._on_filter_change).pack(
+            ttk.Checkbutton(filter_top, text=label, variable=var, command=self._on_filter_change).pack(
                 side="left", padx=(8, 0)
             )
-        ttk.Button(filter_bar, text="Clear books…", command=self.clear_books_with_keep).pack(side="right")
+        ttk.Button(filter_top, text="Clear books…", command=self.clear_books_with_keep).pack(side="right")
+        filter_more = ttk.Frame(filter_bar)
+        filter_more.pack(fill="x", pady=(4, 0))
+        for key, label in ROW_STATUSES:
+            if key in first_keys:
+                continue
+            var = tk.BooleanVar(value=False)
+            self._filter_vars[key] = var
+            ttk.Checkbutton(filter_more, text=label, variable=var, command=self._on_filter_change).pack(
+                side="left", padx=(0, 8)
+            )
+        table_pad = ttk.Frame(list_frame, height=10)
+        table_pad.pack(side="bottom", fill="x")
+        table_pad.pack_propagate(False)
         self.table.pack(fill="both", expand=True)
 
         detail_header = ttk.Frame(detail_frame, style="Card.TFrame")
@@ -277,8 +304,12 @@ class BookCatalogApp(tk.Tk):
         ttk.Label(detail_header, text="Selected book", style="Card.TLabel", font=("Segoe UI", 11, "bold")).pack(
             side="left"
         )
+        self.unfinal_btn = ttk.Button(
+            detail_header, text="Remove final", command=self.remove_selected_final, state="disabled"
+        )
+        self.unfinal_btn.pack(side="right")
         self.final_btn = ttk.Button(detail_header, text="Mark final", command=self.mark_selected_final, state="disabled")
-        self.final_btn.pack(side="right")
+        self.final_btn.pack(side="right", padx=(0, 6))
         self.approve_btn = ttk.Button(detail_header, text="Approve", command=self.approve_selected, state="disabled")
         self.approve_btn.pack(side="right", padx=(0, 6))
         self.more_btn = ttk.Button(detail_header, text="More", command=self.lookup_more, state="disabled")
@@ -358,17 +389,33 @@ class BookCatalogApp(tk.Tk):
         self.desc_view.pack(fill="both", expand=True)
 
         footer = ttk.Frame(body)
-        footer.pack(fill="x", pady=(8, 0))
-        ttk.Button(footer, text="Select all", command=self.table.select_all).pack(side="left")
-        ttk.Button(footer, text="Clear selection", command=self.table.clear_selection).pack(side="left", padx=6)
-        ttk.Button(footer, text="Mark selected final", command=self.mark_selected_final_checked).pack(side="left")
-        ttk.Button(
-            footer,
-            text="Approve selected",
-            command=self.approve_checked,
-            style="Accent.TButton",
-        ).pack(side="right")
-        ttk.Label(footer, textvariable=self.status).pack(side="left", padx=16)
+        ttk.Button(footer, text="Select all", command=self.table.select_all).pack(side="left", pady=6)
+        ttk.Button(footer, text="Clear selection", command=self.table.clear_selection).pack(side="left", padx=6, pady=6)
+        self.status_label = ttk.Label(footer, textvariable=self.status, wraplength=1, justify="left")
+        self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=6)
+        footer.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        body.rowconfigure(6, minsize=44)
+        split.grid(row=5, column=0, sticky="nsew")
+        self._bind_list_excel_path(rename_existing=False)
+        body.bind("<Configure>", self._sync_full_width_wraps, add="+")
+        lists.bind("<Configure>", lambda event: self._set_label_wrap(self.list_status_label, event.width - 24), add="+")
+        footer.bind("<Configure>", lambda event: self._set_label_wrap(self.status_label, max(120, event.width - 220)), add="+")
+
+    def _set_label_wrap(self, label: ttk.Label, width: int) -> None:
+        width = max(40, int(width))
+        try:
+            current = int(float(label.cget("wraplength") or 0))
+        except (TypeError, ValueError, tk.TclError):
+            current = 0
+        if current != width:
+            label.configure(wraplength=width)
+
+    def _sync_full_width_wraps(self, event: tk.Event) -> None:
+        if event.widget is not getattr(self, "_layout_body", None):
+            return
+        width = max(40, int(event.width) - 8)
+        self._set_label_wrap(self.colored_info_label, width)
+        self._set_label_wrap(self.summary_label, width)
 
     def _urls(self) -> list[str]:
         return parse_site_urls(self.url_text.get("1.0", "end"))
@@ -675,26 +722,170 @@ class BookCatalogApp(tk.Tk):
         win.lift()
         win.focus_force()
 
-    def browse_excel(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select catalog Excel file",
-            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
-            initialdir=str(APP_DIR),
+    def _on_list_title_change(self) -> None:
+        self._bind_list_excel_path(rename_existing=not self._list_locked)
+        self._persist_working()
+
+    def _default_excel_dir(self) -> Path:
+        configured = str(load_config().get("excel_dir") or "").strip()
+        path = Path(configured) if configured else APP_DIR
+        return path if path.exists() else APP_DIR
+
+    def _list_excel_path(self) -> Path:
+        folder = Path(self._excel_dir or self._default_excel_dir())
+        return folder / list_excel_filename(self.list_title.get().strip() or "New", self._list_id)
+
+    def _bind_list_excel_path(self, *, rename_existing: bool = True) -> None:
+        new_path = self._list_excel_path()
+        old_raw = self.excel_path.get().strip()
+        old_path = Path(old_raw) if old_raw else None
+        if (
+            rename_existing
+            and old_path
+            and old_path.exists()
+            and old_path.resolve() != new_path.resolve()
+            and not new_path.exists()
+        ):
+            try:
+                old_path.rename(new_path)
+            except OSError:
+                pass
+        self.excel_path.set(str(new_path))
+
+    def _ensure_list_excel(self, *, create: bool = True) -> Path | None:
+        self._bind_list_excel_path(rename_existing=False)
+        path = Path(self.excel_path.get().strip())
+        if path.exists():
+            return path
+        if not create:
+            return None
+        try:
+            return ensure_list_workbook(path, SCHEMA_EXCEL)
+        except Exception as exc:
+            messagebox.showerror("Excel", str(exc))
+            return None
+
+    def browse_excel_folder(self) -> None:
+        if self._guard_locked("change this list's Excel folder"):
+            return
+        chosen = filedialog.askdirectory(
+            title="Folder for this list's Excel file",
+            initialdir=str(self._excel_dir if Path(self._excel_dir).exists() else APP_DIR),
         )
-        if path:
-            self.excel_path.set(path)
-            self.refresh_excel_info()
+        if not chosen:
+            return
+        new_dir = Path(chosen)
+        old_path = Path(self.excel_path.get().strip()) if self.excel_path.get().strip() else None
+        self._excel_dir = new_dir
+        data = load_config()
+        data["excel_dir"] = str(new_dir)
+        save_config(data)
+        self._bind_list_excel_path(rename_existing=False)
+        new_path = Path(self.excel_path.get().strip())
+        if old_path and old_path.exists() and old_path.resolve() != new_path.resolve():
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            if not new_path.exists():
+                try:
+                    shutil.move(str(old_path), str(new_path))
+                except OSError as exc:
+                    messagebox.showerror("Excel", f"Could not move the Excel file:\n{exc}")
+        self.refresh_excel_info()
+        self._sync_books_from_list_excel(self.books)
+        self.table.set_books(self.books, keep_checks=True)
+        self._persist_working()
+        self._set_status(f"This list's Excel folder is {new_dir}")
 
     def open_excel(self) -> None:
-        path = Path(self.excel_path.get().strip())
-        if not path.exists():
-            messagebox.showerror("Excel", "The Excel file was not found.")
+        path = self._ensure_list_excel(create=not self._list_locked)
+        if path is None or not path.exists():
+            messagebox.showerror("Excel", "The Excel file for this list was not found.")
             return
         try:
             os.startfile(str(path))
             self._set_status(f"Opened {path.name}")
         except OSError as exc:
             messagebox.showerror("Could not open Excel", str(exc))
+
+    def share_excel(self) -> None:
+        path = self._ensure_list_excel(create=not self._list_locked)
+        if path is None or not path.exists():
+            messagebox.showerror("Share", "There is no Excel file for this list yet.")
+            return
+        title = self.list_title.get().strip() or "SISU list"
+        subject = f"SISU catalog: {title}"
+        body = (
+            f"Please process the attached Excel catalog for scan list \"{title}\".\n\n"
+            "After you take this file, lock the list in SISU so the spreadsheet is not changed."
+        )
+        if self._share_via_outlook(path, subject, body):
+            self._set_status(f"Opened an email with {path.name} attached.")
+            return
+        if self._share_via_eml(path, subject, body):
+            self._set_status(f"Opened an email draft with {path.name} attached.")
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(str(path))
+        except tk.TclError:
+            pass
+        mailto = "mailto:?subject=" + quote(subject) + "&body=" + quote(body + "\n\n" + str(path))
+        webbrowser.open(mailto)
+        messagebox.showinfo(
+            "Share Excel",
+            "Could not attach the file in your mail program automatically.\n\n"
+            f"The Excel path was copied to the clipboard:\n{path}",
+        )
+
+    def _share_via_outlook(self, path: Path, subject: str, body: str) -> bool:
+        script = Path(tempfile.gettempdir()) / "sisu_share_excel.ps1"
+        def ps_str(value: str) -> str:
+            return "'" + value.replace("'", "''") + "'"
+
+        script.write_text(
+            "\n".join(
+                [
+                    "$ErrorActionPreference = 'Stop'",
+                    "$outlook = New-Object -ComObject Outlook.Application",
+                    "$mail = $outlook.CreateItem(0)",
+                    f"$mail.Subject = {ps_str(subject)}",
+                    f"$mail.Body = {ps_str(body)}",
+                    f"$null = $mail.Attachments.Add({ps_str(str(path))})",
+                    "$mail.Display() | Out-Null",
+                ]
+            ),
+            encoding="utf-8-sig",
+        )
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                capture_output=True,
+                text=True,
+                timeout=40,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
+
+    def _share_via_eml(self, path: Path, subject: str, body: str) -> bool:
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg.set_content(body)
+        msg.add_attachment(
+            path.read_bytes(),
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=path.name,
+        )
+        draft = APP_DIR / "cache" / "sisu_share_draft.eml"
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_bytes(msg.as_bytes())
+        try:
+            os.startfile(str(draft))
+            return True
+        except OSError:
+            return False
 
     def _open_local_file(self, path: Path) -> None:
         if not path.exists():
@@ -716,7 +907,11 @@ class BookCatalogApp(tk.Tk):
     def refresh_excel_info(self) -> None:
         path = Path(self.excel_path.get().strip())
         if not path.exists():
-            self.colored_info.set("No Excel file selected yet.")
+            self.colored_info.set(
+                f"This list’s Excel is {path.name} in {path.parent}. Open, Share, or Mark final will create it from the schema."
+            )
+            self.excel_columns = []
+            self.excel_all_columns = []
             return
         try:
             catalog = CatalogWorkbook(path)
@@ -731,7 +926,6 @@ class BookCatalogApp(tk.Tk):
         unmapped = [col["header"] for col in catalog.columns if not col.get("field")]
         extra = f" Unmapped orange headers: {', '.join(unmapped)}." if unmapped else ""
         self.colored_info.set(f"Orange/colored columns that will be filled: {names}.{extra}")
-        mark_excel_ids(catalog.existing_scanner_ids())
 
     def _current_payload(self, report: dict | None = None) -> dict:
         return build_payload(
@@ -747,6 +941,8 @@ class BookCatalogApp(tk.Tk):
             report=report if report is not None else self._list_report,
             notes=self._list_notes,
             created_at=self._list_created_at,
+            skip_cache_restore=self._skip_cache_restore,
+            excel_dir=str(self._excel_dir or ""),
         )
 
     def _persist_working(self, report: dict | None = None) -> None:
@@ -786,10 +982,13 @@ class BookCatalogApp(tk.Tk):
         self.pages_spin.configure(state=edit_state)
         self.unknown_check.configure(state=edit_state)
         self.list_title_entry.configure(state=edit_state)
+        folder_state = "disabled" if self._list_locked else "normal"
+        self.excel_folder_btn.configure(state=folder_state)
         if self._list_locked:
             self.more_btn.configure(state="disabled")
             self.approve_btn.configure(state="disabled")
             self.final_btn.configure(state="disabled")
+            self.unfinal_btn.configure(state="disabled")
         elif self._selected_book and not self._busy:
             self.more_btn.configure(state="normal")
             self._update_workflow_buttons(self._selected_book)
@@ -801,11 +1000,12 @@ class BookCatalogApp(tk.Tk):
         self._list_created_at = str(data.get("created_at") or "")
         self._list_notes = str(data.get("notes") or "")
         self._list_report = data.get("report") or {}
+        self._skip_cache_restore = bool(data.get("skip_cache_restore"))
         self.list_title.set(str(data.get("title") or "New"))
-        urls = [str(url) for url in (data.get("urls") or []) if str(url).strip()]
+        urls = merge_search_urls(list(data.get("urls") or []))
         self.url_text.configure(state="normal")
         self.url_text.delete("1.0", "end")
-        self.url_text.insert("1.0", "\n".join(urls) if urls else DEFAULT_URLS)
+        self.url_text.insert("1.0", "\n".join(urls))
         if data.get("year") not in (None, ""):
             self.year.set(str(data.get("year")))
         if data.get("max_pages"):
@@ -815,10 +1015,14 @@ class BookCatalogApp(tk.Tk):
                 pass
         if "include_unknown" in data:
             self.include_unknown.set(bool(data.get("include_unknown")))
+        excel_dir = str(data.get("excel_dir") or "").strip()
+        self._excel_dir = Path(excel_dir) if excel_dir else self._default_excel_dir()
+        self._bind_list_excel_path(rename_existing=False)
         self.books = books_from_payload(data)
         self._prepare_books(self.books)
         self.table.set_books(self.books, keep_checks=False)
         self._selected_book = None
+        self.refresh_excel_info()
         self._persist_working()
         report = self._list_report
         if report:
@@ -859,6 +1063,7 @@ class BookCatalogApp(tk.Tk):
             max_pages=int(self.max_pages.get() or 5),
             include_unknown=bool(self.include_unknown.get()),
         )
+        payload["excel_dir"] = str(self._excel_dir or "")
         self._apply_payload(payload, status="Started a new empty working list.")
 
     def stash_working_list(self) -> None:
@@ -878,6 +1083,7 @@ class BookCatalogApp(tk.Tk):
             max_pages=int(self.max_pages.get() or 5),
             include_unknown=bool(self.include_unknown.get()),
         )
+        payload["excel_dir"] = str(self._excel_dir or "")
         self._apply_payload(payload, status="Stashed the previous list. This working list is empty for a new search.")
 
     def restore_stash(self) -> None:
@@ -914,6 +1120,7 @@ class BookCatalogApp(tk.Tk):
         payload = save_named(self._current_payload())
         self._list_id = str(payload.get("id") or "")
         self._list_created_at = str(payload.get("created_at") or "")
+        self._bind_list_excel_path(rename_existing=True)
         self._persist_working()
         self._set_status(f"Saved list “{title}”.")
         if self._lists_popup is not None:
@@ -956,6 +1163,18 @@ class BookCatalogApp(tk.Tk):
             variable=self._show_archived,
             command=self._reload_lists_table,
         ).pack(anchor="w", pady=(8, 6))
+        btns = ttk.Frame(body)
+        btns.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Open", command=self._open_selected_saved_list).pack(side="left")
+        ttk.Button(btns, text="Rename", command=self._rename_selected_list).pack(side="left", padx=4)
+        ttk.Button(btns, text="Lock", command=lambda: self._flag_selected_list(locked=True)).pack(side="left")
+        ttk.Button(btns, text="Unlock", command=lambda: self._flag_selected_list(locked=False)).pack(side="left", padx=4)
+        ttk.Button(btns, text="Archive", command=lambda: self._flag_selected_list(archived=True)).pack(side="left")
+        ttk.Button(btns, text="Unarchive", command=lambda: self._flag_selected_list(archived=False)).pack(
+            side="left", padx=4
+        )
+        ttk.Button(btns, text="Delete…", command=self._delete_selected_list).pack(side="left")
+        ttk.Button(btns, text="Close", command=self._close_lists_popup).pack(side="right")
         wrap = ttk.Frame(body)
         wrap.pack(fill="both", expand=True)
         columns = ("title", "books", "year", "updated", "state")
@@ -972,22 +1191,10 @@ class BookCatalogApp(tk.Tk):
         tree.column("state", width=140, anchor="w")
         scroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
-        tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
         self._lists_tree = tree
         tree.bind("<Double-1>", lambda _e: self._open_selected_saved_list())
-        btns = ttk.Frame(body)
-        btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="Open", command=self._open_selected_saved_list).pack(side="left")
-        ttk.Button(btns, text="Rename", command=self._rename_selected_list).pack(side="left", padx=4)
-        ttk.Button(btns, text="Lock", command=lambda: self._flag_selected_list(locked=True)).pack(side="left")
-        ttk.Button(btns, text="Unlock", command=lambda: self._flag_selected_list(locked=False)).pack(side="left", padx=4)
-        ttk.Button(btns, text="Archive", command=lambda: self._flag_selected_list(archived=True)).pack(side="left")
-        ttk.Button(btns, text="Unarchive", command=lambda: self._flag_selected_list(archived=False)).pack(
-            side="left", padx=4
-        )
-        ttk.Button(btns, text="Delete…", command=self._delete_selected_list).pack(side="left")
-        ttk.Button(btns, text="Close", command=self._close_lists_popup).pack(side="right")
         self._reload_lists_table()
 
     def _close_lists_popup(self) -> None:
@@ -1066,6 +1273,7 @@ class BookCatalogApp(tk.Tk):
         rename_named(list_id, entered.strip())
         if self._list_id == list_id:
             self.list_title.set(entered.strip())
+            self._bind_list_excel_path(rename_existing=not self._list_locked)
             self._persist_working()
         self._reload_lists_table()
 
@@ -1140,6 +1348,7 @@ class BookCatalogApp(tk.Tk):
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
+        self.unfinal_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.start(12)
         self._set_status("Starting crawl…")
@@ -1207,6 +1416,7 @@ class BookCatalogApp(tk.Tk):
                     report=asdict(crawler.report),
                     notes=notes,
                     created_at=created_at,
+                    excel_dir=str(self._excel_dir or ""),
                 )
             )
             try:
@@ -1364,6 +1574,7 @@ class BookCatalogApp(tk.Tk):
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
+        self.unfinal_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.start(12)
         label = books[0].publisher.strip() if books else "publisher"
@@ -1889,7 +2100,7 @@ class BookCatalogApp(tk.Tk):
         self._clear_detail_panel()
         self._add_detail_section("Scan")
         self._add_detail_row("Scanner ID", book.scanner_id or "—")
-        workflow = "Final" if book.final else "Approved" if book.approved else "In Excel" if book.excel_passed else "Not approved"
+        workflow = "Final" if book.final else "Approved" if book.approved else "Not approved"
         self._add_detail_row("Workflow", workflow)
         self._add_detail_row("Status", book.scan_status or "—")
         self._add_detail_row("Message", book.scan_message or "—")
@@ -2056,6 +2267,7 @@ class BookCatalogApp(tk.Tk):
             self.table.set_books(self.books, keep_checks=True)
             if selected not in self.books:
                 self._selected_book = None
+            self._skip_cache_restore = True
             self._persist_working()
             self._refresh_list_status()
             self._set_status(f"Removed {removed} book(s). {len(self.books)} remaining.")
@@ -2078,25 +2290,50 @@ class BookCatalogApp(tk.Tk):
                 if not book.scan_message:
                     book.scan_message = "Scan did not complete."
         attach_books(books)
+        self._sync_books_from_list_excel(books)
+
+    def _book_excel_keys(self, book: Book) -> set[str]:
+        keys: set[str] = set()
+        if (book.scanner_id or "").strip():
+            keys.add(f"scanner:{book.scanner_id.strip()}")
+        if (book.isbn or "").strip():
+            keys.add(f"isbn:{book.isbn.strip()}")
+        title = (book.title or "").strip()
+        if title:
+            keys.add(f"title:{title.casefold()}")
+        return keys
+
+    def _sync_books_from_list_excel(self, books: list[Book]) -> None:
+        path = Path(self.excel_path.get().strip())
+        present: set[str] = set()
+        if path.exists():
+            try:
+                catalog = CatalogWorkbook(path)
+                present = catalog.existing_keys()
+            except Exception:
+                present = set()
+        for book in books:
+            on_excel = bool(present and (self._book_excel_keys(book) & present))
+            if on_excel:
+                book.excel_passed = True
+                book.final = True
+                book.approved = True
+            else:
+                book.excel_passed = False
+                book.final = False
 
     def _update_workflow_buttons(self, book: Book | None) -> None:
         if book is None or self._busy or self._list_locked:
             self.approve_btn.configure(state="disabled")
             self.final_btn.configure(state="disabled")
+            self.unfinal_btn.configure(state="disabled")
             return
-        can_approve = bool(book) and (not book.final) and (not book.excel_passed) and book.workflow_label() == "Approve"
-        can_final = bool(book) and (not book.final) and book.excel_passed
+        can_approve = bool(book) and (not book.final) and (not book.approved) and bool((book.title or "").strip())
+        can_final = bool(book) and book.approved and (not book.final)
+        can_unfinal = bool(book) and book.final
         self.approve_btn.configure(state="normal" if can_approve else "disabled")
         self.final_btn.configure(state="normal" if can_final else "disabled")
-
-    def handle_book_action(self, book: Book) -> None:
-        if self._guard_locked("change books on this list"):
-            return
-        label = book.workflow_label()
-        if label == "Approve":
-            self._approve_books([book])
-        elif label == "Mark final":
-            self._mark_books_final([book])
+        self.unfinal_btn.configure(state="normal" if can_unfinal else "disabled")
 
     def approve_selected(self) -> None:
         if self._guard_locked("approve books"):
@@ -2104,32 +2341,50 @@ class BookCatalogApp(tk.Tk):
         if self._selected_book:
             self._approve_books([self._selected_book])
 
-    def approve_checked(self) -> None:
-        if self._guard_locked("approve books"):
-            return
-        selected = self.table.selected_books()
-        if not selected:
-            messagebox.showinfo("Nothing selected", "Check one or more books in the list first.")
-            return
-        self._approve_books(selected)
-
     def mark_selected_final(self) -> None:
-        if self._guard_locked("mark books final"):
+        if self._guard_locked("change this list's Excel"):
             return
         if self._selected_book:
             self._mark_books_final([self._selected_book])
 
-    def mark_selected_final_checked(self) -> None:
-        if self._guard_locked("mark books final"):
+    def remove_selected_final(self) -> None:
+        if self._guard_locked("change this list's Excel"):
             return
-        selected = self.table.selected_books()
-        if not selected:
-            messagebox.showinfo("Nothing selected", "Check one or more approved books first.")
+        book = self._selected_book
+        if not book or not book.final:
             return
-        self._mark_books_final(selected)
+        if not messagebox.askyesno(
+            "Remove final",
+            f"Remove Final from “{book.display_title()}”?\n\n"
+            "This takes the book off this list’s Excel and brings it back to Approved.",
+        ):
+            return
+        path = Path(self.excel_path.get().strip())
+        if path.exists() and (book.scanner_id or "").strip():
+            try:
+                catalog = CatalogWorkbook(path)
+                catalog.remove_scanner_ids({book.scanner_id})
+                saved = catalog.save()
+            except Exception as exc:
+                messagebox.showerror("Excel", f"Could not update the Excel file:\n{exc}")
+                return
+            if saved != path:
+                messagebox.showinfo(
+                    "Excel",
+                    f"The original file is open or locked, so the change was saved as:\n{saved}",
+                )
+        book.final = False
+        book.excel_passed = False
+        book.approved = True
+        persist_book_state(book)
+        self.table.refresh_book(book)
+        self.show_book(book)
+        self._persist_working()
+        self.refresh_excel_info()
+        self._set_status("Removed Final. The book is Approved again and is not on this list’s Excel.")
 
     def _approve_books(self, books: list[Book]) -> None:
-        to_write: list[Book] = []
+        approved = 0
         skipped_final = 0
         skipped_failed = 0
         already = 0
@@ -2138,13 +2393,46 @@ class BookCatalogApp(tk.Tk):
             if book.final:
                 skipped_final += 1
                 continue
-            if book.scan_status == "failed" and not (book.title or "").strip():
+            if not (book.title or "").strip():
                 skipped_failed += 1
                 continue
-            if book.excel_passed:
-                book.approved = True
-                persist_book_state(book)
+            if book.approved:
                 already += 1
+                continue
+            book.approved = True
+            persist_book_state(book)
+            self.table.refresh_book(book)
+            approved += 1
+        if self._selected_book:
+            self.show_book(self._selected_book)
+            self._update_workflow_buttons(self._selected_book)
+        self._persist_working()
+        parts = []
+        if approved:
+            parts.append(f"Approved {approved} book(s)")
+        if already:
+            parts.append(f"{already} already approved")
+        if skipped_failed:
+            parts.append(f"{skipped_failed} need a title first")
+        if skipped_final:
+            parts.append(f"{skipped_final} already final")
+        self._set_status("; ".join(parts) or "Nothing to approve.")
+
+    def _mark_books_final(self, books: list[Book]) -> None:
+        to_write: list[Book] = []
+        already_in_excel: list[Book] = []
+        skipped_unapproved = 0
+        skipped_final = 0
+        for book in books:
+            attach_book(book)
+            if book.final:
+                skipped_final += 1
+                continue
+            if not book.approved:
+                skipped_unapproved += 1
+                continue
+            if book.excel_passed:
+                already_in_excel.append(book)
             else:
                 to_write.append(book)
         written = 0
@@ -2153,37 +2441,9 @@ class BookCatalogApp(tk.Tk):
         note = ""
         if to_write:
             written, skipped_excel, saved, note = self._pass_books_to_excel(to_write)
-        for book in books:
-            self.table.refresh_book(book)
-        if self._selected_book:
-            self.show_book(self._selected_book)
-        self._persist_working()
-        parts = []
-        if written:
-            parts.append(f"Approved and passed {written} book(s) to Excel")
-        if already:
-            parts.append(f"{already} already in Excel")
-        if skipped_excel:
-            parts.append(f"{skipped_excel} already in Excel (duplicate)")
-        if skipped_failed:
-            parts.append(f"{skipped_failed} failed scan(s) need a title first")
-        if skipped_final:
-            parts.append(f"{skipped_final} already final")
-        summary = "; ".join(parts) or "Nothing to approve."
-        if saved and note:
-            summary += note
-        self._set_status(summary)
-        if written or already or skipped_excel:
-            messagebox.showinfo("Approved", summary)
-
-    def _mark_books_final(self, books: list[Book]) -> None:
         marked = 0
-        skipped = 0
-        for book in books:
-            if book.final:
-                continue
+        for book in [*to_write, *already_in_excel]:
             if not book.excel_passed:
-                skipped += 1
                 continue
             book.final = True
             book.approved = True
@@ -2192,25 +2452,40 @@ class BookCatalogApp(tk.Tk):
             marked += 1
         if self._selected_book:
             self.show_book(self._selected_book)
+            self._update_workflow_buttons(self._selected_book)
         self._persist_working()
         if not marked:
-            messagebox.showinfo(
-                "Mark final",
-                "Pass the book to Excel first by clicking Approve. After you process the spreadsheet, mark it final so it will not be written again.",
-            )
+            if skipped_unapproved:
+                messagebox.showinfo(
+                    "Mark final",
+                    "Approve the book in the details pane first. Mark final writes it to Excel and marks it as on the spreadsheet.",
+                )
+            elif skipped_final:
+                self._set_status("This book is already final and in Excel.")
+            else:
+                messagebox.showinfo("Mark final", "The book could not be written to Excel.")
             return
-        extra = f" {skipped} book(s) are not in Excel yet." if skipped else ""
-        self._set_status(f"Marked {marked} book(s) final.{extra}")
-        self._persist_working()
+        parts = [f"Marked {marked} book(s) final"]
+        if written:
+            parts.append(f"wrote {written} to Excel")
+        if skipped_excel:
+            parts.append(f"{skipped_excel} already in Excel")
+        if skipped_unapproved:
+            parts.append(f"{skipped_unapproved} not approved yet")
+        summary = "; ".join(parts)
+        if saved and note:
+            summary += note
+        self._set_status(summary)
 
     def _pass_books_to_excel(self, books: list[Book]) -> tuple[int, int, Path | None, str]:
-        path = Path(self.excel_path.get().strip())
-        if not path.exists():
-            messagebox.showerror("Excel", "The Excel file was not found.")
+        if self._list_locked:
+            messagebox.showinfo("Locked list", "This list is locked, so its Excel cannot be changed.")
+            return 0, 0, None, ""
+        path = self._ensure_list_excel(create=True)
+        if path is None:
             return 0, 0, None, ""
         try:
             catalog = CatalogWorkbook(path)
-            mark_excel_ids(catalog.existing_scanner_ids())
             payload = [book.to_excel_fields() for book in books]
             written, skipped, written_ids, skipped_ids = catalog.append_books(payload)
             saved = catalog.save()
@@ -2223,13 +2498,11 @@ class BookCatalogApp(tk.Tk):
                 book.approved = True
                 book.excel_passed = True
                 persist_book_state(book)
+        self.refresh_excel_info()
         note = ""
         if saved != path:
             note = f"\n\nThe original file is open or locked, so results were saved as:\n{saved}"
         return written, skipped, saved, note
-
-    def write_excel(self) -> None:
-        self.approve_checked()
 
     def _set_status(self, text: str) -> None:
         self.status.set(text)
@@ -2314,6 +2587,7 @@ class BookCatalogApp(tk.Tk):
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
+        self.unfinal_btn.configure(state="disabled")
         self._set_status("Updating SISU from GitHub. The window will restart when it is done.")
         thread = threading.Thread(target=self._run_self_update, daemon=True)
         thread.start()
