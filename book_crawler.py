@@ -87,12 +87,28 @@ def site_error_message(html: str, status: int | None = None, url: str = "") -> s
     return None
 
 
+def http_status_message(status: int, url: str = "") -> str:
+    host = urlparse(url).netloc or url
+    where = f" ({host})" if host else ""
+    if status == 404:
+        return f"HTTP 404: the site was reached{where}, but this page was not found."
+    if status == 403:
+        return f"HTTP 403: the site refused access to this page{where}."
+    if status == 401:
+        return f"HTTP 401: this page requires a login{where}."
+    return f"HTTP {status}: the site returned an error for this page{where}."
+
+
 def request_failure_message(exc: BaseException, url: str) -> str:
     host = urlparse(url).netloc or url
     if isinstance(exc, requests.Timeout):
         return f"Timed out while opening {host}."
     if isinstance(exc, requests.ConnectionError):
         return f"Could not connect to {host}."
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None) if response is not None else None
+    if status:
+        return http_status_message(int(status), url)
     return f"Could not open {host}: {exc.__class__.__name__}."
 
 HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
@@ -110,6 +126,28 @@ SKIP_PATH_BITS = (
     "/customer",
     "/mailto:",
     "/search/suggest",
+)
+ASSET_SUFFIXES = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".ico",
+    ".css",
+    ".js",
+    ".mjs",
+    ".map",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".mp3",
+    ".mp4",
+    ".webm",
+    ".pdf",
 )
 PRODUCT_PATH_HINTS = (
     "/מוצרים/",
@@ -1478,6 +1516,12 @@ def same_domain(left: str, right: str) -> bool:
     return urlparse(left).netloc.lstrip("www.") == urlparse(right).netloc.lstrip("www.")
 
 
+def is_asset_url(url: str) -> bool:
+    """Cover images and other static files are not book pages."""
+    path = unquote(urlparse(url or "").path).casefold()
+    return path.endswith(ASSET_SUFFIXES)
+
+
 def normalize_url(base: str, href: str) -> str | None:
     if not href:
         return None
@@ -1685,7 +1729,7 @@ def collect_matching_links(soup: BeautifulSoup, page_url: str, book: Book) -> li
     }
     for tag in soup.select("a[href]"):
         url = normalize_url(page_url, tag.get("href", ""))
-        if not url or not same_domain(page_url, url):
+        if not url or not same_domain(page_url, url) or is_asset_url(url):
             continue
         path = unquote(urlparse(url).path).strip("/")
         first = path.split("/")[0].casefold() if path else ""
@@ -1704,7 +1748,7 @@ def collect_product_links(soup: BeautifulSoup, page_url: str) -> list[str]:
 
     def add(href: str | None) -> None:
         url = normalize_url(page_url, href or "")
-        if url and "/icons/" not in url and url not in found:
+        if url and "/icons/" not in url and not is_asset_url(url) and url not in found:
             path = urlparse(url).path.lower()
             if any(hint in path for hint in PRODUCT_PATH_HINTS):
                 found.append(url)
@@ -1760,7 +1804,7 @@ def collect_search_result_links(soup: BeautifulSoup, page_url: str, book: Book) 
 
     def add(href: str | None, title_text: str = "") -> None:
         url = normalize_url(page_url, href or "")
-        if not url or not same_domain(page_url, url) or is_query_listing_url(url):
+        if not url or not same_domain(page_url, url) or is_query_listing_url(url) or is_asset_url(url):
             return
         key = _url_key(url)
         if key == current:
@@ -1823,7 +1867,7 @@ def collect_detail_links(soup: BeautifulSoup, page_url: str, book: Book) -> list
 
     def add(href: str | None, image: bool = False) -> None:
         url = normalize_url(page_url, href or "")
-        if not url or not same_domain(page_url, url):
+        if not url or not same_domain(page_url, url) or is_asset_url(url):
             return
         key = _url_key(url)
         if key == current or key in seen:
@@ -1967,7 +2011,8 @@ class BookCrawler:
         failure = site_error_message(html, response.status_code, response.url or url)
         if failure:
             raise SiteError(failure, url=response.url or url)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise SiteError(http_status_message(response.status_code, response.url or url), url=response.url or url)
         time.sleep(self.delay_seconds)
         return html, response.url
 
@@ -2065,7 +2110,11 @@ class BookCrawler:
                         self.report.listing_failed += 1
                         continue
                 for product_url in collect_product_links(soup, listing_url):
-                    if same_domain(start_url, product_url) and product_url not in product_urls:
+                    if (
+                        same_domain(start_url, product_url)
+                        and not is_asset_url(product_url)
+                        and product_url not in product_urls
+                    ):
                         product_urls.append(product_url)
                 if len(visited_listings) < max_listing_pages:
                     for page_url in collect_pagination_links(soup, listing_url):
@@ -2087,10 +2136,11 @@ class BookCrawler:
                     book = self._book_from_url(product_url)
                 except (SiteError, requests.RequestException) as exc:
                     self.report.product_failed += 1
+                    note = str(exc) if isinstance(exc, SiteError) else request_failure_message(exc, product_url)
                     stub = Book(url=product_url)
-                    stub.mark_scan_failed(f"Could not open the book page: {exc.__class__.__name__}: {exc}")
+                    stub.mark_scan_failed(note)
                     results.append(stub)
-                    self.progress(f"Kept a failed page ({exc.__class__.__name__}). Continuing…")
+                    self.progress(f"{note} Continuing…")
                     continue
                 if book is None:
                     stub = Book(url=product_url)
@@ -2127,10 +2177,7 @@ class BookCrawler:
         if "e-vrit" in host or "evrit" in host:
             return [f"{origin}/search?q={encoded}"]
         if "booknet" in host:
-            return [
-                f"{origin}/search?q={encoded}",
-                f"{origin}/%D7%97%D7%99%D7%A4%D7%95%D7%A9?q={encoded}",
-            ]
+            return [f"{origin}/%D7%97%D7%99%D7%A4%D7%95%D7%A9?q={encoded}"]
         return [
             f"{origin}/search?q={encoded}",
             f"{origin}/search?type=product&q={encoded}",
