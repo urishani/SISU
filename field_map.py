@@ -57,6 +57,10 @@ EXCEL_TARGETS: dict[str, str] = {
     "keywords": "Keywords",
     "cover_image_url": "Cover image URL",
     "back_image_url": "Back image URL",
+    "translator": "Translator",
+    "illustrator": "Illustrator",
+    "marc": "MARC",
+    "ddc": "DDC",
     "scanner_id": "Scanner ID",
 }
 
@@ -79,6 +83,10 @@ CORE_FIELDS = {
     "dimensions",
     "cover_image_url",
     "back_image_url",
+    "translator",
+    "illustrator",
+    "marc",
+    "ddc",
 }
 
 LABEL_MAP_KEYS = {
@@ -355,11 +363,34 @@ def apply_field(book: Any, field: str, value: str) -> bool:
         return True
     if field == "translated":
         captured = book.captured_fields()
-        text = format_person_name(value) if _looks_like_person_name(value) and len(value.split()) >= 2 else value
+        if _looks_like_person_name(value) and len(value.split()) >= 2:
+            if empty("translator"):
+                book.translator = format_person_name(value) or value
+            if not captured.get("translated"):
+                book.set_captured("translated", "Y")
+            return bool(book.translator)
+        text = value
         if text and not captured.get("translated"):
             book.set_captured("translated", text)
             return True
         return False
+    if field == "translator" and empty("translator"):
+        book.translator = format_person_name(value) or value
+        captured = book.captured_fields()
+        if book.translator and not captured.get("translated"):
+            book.set_captured("translated", "Y")
+        return bool(book.translator)
+    if field == "illustrator" and empty("illustrator"):
+        book.illustrator = format_person_name(value) or value
+        return bool(book.illustrator)
+    if field == "marc" and empty("marc"):
+        digits = re.sub(r"\s", "", value)
+        book.marc = digits if re.fullmatch(r"\d{6,}", digits) else value.strip()[:80]
+        return bool(book.marc)
+    if field == "ddc" and empty("ddc"):
+        match = re.search(r"\d{1,3}(?:\.\d+)*", value)
+        book.ddc = match.group(0) if match else value.strip()[:80]
+        return bool(book.ddc)
     if field == "language":
         value = isolate_language(value)
         if not value:

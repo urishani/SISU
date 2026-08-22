@@ -87,6 +87,10 @@ FILLABLE_FIELDS = (
     "description",
     "cover_image_url",
     "back_image_url",
+    "translator",
+    "illustrator",
+    "marc",
+    "ddc",
 )
 LABEL_MAP: dict[str, tuple[str, ...]] = {
     "publisher": ("publisher", "הוצאה", "הוצאה לאור", "מוציא לאור", "הוצאת", "manufacturer"),
@@ -130,6 +134,62 @@ LABEL_MAP: dict[str, tuple[str, ...]] = {
     "price": ("price", "מחיר", "מחיר באתר", "israeli price"),
     "description": ("description", "תקציר", "תיאור", "גב הספר", "about"),
     "title": ("title", "name", "שם", "כותרת", "שם ספר", "שם הספר"),
+    "translator": (
+        "translator",
+        "translators",
+        "translated by",
+        "translation by",
+        "מתרגם",
+        "מתרגמת",
+        "מתרגמים",
+        "תרגם",
+        "תרגמה",
+        "תרגום של",
+        "שם המתרגם",
+    ),
+    "illustrator": (
+        "illustrator",
+        "illustrators",
+        "illustrated by",
+        "illustrations by",
+        "מאייר",
+        "מאיירת",
+        "מאיירים",
+        "אייר",
+        "איירה",
+        "צייר",
+        "ציירת",
+        "איורים",
+        "שם המאייר",
+    ),
+    "marc": (
+        "marc",
+        "marc21",
+        "marc 21",
+        "marc code",
+        "system number",
+        "mms id",
+        "mmsid",
+        "nli id",
+        "מספר מערכת",
+        "קוד marc",
+        "מספר marc",
+        "מספר רשומה",
+    ),
+    "ddc": (
+        "ddc",
+        "dewey",
+        "dewey decimal",
+        "dewey classification",
+        "dewey class",
+        "dewey class number",
+        "classification dewey",
+        "דיואי",
+        "סיווג דיואי",
+        "מספר דיואי",
+        "קוד דיואי",
+        "דיואי עשרוני",
+    ),
 }
 SITE_DISPLAY_NAMES = {
     "booknet.co.il": "Booknet",
@@ -184,6 +244,10 @@ class Book:
     description: str = ""
     cover_image_url: str = ""
     back_image_url: str = ""
+    translator: str = ""
+    illustrator: str = ""
+    marc: str = ""
+    ddc: str = ""
     extra: dict[str, str] = field(default_factory=dict)
     scanner_id: str = ""
     scan_status: str = ""
@@ -493,6 +557,10 @@ class Book:
             "description_en": desc_en,
             "cover_image_url": clean(self.cover_image_url),
             "back_image_url": clean(self.back_image_url),
+            "translator": format_person_name(self.translator) or clean(self.translator),
+            "illustrator": format_person_name(self.illustrator) or clean(self.illustrator),
+            "marc": clean(self.marc),
+            "ddc": clean(self.ddc),
             "scanner_id": clean(self.scanner_id),
             "url": self.url,
         }
@@ -502,11 +570,17 @@ class Book:
             author_he = captured.get("author_he") or author_he
         fields["author_en"] = format_person_name(author_en)
         fields["author_he"] = format_person_name(author_he)
-        if captured.get("translated"):
-            fields["translated"] = format_person_name(captured["translated"]) if _looks_like_person_name(
-                captured["translated"]
-            ) else captured["translated"]
+        legacy = captured.get("translated") or ""
+        if not fields["translator"] and _looks_like_person_name(legacy) and len(legacy.split()) >= 2:
+            fields["translator"] = format_person_name(legacy)
+            fields["translated"] = "Y"
+        elif captured.get("translated"):
+            fields["translated"] = legacy if not _looks_like_person_name(legacy) else "Y"
+        if fields["translator"] and not fields.get("translated"):
+            fields["translated"] = "Y"
         for name, value in captured.items():
+            if name in {"translated", "translator"}:
+                continue
             if name not in fields or not fields[name]:
                 fields[name] = value
         return fields
@@ -961,6 +1035,10 @@ def fill_from_schema(book: Book, item: dict) -> None:
         book.width_cm = book.width_cm or re.sub(r"[^\d.]", "", schema_name(width))
     if depth:
         book.thickness_cm = book.thickness_cm or re.sub(r"[^\d.]", "", schema_name(depth))
+    if not book.translator:
+        book.translator = schema_name(item.get("translator"))
+    if not book.illustrator:
+        book.illustrator = schema_name(item.get("illustrator") or item.get("artist"))
 
 
 def labeled_value_pairs(soup: BeautifulSoup) -> dict[str, str]:
@@ -1011,6 +1089,19 @@ def labeled_value_pairs(soup: BeautifulSoup) -> dict[str, str]:
         content = title.find_next_sibling(class_="attributeList-content")
         if content:
             remember(title.get_text(" ", strip=True), content.get_text(" ", strip=True))
+    for block in soup.select(
+        ".display-element, prm-data-field, .item-details-element, .full-view-field, [class*='display-element']"
+    ):
+        if not isinstance(block, Tag):
+            continue
+        title = block.select_one(
+            ".display-element-title, .data-field-title, .full-view-label, dt, .label, span[class*='title']"
+        )
+        value = block.select_one(
+            ".display-element-text, .data-field-value, .full-view-value, dd, .value, span[class*='text']"
+        )
+        if title and value:
+            remember(title.get_text(" ", strip=True), value.get_text(" ", strip=True))
     return pairs
 
 
@@ -1045,6 +1136,16 @@ def fill_from_booknet(book: Book, soup: BeautifulSoup, url: str) -> None:
     authors = [a.get_text(" ", strip=True) for a in root.select("[itemprop='author'], .pp-authors a, .product-author")]
     if authors and not book.author:
         book.author = ", ".join(dict.fromkeys(authors))
+    translators = [a.get_text(" ", strip=True) for a in root.select("[itemprop='translator']")]
+    if translators and not book.translator:
+        book.translator = format_person_name(", ".join(dict.fromkeys(translators))) or ", ".join(dict.fromkeys(translators))
+    illustrators = [
+        a.get_text(" ", strip=True) for a in root.select("[itemprop='illustrator'], [itemprop='artist']")
+    ]
+    if illustrators and not book.illustrator:
+        book.illustrator = format_person_name(", ".join(dict.fromkeys(illustrators))) or ", ".join(
+            dict.fromkeys(illustrators)
+        )
     publisher = root.select_one("#product-page-manufacturer-name, [itemprop='publisher']")
     if publisher:
         book.publisher = book.publisher or publisher.get_text(" ", strip=True)
@@ -1080,6 +1181,36 @@ def fill_from_magento(book: Book, soup: BeautifulSoup) -> None:
         book.price_ils = price.get("data-price-amount") or parse_price(price.get_text(" ", strip=True))
 
 
+def fill_from_nli(book: Book, soup: BeautifulSoup, url: str) -> None:
+    if "nli.org.il" not in site_host(url):
+        return
+    text = soup.get_text("\n", strip=True)
+    if not book.ddc:
+        match = re.search(
+            r"(?:dewey(?:\s+(?:decimal|class(?:ification| number)?))?|ddc|דיואי(?:\s+עשרוני)?|סיווג\s*דיואי)\s*[:\-]?\s*([0-9]{1,3}(?:\.[0-9]+)*)",
+            text,
+            re.I,
+        )
+        if match:
+            book.ddc = match.group(1)
+    if not book.marc:
+        match = re.search(
+            r"(?:mms\s*id|system\s*number|מספר\s*מערכת|marc(?:\s*21)?)\s*[:\-]?\s*(\d{6,})",
+            text,
+            re.I,
+        )
+        if match:
+            book.marc = match.group(1)
+    if not book.marc:
+        parsed = urlparse(url)
+        for key, values in parse_qs(parsed.query).items():
+            if key.casefold() in {"docid", "doc_id", "mms_id", "recordid", "record_id"} and values:
+                digits = re.sub(r"\D", "", values[0])
+                if len(digits) >= 6:
+                    book.marc = digits
+                    break
+
+
 def extract_book_from_html(html: str, url: str) -> Book:
     soup = parse_html(html)
     book = Book(url=url)
@@ -1094,6 +1225,7 @@ def extract_book_from_html(html: str, url: str) -> Book:
     fill_from_labels(book, pairs)
     attach_page_fields(book, pairs)
     remember_candidates(pairs, url)
+    fill_from_nli(book, soup, url)
     if not book.title:
         og = soup.select_one("meta[property='og:title']")
         h1 = soup.find("h1")
@@ -1109,6 +1241,8 @@ def extract_book_from_html(html: str, url: str) -> Book:
     book.year = extract_year(book.year)
     book.title = clean(book.title)
     book.author = format_person_name(book.author) or clean(book.author)
+    book.translator = format_person_name(book.translator) or clean(book.translator)
+    book.illustrator = format_person_name(book.illustrator) or clean(book.illustrator)
     book.publisher = clean(book.publisher)
     book.description = clean(book.description)
     fill_book_images(book, soup, url, html)

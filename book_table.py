@@ -61,7 +61,7 @@ class BookTable(ttk.Frame):
         self._by_iid: dict[str, Book] = {}
 
         style = ttk.Style(self)
-        style.configure("Books.Treeview", font=("Segoe UI", 10), rowheight=ROW_HEIGHT)
+        style.configure("Books.Treeview", font=("Segoe UI", 10), rowheight=ROW_HEIGHT, padding=0)
         style.configure("Books.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
         columns = ("mark", "title", "author", "year", "status", "publisher", "code", "price")
@@ -86,14 +86,10 @@ class BookTable(ttk.Frame):
         self.tree.tag_configure("failed", background="#F8E4E4")
         self.tree.tag_configure("approved", background="#E4F7EA")
         self.tree.tag_configure("final", background="#E8E8E8")
-        scroll_y = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        scroll_x = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scroll_y.grid(row=0, column=1, sticky="ns")
-        scroll_x.grid(row=1, column=0, sticky="ew")
+        scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Motion>", self._on_motion)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)

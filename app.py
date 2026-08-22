@@ -294,9 +294,6 @@ class BookCatalogApp(tk.Tk):
             ttk.Checkbutton(filter_more, text=label, variable=var, command=self._on_filter_change).pack(
                 side="left", padx=(0, 8)
             )
-        table_pad = ttk.Frame(list_frame, height=10)
-        table_pad.pack(side="bottom", fill="x")
-        table_pad.pack_propagate(False)
         self.table.pack(fill="both", expand=True)
 
         detail_header = ttk.Frame(detail_frame, style="Card.TFrame")

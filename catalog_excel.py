@@ -63,6 +63,11 @@ HEADER_TO_FIELD: dict[str, str] = {
     "back page url": "back_image_url",
     "scanner id": "scanner_id",
     "scannerid": "scanner_id",
+    "translator": "translator",
+    "illustrator": "illustrator",
+    "marc": "marc",
+    "ddc": "ddc",
+    "dewey": "ddc",
     "comments": "comments",
     "keywords": "keywords",
 }
@@ -72,6 +77,10 @@ REQUIRED_COLORED_HEADERS = (
     "Cover image URL",
     "Back image URL",
     "Scanner ID",
+    "Translator",
+    "Illustrator",
+    "MARC",
+    "DDC",
 )
 
 BLANK_FILLS = {
