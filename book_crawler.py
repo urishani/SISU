@@ -682,6 +682,7 @@ class CrawlReport:
     from_cache: bool = False
     cancelled: bool = False
     error: str = ""
+    error_books: int = 0
 
     def summary(self) -> str:
         if self.error:
@@ -693,9 +694,15 @@ class CrawlReport:
             f"book links: {self.product_links}",
             f"from cache: {self.product_cached}",
             f"downloaded: {self.product_fetched}",
-            f"failed: {self.listing_failed + self.product_failed}",
             f"matched: {self.matched}",
         ]
+        if self.error_books:
+            parts.append(f"error books in the list: {self.error_books} (Filter: Errors)")
+        page_failed = self.listing_failed + self.product_failed
+        if page_failed:
+            parts.append(
+                f"catalog or book pages that did not open: {page_failed} (not added as books)"
+            )
         if self.skipped_year:
             parts.append(f"wrong year: {self.skipped_year}")
         if self.enriched:
@@ -2433,10 +2440,8 @@ class BookCrawler:
                 extra_report = self.report
                 self.report = saved
                 self.report.listing_pages += extra_report.listing_pages
-                self.report.listing_failed += extra_report.listing_failed
                 self.report.product_cached += extra_report.product_cached
                 self.report.product_fetched += extra_report.product_fetched
-                self.report.product_failed += extra_report.product_failed
             added = merge_catalog(books, extras)
             filled += added
             self.report.enriched += added

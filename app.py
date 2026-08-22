@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from app_config import (
 from book_crawler import Book, BookCrawler, CrawlCancelled, CrawlReport, format_person_name, format_price, parse_site_urls, site_display_name, site_host
 from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
-from field_map import ALIASES_PATH, REPORT_JSON_PATH, reload_aliases, write_field_report
+from field_map import ALIASES_PATH, EXCEL_TARGETS, reload_aliases, write_field_report
 from hebrew_view import HebrewDescription
 from publisher_sites import publishers_match, resolve_publisher_site
 from scanner_registry import attach_book, attach_books, persist_book_state
@@ -138,6 +139,8 @@ class BookCatalogApp(tk.Tk):
         self._lookup_running = False
         self._found_popup: tk.Toplevel | None = None
         self._settings_popup: tk.Toplevel | None = None
+        self._report_popup: tk.Toplevel | None = None
+        self._report_view: tk.Text | None = None
         self._updating = False
         self._update_check_running = False
         self._update_declined_remote = ""
@@ -171,52 +174,71 @@ class BookCatalogApp(tk.Tk):
         header = tk.Frame(self, bg=NAVY)
         header.pack(fill="x")
         ttk.Label(header, text="SISU Book Catalog Filler", style="Header.TLabel").pack(
-            side="left", padx=18, pady=(14, 2)
+            side="left", padx=18, pady=8
         )
         ttk.Label(
             header,
-            text="Crawl the first site, fill gaps from the next URLs, then write orange Excel columns",
+            text="Crawl sites, then fill orange Excel columns",
             style="Sub.TLabel",
-        ).pack(side="left", padx=12, pady=(18, 8))
-        ttk.Button(header, text="Check for updates", command=lambda: self.check_for_updates(silent=False)).pack(
-            side="right", padx=(0, 8), pady=12
-        )
-        ttk.Button(header, text="Field report", command=self.open_field_report).pack(side="right", padx=(0, 8), pady=12)
-        ttk.Button(header, text="Lists", command=self.open_lists_manager).pack(side="right", padx=(0, 8), pady=12)
-        ttk.Button(header, text="Settings", command=self.open_settings).pack(side="right", padx=16, pady=12)
+        ).pack(side="left", padx=(0, 12), pady=10)
+        header_btns = tk.Frame(header, bg=NAVY)
+        header_btns.pack(side="right", padx=12, pady=6)
+
+        def header_button(text: str, command) -> None:
+            tk.Button(
+                header_btns,
+                text=text,
+                command=command,
+                bg="#E8D5B5",
+                fg=NAVY,
+                activebackground=WHITE,
+                activeforeground=NAVY,
+                relief="flat",
+                bd=0,
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=4,
+                cursor="hand2",
+            ).pack(side="left", padx=4)
+
+        header_button("Check for updates", lambda: self.check_for_updates(silent=False))
+        header_button("Field report", self.open_field_report)
+        header_button("Lists", self.open_lists_manager)
+        header_button("Settings", self.open_settings)
 
         body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=14, pady=12)
+        body.pack(fill="both", expand=True, padx=12, pady=8)
         self._layout_body = body
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(5, weight=1)
+        body.rowconfigure(4, weight=1)
 
-        lists = ttk.LabelFrame(body, text="Scan list", padding=(10, 8, 10, 12))
-        lists.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        lists.columnconfigure(1, weight=1)
-        ttk.Label(lists, text="Title").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=(0, 4))
+        lists = ttk.LabelFrame(body, text="Scan list", padding=(8, 4, 8, 6))
+        lists.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        lists.columnconfigure(1, weight=2)
+        lists.columnconfigure(3, weight=1)
+        ttk.Label(lists, text="Title").grid(row=0, column=0, sticky="e", padx=(0, 8))
         self.list_title_entry = ttk.Entry(lists, textvariable=self.list_title)
-        self.list_title_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        self.list_title_entry.grid(row=0, column=1, sticky="ew")
         self.list_title_entry.bind("<FocusOut>", lambda _e: self._on_list_title_change())
         list_btns = ttk.Frame(lists)
-        list_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        list_btns.grid(row=0, column=2, sticky="w", padx=(8, 8))
         ttk.Button(list_btns, text="New", command=self.new_working_list).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Stash", command=self.stash_working_list).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Restore stash", command=self.restore_stash).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Save list", command=self.save_current_list).pack(side="left", padx=(0, 4))
         ttk.Button(list_btns, text="Open lists…", command=self.open_lists_manager).pack(side="left")
         self.list_status_label = ttk.Label(lists, textvariable=self.list_status, wraplength=1, justify="left")
-        self.list_status_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        self.list_status_label.grid(row=0, column=3, sticky="ew")
 
-        form = ttk.LabelFrame(body, text="Search", padding=(10, 8, 10, 14))
+        form = ttk.LabelFrame(body, text="Search", padding=(8, 4, 8, 6))
         form.grid(row=1, column=0, sticky="ew")
         form.columnconfigure(1, weight=1)
 
-        ttk.Label(form, text="List Excel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=6)
+        ttk.Label(form, text="List Excel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=(0, 4))
         self.excel_entry = ttk.Entry(form, textvariable=self.excel_path, state="readonly")
-        self.excel_entry.grid(row=0, column=1, columnspan=3, sticky="ew", pady=6)
+        self.excel_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4))
         excel_btns = ttk.Frame(form)
-        excel_btns.grid(row=0, column=4, padx=(10, 0), pady=6, sticky="e")
+        excel_btns.grid(row=0, column=2, padx=(8, 0), pady=(0, 4), sticky="e")
         self.excel_folder_btn = ttk.Button(excel_btns, text="Folder…", command=self.browse_excel_folder)
         self.excel_folder_btn.pack(side="left")
         self.excel_open_btn = ttk.Button(excel_btns, text="Open", command=self.open_excel)
@@ -224,45 +246,49 @@ class BookCatalogApp(tk.Tk):
         self.excel_share_btn = ttk.Button(excel_btns, text="Share", command=self.share_excel)
         self.excel_share_btn.pack(side="left", padx=(6, 0))
 
-        ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=6)
+        ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=(2, 0))
         url_wrap = ttk.Frame(form)
-        url_wrap.grid(row=1, column=1, columnspan=4, sticky="ew", pady=6)
+        url_wrap.grid(row=1, column=1, sticky="nsew", pady=(2, 0))
         url_wrap.columnconfigure(0, weight=1)
-        self.url_text = tk.Text(url_wrap, height=4, wrap="none", font=("Segoe UI", 10), undo=True, padx=6, pady=4)
+        url_wrap.rowconfigure(0, weight=1)
+        self.url_text = tk.Text(url_wrap, height=3, wrap="none", font=("Segoe UI", 10), undo=True, padx=6, pady=2)
         url_scroll_y = ttk.Scrollbar(url_wrap, orient="vertical", command=self.url_text.yview)
-        url_scroll_x = ttk.Scrollbar(url_wrap, orient="horizontal", command=self.url_text.xview)
-        self.url_text.configure(yscrollcommand=url_scroll_y.set, xscrollcommand=url_scroll_x.set)
-        self.url_text.grid(row=0, column=0, sticky="ew")
+        self.url_text.configure(yscrollcommand=url_scroll_y.set)
+        self.url_text.grid(row=0, column=0, sticky="nsew")
         url_scroll_y.grid(row=0, column=1, sticky="ns")
-        url_scroll_x.grid(row=1, column=0, sticky="ew")
         self.url_text.insert("1.0", DEFAULT_URLS)
 
-        ttk.Label(form, text="Year").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=6)
-        self.year_entry = ttk.Entry(form, textvariable=self.year, width=10)
-        self.year_entry.grid(row=2, column=1, sticky="w", pady=6)
-        ttk.Label(form, text="Max listing pages").grid(row=2, column=2, sticky="e", padx=(16, 8))
-        self.pages_spin = ttk.Spinbox(form, from_=1, to=40, textvariable=self.max_pages, width=6)
-        self.pages_spin.grid(row=2, column=3, sticky="w")
-        buttons = ttk.Frame(form)
-        buttons.grid(row=2, column=4, sticky="e", padx=(10, 0), pady=6)
+        search_side = ttk.Frame(form)
+        search_side.grid(row=1, column=2, sticky="nw", padx=(10, 0), pady=(2, 0))
+        year_row = ttk.Frame(search_side)
+        year_row.pack(anchor="w")
+        ttk.Label(year_row, text="Year").pack(side="left")
+        self.year_entry = ttk.Entry(year_row, textvariable=self.year, width=8)
+        self.year_entry.pack(side="left", padx=(6, 10))
+        ttk.Label(year_row, text="Max pages").pack(side="left")
+        self.pages_spin = ttk.Spinbox(year_row, from_=1, to=40, textvariable=self.max_pages, width=5)
+        self.pages_spin.pack(side="left", padx=(6, 0))
+        self.unknown_check = ttk.Checkbutton(
+            search_side, text="Also keep books with no year listed", variable=self.include_unknown
+        )
+        self.unknown_check.pack(anchor="w", pady=(6, 6))
+        buttons = ttk.Frame(search_side)
+        buttons.pack(anchor="w")
         self.search_btn = ttk.Button(buttons, text="Search", command=self.start_search, style="Accent.TButton")
         self.search_btn.pack(side="left", padx=(0, 4))
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self.stop_btn.pack(side="left")
 
-        checks = ttk.Frame(form)
-        checks.grid(row=3, column=1, columnspan=4, sticky="w", pady=(0, 4))
-        self.unknown_check = ttk.Checkbutton(
-            checks, text="Also keep books with no year listed", variable=self.include_unknown
-        )
-        self.unknown_check.pack(side="left")
+        self.colored_info_label = ttk.Label(form, textvariable=self.colored_info, wraplength=1, justify="left")
+        self.colored_info_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
-        self.colored_info_label = ttk.Label(body, textvariable=self.colored_info, wraplength=1, justify="left")
-        self.colored_info_label.grid(row=2, column=0, sticky="ew", pady=(8, 4))
-        self.progress = ttk.Progressbar(body, mode="indeterminate")
-        self.progress.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        meta = ttk.Frame(body)
+        meta.grid(row=2, column=0, sticky="ew", pady=(4, 4))
+        meta.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(meta, mode="indeterminate")
+        self.progress.grid(row=0, column=0, sticky="ew")
         self.summary_label = ttk.Label(body, textvariable=self.summary, wraplength=1, justify="left")
-        self.summary_label.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        self.summary_label.grid(row=3, column=0, sticky="ew", pady=(0, 4))
 
         split = ttk.Panedwindow(body, orient="horizontal")
         list_frame = ttk.Frame(split)
@@ -277,31 +303,16 @@ class BookCatalogApp(tk.Tk):
             on_publisher=self.ask_publisher_lookup,
         )
         filter_bar = ttk.Frame(list_frame)
-        filter_bar.pack(fill="x", pady=(0, 6))
-        filter_top = ttk.Frame(filter_bar)
-        filter_top.pack(fill="x")
-        ttk.Label(filter_top, text="Filter").pack(side="left")
+        filter_bar.pack(fill="x", pady=(0, 4))
+        ttk.Label(filter_bar, text="Filter").pack(side="left")
         self._filter_vars: dict[str, tk.BooleanVar] = {}
-        first_keys = {"checked", "approved", "failed", "successful"}
         for key, label in ROW_STATUSES:
-            if key not in first_keys:
-                continue
             var = tk.BooleanVar(value=False)
             self._filter_vars[key] = var
-            ttk.Checkbutton(filter_top, text=label, variable=var, command=self._on_filter_change).pack(
+            ttk.Checkbutton(filter_bar, text=label, variable=var, command=self._on_filter_change).pack(
                 side="left", padx=(8, 0)
             )
-        ttk.Button(filter_top, text="Clear books…", command=self.clear_books_with_keep).pack(side="right")
-        filter_more = ttk.Frame(filter_bar)
-        filter_more.pack(fill="x", pady=(4, 0))
-        for key, label in ROW_STATUSES:
-            if key in first_keys:
-                continue
-            var = tk.BooleanVar(value=False)
-            self._filter_vars[key] = var
-            ttk.Checkbutton(filter_more, text=label, variable=var, command=self._on_filter_change).pack(
-                side="left", padx=(0, 8)
-            )
+        ttk.Button(filter_bar, text="Clear books…", command=self.clear_books_with_keep).pack(side="right")
         self.table.pack(fill="both", expand=True)
 
         detail_header = ttk.Frame(detail_frame, style="Card.TFrame")
@@ -395,16 +406,19 @@ class BookCatalogApp(tk.Tk):
         self.desc_view.pack(fill="both", expand=True)
 
         footer = ttk.Frame(body)
-        ttk.Button(footer, text="Select all", command=self.table.select_all).pack(side="left", pady=6)
-        ttk.Button(footer, text="Clear selection", command=self.table.clear_selection).pack(side="left", padx=6, pady=6)
+        ttk.Button(footer, text="Select all", command=self.table.select_all).pack(side="left", pady=2)
+        ttk.Button(footer, text="Clear selection", command=self.table.clear_selection).pack(side="left", padx=6, pady=2)
         self.status_label = ttk.Label(footer, textvariable=self.status, wraplength=1, justify="left")
-        self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=6)
-        footer.grid(row=6, column=0, sticky="ew", pady=(8, 0))
-        body.rowconfigure(6, minsize=44)
-        split.grid(row=5, column=0, sticky="nsew")
+        self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=2)
+        footer.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        split.grid(row=4, column=0, sticky="nsew")
         self._bind_list_excel_path(rename_existing=False)
         body.bind("<Configure>", self._sync_full_width_wraps, add="+")
-        lists.bind("<Configure>", lambda event: self._set_label_wrap(self.list_status_label, event.width - 24), add="+")
+        self.list_status_label.bind(
+            "<Configure>",
+            lambda event: self._set_label_wrap(self.list_status_label, max(80, event.width - 4)),
+            add="+",
+        )
         footer.bind("<Configure>", lambda event: self._set_label_wrap(self.status_label, max(120, event.width - 220)), add="+")
 
     def _set_label_wrap(self, label: ttk.Label, width: int) -> None:
@@ -455,8 +469,8 @@ class BookCatalogApp(tk.Tk):
         win.title("Settings")
         win.configure(bg=BG)
         win.transient(self)
-        win.geometry("820x600")
-        win.minsize(680, 500)
+        win.geometry("900x640")
+        win.minsize(720, 520)
         self._settings_popup = win
 
         def close() -> None:
@@ -551,43 +565,31 @@ class BookCatalogApp(tk.Tk):
         ).pack(anchor="w")
         table_wrap = ttk.Frame(publisher_tab)
         table_wrap.pack(fill="both", expand=True, pady=(8, 6))
-        canvas = tk.Canvas(table_wrap, bg=BG, highlightthickness=0)
-        scroll = ttk.Scrollbar(table_wrap, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.columnconfigure(1, weight=1)
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        inner = _settings_scroll_table(table_wrap, columns=(1,))
 
         rows: list[tuple[tk.StringVar, tk.StringVar]] = []
 
-        def _sync_scroll(_event=None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfigure(window_id, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", _sync_scroll)
-        canvas.bind("<Configure>", _sync_scroll)
-
-        def _on_mousewheel(event: tk.Event) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-
-        def _paint_url(entry: tk.Entry, var: tk.StringVar) -> None:
-            entry.configure(bg="#FFF4CC" if not var.get().strip() else WHITE)
+        def _paint_url(shell: tk.Frame, var: tk.StringVar) -> None:
+            empty = not var.get().strip()
+            shell.configure(
+                highlightbackground="#E2B93D" if empty else "#C9BBA8",
+                highlightthickness=2 if empty else 1,
+            )
 
         def _append_data_row(name: str = "", url: str = "", highlight: bool = False) -> None:
             name_var = tk.StringVar(value=name)
             url_var = tk.StringVar(value=url)
             grid_row = len(rows) + 1
             name_entry = tk.Entry(inner, textvariable=name_var, font=("Segoe UI", 10), relief="solid", bd=1, width=28)
-            url_entry = tk.Entry(inner, textvariable=url_var, font=("Segoe UI", 10), relief="solid", bd=1)
+            url_shell = tk.Frame(inner, bg=WHITE, highlightbackground="#C9BBA8", highlightthickness=1)
+            url_entry = tk.Entry(url_shell, textvariable=url_var, font=("Segoe UI", 10), relief="flat", bd=0, bg=WHITE)
+            url_entry.pack(fill="x", ipady=4, padx=2, pady=1)
             name_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
-            url_entry.grid(row=grid_row, column=1, sticky="ew", padx=(0, 6), pady=3, ipady=3)
-            _paint_url(url_entry, url_var)
-            url_var.trace_add("write", lambda *_args: _paint_url(url_entry, url_var))
+            url_shell.grid(row=grid_row, column=1, sticky="ew", padx=(0, 6), pady=3)
+            _bind_entry_clipboard(name_entry)
+            _bind_entry_clipboard(url_entry)
+            _paint_url(url_shell, url_var)
+            url_var.trace_add("write", lambda *_args: _paint_url(url_shell, url_var))
             if highlight:
                 url_entry.focus_set()
             open_btn = tk.Button(
@@ -649,55 +651,164 @@ class BookCatalogApp(tk.Tk):
 
         ttk.Label(
             aliases_tab,
-            text="Conversion table used at runtime. Add a page label (Hebrew or English) and the catalog field it should fill, then Save.",
+            text="Page labels found on bookstore sites, and the catalog field each one should fill. Add a row, then Save.",
             wraplength=740,
         ).pack(anchor="w")
+        alias_wrap = ttk.Frame(aliases_tab)
+        alias_wrap.pack(fill="both", expand=True, pady=(8, 4))
+        alias_inner = _settings_scroll_table(alias_wrap, columns=(0, 1))
+        alias_rows: list[tuple[tk.StringVar, tk.StringVar]] = []
+        field_choices = sorted(EXCEL_TARGETS.keys())
+
+        def _append_alias_row(label: str = "", field: str = "") -> None:
+            label_var = tk.StringVar(value=label)
+            field_var = tk.StringVar(value=field)
+            grid_row = len(alias_rows) + 1
+            label_entry = tk.Entry(alias_inner, textvariable=label_var, font=("Segoe UI", 10), relief="solid", bd=1)
+            field_combo = ttk.Combobox(
+                alias_inner,
+                textvariable=field_var,
+                values=field_choices,
+                font=("Segoe UI", 10),
+            )
+            label_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
+            field_combo.grid(row=grid_row, column=1, sticky="ew", padx=(0, 6), pady=3)
+            _bind_entry_clipboard(label_entry)
+            _bind_combobox_clipboard(field_combo)
+            pair = (label_var, field_var)
+            ttk.Button(
+                alias_inner,
+                text="Remove",
+                command=lambda item=pair: _remove_alias_row(item),
+            ).grid(row=grid_row, column=2, pady=3)
+            alias_rows.append(pair)
+
+        def _remove_alias_row(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
+            snapshot = [(label.get(), field.get()) for label, field in alias_rows if (label, field) != pair]
+            _fill_alias_rows(snapshot)
+
+        def _fill_alias_rows(items: list[tuple[str, str]]) -> None:
+            for child in alias_inner.winfo_children():
+                child.destroy()
+            alias_rows.clear()
+            ttk.Label(alias_inner, text="Page label", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+            ttk.Label(alias_inner, text="Catalog field", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
+            for label, field in items:
+                _append_alias_row(label, field)
+
+        alias_comment = ""
+        cover_items: list[tuple[str, str]] = []
+        loaded_aliases: list[tuple[str, str]] = []
+        if ALIASES_PATH.exists():
+            try:
+                parsed = json.loads(ALIASES_PATH.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                parsed = {}
+            if isinstance(parsed, dict):
+                alias_comment = str(parsed.get("comment") or "")
+                aliases_map = parsed.get("aliases") or {}
+                if isinstance(aliases_map, dict):
+                    loaded_aliases = sorted(
+                        ((str(label), str(field)) for label, field in aliases_map.items() if str(label).strip()),
+                        key=lambda item: (item[1].casefold(), item[0].casefold()),
+                    )
+                covers_map = parsed.get("cover_values") or {}
+                if isinstance(covers_map, dict):
+                    cover_items = [(str(word), str(code)) for word, code in covers_map.items()]
+        _fill_alias_rows(loaded_aliases)
+        ttk.Button(aliases_tab, text="Add label", command=lambda: _append_alias_row("", "")).pack(anchor="w")
+
         ttk.Label(
             aliases_tab,
-            text=str(ALIASES_PATH),
-            font=("Segoe UI", 8),
+            text="Cover type words (S = soft, H = hard, BB = board).",
             wraplength=740,
-        ).pack(anchor="w", pady=(2, 6))
-        alias_wrap = ttk.Frame(aliases_tab)
-        alias_wrap.pack(fill="both", expand=True)
-        alias_wrap.columnconfigure(0, weight=1)
-        alias_wrap.rowconfigure(0, weight=1)
-        alias_text = tk.Text(alias_wrap, wrap="none", font=("Consolas", 10), undo=True)
-        alias_y = ttk.Scrollbar(alias_wrap, orient="vertical", command=alias_text.yview)
-        alias_x = ttk.Scrollbar(alias_wrap, orient="horizontal", command=alias_text.xview)
-        alias_text.configure(yscrollcommand=alias_y.set, xscrollcommand=alias_x.set)
-        alias_text.grid(row=0, column=0, sticky="nsew")
-        alias_y.grid(row=0, column=1, sticky="ns")
-        alias_x.grid(row=1, column=0, sticky="ew")
-        if ALIASES_PATH.exists():
-            alias_text.insert("1.0", ALIASES_PATH.read_text(encoding="utf-8"))
-        else:
-            alias_text.insert("1.0", '{\n  "comment": "",\n  "aliases": {\n  }\n}\n')
+        ).pack(anchor="w", pady=(10, 0))
+        cover_wrap = ttk.Frame(aliases_tab)
+        cover_wrap.pack(fill="x", pady=(6, 4))
+        cover_inner = _settings_scroll_table(cover_wrap, columns=(0,), height=140)
+        cover_rows: list[tuple[tk.StringVar, tk.StringVar]] = []
+
+        def _append_cover_row(word: str = "", code: str = "") -> None:
+            word_var = tk.StringVar(value=word)
+            code_var = tk.StringVar(value=code)
+            grid_row = len(cover_rows) + 1
+            word_entry = tk.Entry(cover_inner, textvariable=word_var, font=("Segoe UI", 10), relief="solid", bd=1)
+            code_combo = ttk.Combobox(
+                cover_inner,
+                textvariable=code_var,
+                values=("S", "H", "BB"),
+                width=8,
+                font=("Segoe UI", 10),
+            )
+            word_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
+            code_combo.grid(row=grid_row, column=1, sticky="w", padx=(0, 6), pady=3)
+            _bind_entry_clipboard(word_entry)
+            _bind_combobox_clipboard(code_combo)
+            pair = (word_var, code_var)
+            ttk.Button(
+                cover_inner,
+                text="Remove",
+                command=lambda item=pair: _remove_cover_row(item),
+            ).grid(row=grid_row, column=2, pady=3)
+            cover_rows.append(pair)
+
+        def _remove_cover_row(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
+            snapshot = [(word.get(), code.get()) for word, code in cover_rows if (word, code) != pair]
+            _fill_cover_rows(snapshot)
+
+        def _fill_cover_rows(items: list[tuple[str, str]]) -> None:
+            for child in cover_inner.winfo_children():
+                child.destroy()
+            cover_rows.clear()
+            ttk.Label(cover_inner, text="Word on the page", font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Label(cover_inner, text="Code", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
+            for word, code in items:
+                _append_cover_row(word, code)
+
+        _fill_cover_rows(cover_items)
+        ttk.Button(aliases_tab, text="Add cover word", command=lambda: _append_cover_row("", "")).pack(anchor="w")
 
         def save_aliases() -> bool:
-            raw = alias_text.get("1.0", "end").strip()
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                messagebox.showerror("Field aliases", f"The JSON is not valid:\n{exc}")
-                return False
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("aliases"), dict):
-                messagebox.showerror("Field aliases", 'The file must be a JSON object with an "aliases" map.')
-                return False
-            ALIASES_PATH.write_text(json.dumps(parsed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            aliases: dict[str, str] = {}
+            for label_var, field_var in alias_rows:
+                label = label_var.get().strip()
+                field = field_var.get().strip()
+                if not label:
+                    continue
+                if not field:
+                    messagebox.showerror("Field aliases", f"Choose a catalog field for “{label}”.")
+                    return False
+                aliases[label] = field
+            covers: dict[str, str] = {}
+            for word_var, code_var in cover_rows:
+                word = word_var.get().strip()
+                code = code_var.get().strip().upper()
+                if not word:
+                    continue
+                if code not in {"S", "H", "BB"}:
+                    messagebox.showerror("Field aliases", f"Cover code for “{word}” must be S, H, or BB.")
+                    return False
+                covers[word] = code
+            payload = {
+                "comment": alias_comment
+                or "Maps labels found on bookstore and publisher pages to SISU field keys.",
+                "aliases": aliases,
+                "cover_values": covers,
+            }
+            ALIASES_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             reload_aliases()
             self._set_status("Field aliases saved. The next Search or More will use them.")
             return True
 
-        alias_btns = ttk.Frame(aliases_tab)
-        alias_btns.pack(fill="x", pady=(8, 0))
-        ttk.Button(alias_btns, text="Save aliases", command=save_aliases, style="Accent.TButton").pack(side="left")
-        ttk.Button(alias_btns, text="Open file…", command=lambda: self._open_local_file(ALIASES_PATH)).pack(
-            side="left", padx=8
-        )
-
         buttons = ttk.Frame(body)
         buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(
+            buttons,
+            text="Check for updates",
+            command=lambda: self.check_for_updates(silent=False),
+        ).pack(side="left")
 
         def save() -> None:
             publishers: dict[str, str] = {}
@@ -1483,6 +1594,7 @@ class BookCatalogApp(tk.Tk):
             self.list_title.set(default_scan_title(len(self.books), self.year.get().strip()))
         if report is None:
             report = CrawlReport(matched=len(self.books), cancelled=cancelled)
+        report.error_books = sum(1 for book in self.books if (book.scan_status or "") == "failed")
         self._list_report = asdict(report)
         self._persist_working(self._list_report)
         year = self.year.get().strip() or "any year"
@@ -1879,43 +1991,71 @@ class BookCatalogApp(tk.Tk):
     def open_field_report(self) -> None:
         try:
             report = write_field_report(self.excel_path.get().strip() or None)
+            markdown = report.read_text(encoding="utf-8")
         except Exception as exc:
             messagebox.showerror("Field report", str(exc))
             return
-        self._set_status(f"Field matching report saved: {report}")
+        self._set_status("Field matching report is open.")
+        existing = self._report_popup
+        view = self._report_view
+        if existing is not None and view is not None:
+            try:
+                if existing.winfo_exists():
+                    _fill_markdown_view(view, markdown)
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except tk.TclError:
+                self._report_popup = None
+                self._report_view = None
         win = tk.Toplevel(self)
-        win.title("Field matching files")
+        win.title("Field matching report")
         win.configure(bg=BG)
-        win.transient(self)
-        win.geometry("560x280")
-        body = ttk.Frame(win, padding=16)
-        body.pack(fill="both", expand=True)
-        ttk.Label(
-            body,
-            text="The markdown report lists page labels found on book sites. The JSON conversion table is what the program uses to match those labels to catalog fields — you can view and edit it here.",
-            wraplength=520,
-        ).pack(anchor="w")
+        win.geometry("980x720")
+        win.minsize(640, 420)
+        header = ttk.Frame(win, padding=(16, 12, 16, 6))
+        header.pack(fill="x")
+        ttk.Label(header, text="Field matching report", font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Button(
+            header,
+            text="Edit conversion table",
+            command=lambda: (win.destroy(), self.open_settings(focus_tab="aliases")),
+        ).pack(side="right")
+        wrap = ttk.Frame(win, padding=(12, 0, 12, 8))
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        view = tk.Text(
+            wrap,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg=WHITE,
+            fg="#1B1B1B",
+            relief="flat",
+            padx=16,
+            pady=12,
+            cursor="arrow",
+        )
+        yscroll = ttk.Scrollbar(wrap, orient="vertical", command=view.yview)
+        xscroll = ttk.Scrollbar(wrap, orient="horizontal", command=view.xview)
+        view.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        view.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        _configure_markdown_tags(view)
+        _fill_markdown_view(view, markdown)
+        footer = ttk.Frame(win, padding=(16, 0, 16, 12))
+        footer.pack(fill="x")
+        ttk.Button(footer, text="Close", command=win.destroy).pack(side="right")
 
-        def row(label: str, path: Path, extra=None) -> None:
-            bar = ttk.Frame(body)
-            bar.pack(fill="x", pady=(10, 0))
-            ttk.Label(bar, text=label).pack(side="left")
-            ttk.Button(bar, text="Open", command=lambda: self._open_local_file(path)).pack(side="right")
-            if extra:
-                extra(bar)
+        def close() -> None:
+            self._report_popup = None
+            self._report_view = None
+            win.destroy()
 
-        row("Field report (markdown)", report)
-        row("Field report (JSON)", REPORT_JSON_PATH)
-
-        def alias_buttons(bar: ttk.Frame) -> None:
-            ttk.Button(
-                bar,
-                text="Edit in Settings",
-                command=lambda: (win.destroy(), self.open_settings(focus_tab="aliases")),
-            ).pack(side="right", padx=(0, 8))
-
-        row("Field aliases (JSON conversion table)", ALIASES_PATH, extra=alias_buttons)
-        ttk.Button(body, text="Close", command=win.destroy).pack(side="right", pady=(18, 0))
+        win.protocol("WM_DELETE_WINDOW", close)
+        self._report_popup = win
+        self._report_view = view
         win.lift()
         win.focus_force()
 
@@ -2659,6 +2799,8 @@ class BookCatalogApp(tk.Tk):
                 )
             return
         self._update_check_running = True
+        if not silent:
+            self._set_status("Checking GitHub for a newer SISU…")
         thread = threading.Thread(target=self._run_update_check, args=(silent,), daemon=True)
         thread.start()
 
@@ -2791,6 +2933,202 @@ class BookCatalogApp(tk.Tk):
 
         restart_process()
         self.after(150, self.destroy)
+
+
+def _configure_markdown_tags(view: tk.Text) -> None:
+    view.tag_configure("h1", font=("Segoe UI", 18, "bold"), foreground=NAVY, spacing1=8, spacing3=10)
+    view.tag_configure("h2", font=("Segoe UI", 14, "bold"), foreground=NAVY, spacing1=12, spacing3=8)
+    view.tag_configure("h3", font=("Segoe UI", 12, "bold"), foreground=NAVY, spacing1=10, spacing3=6)
+    view.tag_configure("p", font=("Segoe UI", 10), spacing3=8)
+    view.tag_configure("li", font=("Segoe UI", 10), lmargin1=22, lmargin2=40, spacing3=3)
+    view.tag_configure("code", font=("Consolas", 10), background="#F4F1EA")
+    view.tag_configure("table", font=("Consolas", 9), wrap="none", spacing3=8)
+    view.tag_configure("th", font=("Consolas", 9, "bold"), wrap="none")
+    view.tag_configure("muted", foreground="#5A6570")
+    view.tag_configure("ok", foreground=NEW_FG)
+    view.tag_configure("bad", foreground=ERROR_FG)
+    view.tag_configure("warn", foreground="#8A5A00")
+
+
+def _md_table_cells(line: str) -> list[str]:
+    parts = [part.strip() for part in line.strip().strip("|").split("|")]
+    return parts
+
+
+def _md_is_separator(line: str) -> bool:
+    cells = _md_table_cells(line)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
+
+
+def _format_md_table(rows: list[list[str]]) -> tuple[str, int]:
+    if not rows:
+        return "", 0
+    width = max(len(row) for row in rows)
+    normalized: list[list[str]] = []
+    for row in rows:
+        cells = list(row) + [""] * (width - len(row))
+        wrapped: list[str] = []
+        for cell in cells:
+            text = re.sub(r"\s+", " ", cell).strip()
+            if len(text) > 72:
+                text = text[:71].rstrip() + "…"
+            wrapped.append(text)
+        normalized.append(wrapped)
+    col_w = [1] * width
+    for row in normalized:
+        for index, cell in enumerate(row):
+            col_w[index] = max(col_w[index], len(cell))
+    lines: list[str] = []
+    for row_index, row in enumerate(normalized):
+        line = "  ".join(cell.ljust(col_w[index]) for index, cell in enumerate(row))
+        lines.append(line)
+        if row_index == 0:
+            lines.append("  ".join("-" * col_w[index] for index in range(width)))
+    return "\n".join(lines) + "\n", 0 if not normalized else 0
+
+
+def _insert_inline(view: tk.Text, text: str, base_tag: str) -> None:
+    pattern = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*)")
+    start = 0
+    for match in pattern.finditer(text):
+        if match.start() > start:
+            view.insert("end", text[start : match.start()], base_tag)
+        token = match.group(0)
+        if token.startswith("`"):
+            view.insert("end", token[1:-1], (base_tag, "code"))
+        else:
+            view.insert("end", token[2:-2], (base_tag, "h3"))
+        start = match.end()
+    if start < len(text):
+        view.insert("end", text[start:], base_tag)
+
+
+def _fill_markdown_view(view: tk.Text, source: str) -> None:
+    view.configure(state="normal")
+    view.delete("1.0", "end")
+    lines = (source or "").replace("\r\n", "\n").split("\n")
+    index = 0
+    blank = 0
+    while index < len(lines):
+        raw = lines[index]
+        stripped = raw.strip()
+        if not stripped or stripped == "#":
+            blank += 1
+            index += 1
+            if blank == 1:
+                view.insert("end", "\n")
+            continue
+        blank = 0
+        if stripped.startswith("|"):
+            table_lines: list[str] = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                if not _md_is_separator(lines[index]):
+                    table_lines.append(lines[index])
+                index += 1
+            rows = [_md_table_cells(line) for line in table_lines]
+            formatted, _unused = _format_md_table(rows)
+            del _unused
+            start = view.index("end-1c")
+            view.insert("end", formatted + "\n", "table")
+            if rows:
+                header_line = formatted.split("\n", 1)[0]
+                view.tag_add("th", start, f"{start}+{len(header_line)}c")
+            continue
+        if stripped.startswith("### "):
+            _insert_inline(view, stripped[4:] + "\n", "h3")
+            index += 1
+            continue
+        if stripped.startswith("## "):
+            _insert_inline(view, stripped[3:] + "\n", "h2")
+            index += 1
+            continue
+        if stripped.startswith("# "):
+            _insert_inline(view, stripped[2:] + "\n", "h1")
+            index += 1
+            continue
+        if re.match(r"^[-*]\s+", stripped):
+            item = re.sub(r"^[-*]\s+", "• ", stripped)
+            _insert_inline(view, item + "\n", "li")
+            index += 1
+            continue
+        numbered = re.match(r"^(\d+)\.\s+", stripped)
+        if numbered:
+            _insert_inline(view, stripped + "\n", "li")
+            index += 1
+            continue
+        _insert_inline(view, stripped + "\n", "p")
+        index += 1
+    view.configure(state="disabled")
+
+
+def _bind_entry_clipboard(entry: tk.Entry) -> None:
+    def paste(event: tk.Event) -> str:
+        widget = event.widget
+        try:
+            clip = str(widget.clipboard_get())
+        except tk.TclError:
+            return "break"
+        try:
+            widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        widget.insert("insert", clip)
+        return "break"
+
+    for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>"):
+        entry.bind(sequence, paste)
+
+
+def _bind_combobox_clipboard(combo: ttk.Combobox) -> None:
+    def paste(_event: tk.Event) -> str:
+        try:
+            clip = str(combo.clipboard_get())
+        except tk.TclError:
+            return "break"
+        try:
+            combo.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        combo.insert("insert", clip)
+        return "break"
+
+    for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>"):
+        combo.bind(sequence, paste)
+
+
+def _settings_scroll_table(
+    parent: tk.Widget,
+    columns: tuple[int, ...] = (1,),
+    height: int | None = None,
+) -> ttk.Frame:
+    canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
+    if height:
+        canvas.configure(height=height)
+    scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    for column in columns:
+        inner.columnconfigure(column, weight=1)
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scroll.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scroll.pack(side="right", fill="y")
+
+    def sync(_event=None) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+        canvas.itemconfigure(window_id, width=max(1, canvas.winfo_width()))
+
+    inner.bind("<Configure>", sync)
+    canvas.bind("<Configure>", sync)
+
+    def wheel(event: tk.Event) -> str:
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    canvas.bind("<MouseWheel>", wheel)
+    inner.bind("<MouseWheel>", wheel)
+    return inner
 
 
 def _book_urls(book: Book) -> list[str]:
