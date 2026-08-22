@@ -20,6 +20,22 @@ class UpdateInfo:
     dirty: bool
 
 
+@dataclass
+class AppVersion:
+    number: int
+    date: str
+    commit: str = ""
+
+    def label(self) -> str:
+        if self.number and self.date:
+            return f"version {self.number}, {self.date}"
+        if self.number:
+            return f"version {self.number}"
+        if self.date:
+            return f"version {self.date}"
+        return ""
+
+
 class UpdateError(Exception):
     pass
 
@@ -58,6 +74,30 @@ def is_git_copy() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def read_app_version() -> AppVersion:
+    """Version is the Git commit count on this copy, with the date of HEAD."""
+    if not is_git_copy():
+        return AppVersion(number=0, date="")
+    try:
+        count = _git("rev-list", "--count", "HEAD", timeout=8)
+        stamped = _git("log", "-1", "--format=%cs", timeout=8)
+        commit = _git("rev-parse", "--short", "HEAD", timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return AppVersion(number=0, date="")
+    number = 0
+    if count.returncode == 0:
+        try:
+            number = int((count.stdout or "").strip())
+        except ValueError:
+            number = 0
+    date = stamped.stdout.strip() if stamped.returncode == 0 else ""
+    return AppVersion(
+        number=number,
+        date=date,
+        commit=commit.stdout.strip() if commit.returncode == 0 else "",
+    )
 
 
 def check_for_update() -> UpdateInfo | None:

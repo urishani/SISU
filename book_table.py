@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable
 
 from book_crawler import Book, format_price
 
-ROW_HEIGHT = 32
+ROW_PAD = 6
 MARK_WIDTH = 36
 WEIGHTS = {
     "title": 2.0,
@@ -61,8 +62,10 @@ class BookTable(ttk.Frame):
         self._by_iid: dict[str, Book] = {}
 
         style = ttk.Style(self)
-        style.configure("Books.Treeview", font=("Segoe UI", 10), rowheight=ROW_HEIGHT, padding=0)
+        style.configure("Books.Treeview", font=("Segoe UI", 10), padding=0)
         style.configure("Books.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        self._row_font = tkfont.Font(self, family="Segoe UI", size=10)
+        self._apply_rowheight()
 
         columns = ("mark", "title", "author", "year", "status", "publisher", "code", "price")
         self.tree = ttk.Treeview(
@@ -94,6 +97,13 @@ class BookTable(ttk.Frame):
         self.tree.bind("<Motion>", self._on_motion)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.bind("<Configure>", self._on_resize)
+        self.after_idle(self._apply_rowheight)
+
+    def _apply_rowheight(self) -> None:
+        """Size rows to the font on this machine so high-DPI Windows is not extra-tall."""
+        line = int(self._row_font.metrics("linespace") or 16)
+        height = max(22, line + ROW_PAD)
+        ttk.Style(self).configure("Books.Treeview", rowheight=height)
 
     def _header_text(self, key: str, label: str) -> str:
         if key not in {"mark", "title", "author", "publisher", "status"}:

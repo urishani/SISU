@@ -14,7 +14,7 @@ import threading
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 from urllib.parse import quote, urlparse
 
@@ -36,6 +36,7 @@ from field_map import ALIASES_PATH, EXCEL_TARGETS, reload_aliases, write_field_r
 from hebrew_view import HebrewDescription
 from publisher_sites import publishers_match, resolve_publisher_site
 from scanner_registry import attach_book, attach_books, persist_book_state
+from app_update import read_app_version
 from scan_lists import (
     books_from_payload,
     build_payload,
@@ -72,6 +73,16 @@ WATCHED_FILES = (
     "scanner_registry.py",
     "scan_lists.py",
 )
+APP_NAME = "SISU Book Catalog Filler"
+
+
+def app_title() -> str:
+    extra = read_app_version().label()
+    if extra:
+        return f"{APP_NAME} ({extra})"
+    return APP_NAME
+
+
 RELOAD_SENTINEL = APP_DIR / "cache" / ".reload"
 SCHEMA_EXCEL = APP_DIR / "master our program.xlsx"
 DEFAULT_EXCEL = APP_DIR / "Data enter - bulk - MASTER our program.xlsx"
@@ -96,7 +107,7 @@ UPDATE_CHECK_EVERY_MS = 15 * 60 * 1000
 class BookCatalogApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("SISU Book Catalog Filler")
+        self.title(app_title())
         self.geometry("1280x820")
         self.minsize(1100, 720)
         self.configure(bg=BG)
@@ -173,9 +184,14 @@ class BookCatalogApp(tk.Tk):
     def _build(self) -> None:
         header = tk.Frame(self, bg=NAVY)
         header.pack(fill="x")
-        ttk.Label(header, text="SISU Book Catalog Filler", style="Header.TLabel").pack(
-            side="left", padx=18, pady=8
+        ttk.Label(header, text=APP_NAME, style="Header.TLabel").pack(
+            side="left", padx=(18, 0), pady=8
         )
+        version_text = read_app_version().label()
+        if version_text:
+            ttk.Label(header, text=f"({version_text})", style="Sub.TLabel").pack(
+                side="left", padx=(10, 12), pady=10
+            )
         ttk.Label(
             header,
             text="Crawl sites, then fill orange Excel columns",
@@ -205,6 +221,7 @@ class BookCatalogApp(tk.Tk):
         header_button("Field report", self.open_field_report)
         header_button("Lists", self.open_lists_manager)
         header_button("Settings", self.open_settings)
+        self.after_idle(self._fit_search_fields)
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=12, pady=8)
@@ -232,13 +249,14 @@ class BookCatalogApp(tk.Tk):
 
         form = ttk.LabelFrame(body, text="Search", padding=(8, 4, 8, 6))
         form.grid(row=1, column=0, sticky="ew")
-        form.columnconfigure(1, weight=1)
+        form.columnconfigure(1, weight=0)
+        form.columnconfigure(3, weight=1)
 
         ttk.Label(form, text="List Excel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=(0, 4))
-        self.excel_entry = ttk.Entry(form, textvariable=self.excel_path, state="readonly")
-        self.excel_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        self.excel_entry = ttk.Entry(form, textvariable=self.excel_path, state="readonly", width=52)
+        self.excel_entry.grid(row=0, column=1, sticky="w", pady=(0, 4))
         excel_btns = ttk.Frame(form)
-        excel_btns.grid(row=0, column=2, padx=(8, 0), pady=(0, 4), sticky="e")
+        excel_btns.grid(row=0, column=2, padx=(8, 0), pady=(0, 4), sticky="w")
         self.excel_folder_btn = ttk.Button(excel_btns, text="Folder…", command=self.browse_excel_folder)
         self.excel_folder_btn.pack(side="left")
         self.excel_open_btn = ttk.Button(excel_btns, text="Open", command=self.open_excel)
@@ -248,15 +266,17 @@ class BookCatalogApp(tk.Tk):
 
         ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=(2, 0))
         url_wrap = ttk.Frame(form)
-        url_wrap.grid(row=1, column=1, sticky="nsew", pady=(2, 0))
-        url_wrap.columnconfigure(0, weight=1)
+        url_wrap.grid(row=1, column=1, sticky="nw", pady=(2, 0))
+        url_wrap.columnconfigure(0, weight=0)
         url_wrap.rowconfigure(0, weight=1)
-        self.url_text = tk.Text(url_wrap, height=3, wrap="none", font=("Segoe UI", 10), undo=True, padx=6, pady=2)
+        self.url_text = tk.Text(url_wrap, height=3, width=52, wrap="none", font=("Segoe UI", 10), undo=True, padx=6, pady=2)
         url_scroll_y = ttk.Scrollbar(url_wrap, orient="vertical", command=self.url_text.yview)
         self.url_text.configure(yscrollcommand=url_scroll_y.set)
-        self.url_text.grid(row=0, column=0, sticky="nsew")
+        self.url_text.grid(row=0, column=0, sticky="nw")
         url_scroll_y.grid(row=0, column=1, sticky="ns")
         self.url_text.insert("1.0", DEFAULT_URLS)
+        self.url_text.bind("<<Modified>>", self._on_url_text_modified)
+        self.excel_path.trace_add("write", lambda *_args: self._fit_search_fields())
 
         search_side = ttk.Frame(form)
         search_side.grid(row=1, column=2, sticky="nw", padx=(10, 0), pady=(2, 0))
@@ -436,6 +456,38 @@ class BookCatalogApp(tk.Tk):
         width = max(40, int(event.width) - 8)
         self._set_label_wrap(self.colored_info_label, width)
         self._set_label_wrap(self.summary_label, width)
+
+    def _on_url_text_modified(self, _event=None) -> None:
+        url_box = getattr(self, "url_text", None)
+        if url_box is None or not url_box.edit_modified():
+            return
+        url_box.edit_modified(False)
+        self._fit_search_fields()
+
+    def _fit_search_fields(self) -> None:
+        url_box = getattr(self, "url_text", None)
+        excel_box = getattr(self, "excel_entry", None)
+        if url_box is None or excel_box is None:
+            return
+        url_font = tkfont.Font(font=url_box.cget("font"))
+        lines = [line for line in url_box.get("1.0", "end-1c").splitlines() if line.strip()]
+        if not lines:
+            lines = ["https://www.booknet.co.il/"]
+        url_cols = self._cols_for_texts(url_font, lines, 40, 68)
+        if int(url_box.cget("width") or 0) != url_cols:
+            url_box.configure(width=url_cols)
+        path = self.excel_path.get().strip() or "C:\\SISU\\list.xlsx"
+        excel_font = tkfont.nametofont("TkDefaultFont")
+        excel_cols = self._cols_for_texts(excel_font, [path], 36, 64)
+        if int(str(excel_box.cget("width") or 0)) != excel_cols:
+            excel_box.configure(width=excel_cols)
+
+    @staticmethod
+    def _cols_for_texts(face: tkfont.Font, texts: list[str], min_cols: int, max_cols: int) -> int:
+        zero = max(face.measure("0"), 1)
+        widest = max(face.measure(text) for text in texts)
+        cols = int((widest + zero * 2) / zero)
+        return max(min_cols, min(max_cols, cols))
 
     def _urls(self) -> list[str]:
         return parse_site_urls(self.url_text.get("1.0", "end"))
