@@ -12,12 +12,34 @@ ROW_HEIGHT = 32
 MARK_WIDTH = 36
 WEIGHTS = {
     "title": 2.0,
-    "author": 1.0,
-    "year": 0.55,
-    "publisher": 1.0,
-    "code": 0.9,
-    "price": 0.55,
+    "author": 0.9,
+    "year": 0.45,
+    "status": 0.7,
+    "action": 0.7,
+    "publisher": 0.9,
+    "code": 0.8,
+    "price": 0.5,
 }
+HEADINGS = {
+    "mark": "☑",
+    "title": "Title",
+    "author": "Author",
+    "year": "Year",
+    "status": "Status",
+    "action": "Action",
+    "publisher": "Publisher",
+    "code": "ISBN / code",
+    "price": "Price ₪",
+}
+ROW_STATUSES = (
+    ("checked", "Checked"),
+    ("approved", "Approved"),
+    ("failed", "Errors"),
+    ("successful", "Successful"),
+    ("fully scanned", "Fully scanned"),
+    ("final", "Final"),
+    ("excel", "In Excel"),
+)
 
 
 class BookTable(ttk.Frame):
@@ -27,23 +49,26 @@ class BookTable(ttk.Frame):
         on_select: Callable[[Book], None] | None = None,
         on_check: Callable[[], None] | None = None,
         on_publisher: Callable[[Book], None] | None = None,
+        on_action: Callable[[Book], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.on_select = on_select
         self.on_check = on_check
         self.on_publisher = on_publisher
+        self.on_action = on_action
         self.books: list[Book] = []
         self.order: list[int] = []
         self.checked: set[str] = set()
         self.sort_column = "title"
         self.sort_reverse = False
+        self.filter_keys: set[str] = set()
         self._by_iid: dict[str, Book] = {}
 
         style = ttk.Style(self)
         style.configure("Books.Treeview", font=("Segoe UI", 10), rowheight=ROW_HEIGHT)
         style.configure("Books.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
-        columns = ("mark", "title", "author", "year", "publisher", "code", "price")
+        columns = ("mark", "title", "author", "year", "status", "action", "publisher", "code", "price")
         self.tree = ttk.Treeview(
             self,
             columns=columns,
@@ -51,26 +76,20 @@ class BookTable(ttk.Frame):
             selectmode="browse",
             style="Books.Treeview",
         )
-        headings = {
-            "mark": "☑",
-            "title": "Title",
-            "author": "Author",
-            "year": "Year",
-            "publisher": "Publisher",
-            "code": "ISBN / code",
-            "price": "Price ₪",
-        }
-        for key, label in headings.items():
+        for key, label in HEADINGS.items():
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
             if key == "price":
                 anchor = "e"
-            elif key in {"mark", "author", "year", "publisher", "code"}:
+            elif key in {"mark", "author", "year", "status", "action", "publisher", "code"}:
                 anchor = "center"
             else:
                 anchor = "w"
             self.tree.column(key, anchor=anchor, stretch=key != "mark", width=80)
         self.tree.column("mark", width=MARK_WIDTH, stretch=False, anchor="center")
         self.tree.column("price", anchor="e")
+        self.tree.tag_configure("failed", background="#F8E4E4")
+        self.tree.tag_configure("approved", background="#E4F7EA")
+        self.tree.tag_configure("final", background="#E8E8E8")
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -81,7 +100,7 @@ class BookTable(ttk.Frame):
         self.bind("<Configure>", self._on_resize)
 
     def _header_text(self, key: str, label: str) -> str:
-        if key not in {"mark", "title", "author", "publisher"}:
+        if key not in {"mark", "title", "author", "publisher", "status"}:
             return label
         if self.sort_column != key:
             return f"{label}  ↕"
@@ -119,6 +138,32 @@ class BookTable(ttk.Frame):
         self._sort_order()
         self._reload()
 
+    def set_filters(self, keys: set[str] | None) -> None:
+        self.filter_keys = {key for key in (keys or set()) if key}
+        self._reload()
+
+    def book_has_status(self, book: Book, key: str) -> bool:
+        if key == "checked":
+            return book.key() in self.checked
+        if key == "approved":
+            return bool(book.approved)
+        if key == "final":
+            return bool(book.final)
+        if key == "excel":
+            return bool(book.excel_passed)
+        if key == "failed":
+            return (book.scan_status or "") == "failed"
+        if key == "successful":
+            return (book.scan_status or "") == "successful"
+        if key == "fully scanned":
+            return (book.scan_status or "") == "fully scanned"
+        return False
+
+    def _matches_filter(self, book: Book) -> bool:
+        if not self.filter_keys:
+            return True
+        return any(self.book_has_status(book, key) for key in self.filter_keys)
+
     def select_book(self, book: Book) -> None:
         for iid, item in self._by_iid.items():
             if item is book or item.key() == book.key():
@@ -127,23 +172,14 @@ class BookTable(ttk.Frame):
                 return
 
     def toggle_sort(self, column: str) -> None:
-        if column not in {"mark", "title", "author", "publisher"}:
+        if column not in {"mark", "title", "author", "publisher", "status"}:
             return
         if self.sort_column == column:
             self.sort_reverse = not self.sort_reverse
         else:
             self.sort_column = column
             self.sort_reverse = False
-        headings = {
-            "mark": "☑",
-            "title": "Title",
-            "author": "Author",
-            "year": "Year",
-            "publisher": "Publisher",
-            "code": "ISBN / code",
-            "price": "Price ₪",
-        }
-        for key, label in headings.items():
+        for key, label in HEADINGS.items():
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
         self._sort_order()
         self._reload()
@@ -158,6 +194,8 @@ class BookTable(ttk.Frame):
                 return book.author.casefold()
             if self.sort_column == "publisher":
                 return book.publisher.casefold()
+            if self.sort_column == "status":
+                return (book.status_label().casefold(), title)
             return title
 
         self.order.sort(key=value, reverse=self.sort_reverse)
@@ -165,41 +203,63 @@ class BookTable(ttk.Frame):
     def selected_books(self) -> list[Book]:
         return [book for book in self.books if book.key() in self.checked]
 
-    def select_all(self) -> None:
-        self.checked = {book.key() for book in self.books}
-        self._refresh_marks()
+    def _after_check_change(self) -> None:
         if self.on_check:
             self.on_check()
+        if "checked" in self.filter_keys:
+            self._reload()
+
+    def select_all(self) -> None:
+        self.checked = {book.key() for book in self.books if self._matches_filter(book)}
+        self._refresh_marks()
+        self._after_check_change()
 
     def clear_selection(self) -> None:
         self.checked.clear()
         self._refresh_marks()
-        if self.on_check:
-            self.on_check()
+        self._after_check_change()
+
+    def _row_values(self, book: Book) -> tuple[str, ...]:
+        return (
+            "☑" if book.key() in self.checked else "☐",
+            book.display_title(),
+            book.author,
+            book.year,
+            book.status_label(),
+            book.workflow_label(),
+            book.publisher,
+            book.identity_code() or book.scanner_id,
+            format_price(book.price_ils),
+        )
+
+    def _row_tags(self, book: Book) -> tuple[str, ...]:
+        if book.final:
+            return ("final",)
+        if book.scan_status == "failed":
+            return ("failed",)
+        if book.approved:
+            return ("approved",)
+        return ()
 
     def _reload(self) -> None:
         self.tree.delete(*self.tree.get_children())
         self._by_iid.clear()
         for book_index in self.order:
             book = self.books[book_index]
+            if not self._matches_filter(book):
+                continue
             key = book.key()
             iid = f"{book_index}:{key}"
             self._by_iid[iid] = book
-            self.tree.insert(
-                "",
-                "end",
-                iid=iid,
-                values=(
-                    "☑" if key in self.checked else "☐",
-                    book.display_title(),
-                    book.author,
-                    book.year,
-                    book.publisher,
-                    book.identity_code(),
-                    format_price(book.price_ils),
-                ),
-            )
+            self.tree.insert("", "end", iid=iid, values=self._row_values(book), tags=self._row_tags(book))
         self.after_idle(lambda: self._apply_column_widths(self.winfo_width() or 800))
+
+    def refresh_book(self, book: Book) -> None:
+        for iid, item in self._by_iid.items():
+            if item is book or item.key() == book.key():
+                self.tree.item(iid, values=self._row_values(book), tags=self._row_tags(book))
+                return
+        self._reload()
 
     def _refresh_marks(self) -> None:
         for iid in self.tree.get_children():
@@ -224,7 +284,8 @@ class BookTable(ttk.Frame):
         if self.tree.identify("region", event.x, event.y) != "cell":
             self.tree.configure(cursor="")
             return
-        self.tree.configure(cursor="hand2" if self._column_at(event) == "publisher" else "")
+        column = self._column_at(event)
+        self.tree.configure(cursor="hand2" if column in {"publisher", "action"} else "")
 
     def _on_click(self, event: tk.Event) -> None:
         if self.tree.identify("region", event.x, event.y) != "cell":
@@ -243,8 +304,10 @@ class BookTable(ttk.Frame):
             values = list(self.tree.item(row, "values"))
             values[0] = "☑" if key in self.checked else "☐"
             self.tree.item(row, values=values)
-            if self.on_check:
-                self.on_check()
+            self._after_check_change()
+            return
+        if column == "action" and self.on_action and book.workflow_label() != "—":
+            self.after_idle(lambda b=book: self.on_action(b))
             return
         if column == "publisher" and self.on_publisher:
             self.after_idle(lambda b=book: self.on_publisher(b))

@@ -57,6 +57,7 @@ EXCEL_TARGETS: dict[str, str] = {
     "keywords": "Keywords",
     "cover_image_url": "Cover image URL",
     "back_image_url": "Back image URL",
+    "scanner_id": "Scanner ID",
 }
 
 CORE_FIELDS = {

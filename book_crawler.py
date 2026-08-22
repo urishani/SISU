@@ -185,11 +185,20 @@ class Book:
     cover_image_url: str = ""
     back_image_url: str = ""
     extra: dict[str, str] = field(default_factory=dict)
+    scanner_id: str = ""
+    scan_status: str = ""
+    scan_message: str = ""
+    approved: bool = False
+    excel_passed: bool = False
+    final: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Book":
         allowed = {item.name for item in fields(cls)}
         kwargs = {key: value for key, value in data.items() if key in allowed and key != "extra"}
+        for flag in ("approved", "excel_passed", "final"):
+            if flag in kwargs:
+                kwargs[flag] = bool(kwargs[flag])
         book = cls(**kwargs)
         extra = data.get("extra") or {}
         if isinstance(extra, dict):
@@ -197,7 +206,7 @@ class Book:
         return book
 
     def key(self) -> str:
-        return self.isbn or self.danacode or self.url or self.display_title()
+        return self.scanner_id or self.isbn or self.danacode or self.url or self.display_title()
 
     def display_title(self) -> str:
         return self.title or self.url
@@ -207,6 +216,47 @@ class Book:
 
     def missing_fields(self) -> list[str]:
         return [name for name in FILLABLE_FIELDS if not str(getattr(self, name, "") or "").strip()]
+
+    def append_scan_log(self, line: str) -> None:
+        text = str(line or "").strip()
+        if not text:
+            return
+        existing = (self.scan_message or "").strip()
+        if existing:
+            if text in existing.splitlines():
+                return
+            self.scan_message = existing + "\n" + text
+        else:
+            self.scan_message = text
+
+    def mark_scan_failed(self, message: str) -> None:
+        self.scan_status = "failed"
+        self.append_scan_log(message)
+
+    def refresh_scan_status(self) -> None:
+        if not (self.title or "").strip():
+            self.scan_status = "failed"
+            if not (self.scan_message or "").strip():
+                self.scan_message = "Opened the page but could not read a title."
+            return
+        if not self.missing_fields():
+            self.scan_status = "fully scanned"
+            if "fully scanned" not in (self.scan_message or "").casefold():
+                self.append_scan_log("Fully scanned: all fillable fields are set.")
+            return
+        self.scan_status = "successful"
+
+    def workflow_label(self) -> str:
+        if self.final:
+            return "Done"
+        if self.excel_passed:
+            return "Mark final"
+        if self.scan_status == "failed" and not (self.title or "").strip():
+            return "—"
+        return "Approve"
+
+    def status_label(self) -> str:
+        return self.scan_status or "successful"
 
     def _load_map(self, key: str) -> dict[str, str]:
         raw = self.extra.get(key) or ""
@@ -439,6 +489,7 @@ class Book:
             "description_en": desc_en,
             "cover_image_url": clean(self.cover_image_url),
             "back_image_url": clean(self.back_image_url),
+            "scanner_id": clean(self.scanner_id),
             "url": self.url,
         }
         if captured.get("author_en"):
@@ -1732,11 +1783,18 @@ class BookCrawler:
 
                 remember_page_book(book)
                 save_page_cache()
-            if book.matches_year(year, include_unknown_year) and book.title:
-                results.append(book)
-                self.report.matched += 1
+                book.append_scan_log("Opened a product page and read the book.")
+                book.refresh_scan_status()
+                if book.matches_year(year, include_unknown_year):
+                    results.append(book)
+                    self.report.matched += 1
+                else:
+                    self.report.skipped_year += 1
+                    book.append_scan_log(f"Skipped: publication year {book.year or 'unknown'} is not {year}.")
             else:
-                self.report.skipped_year += 1
+                book.mark_scan_failed("Opened the product page but could not read a title.")
+                results.append(book)
+                self.report.product_failed += 1
             self.progress(f"Opened a product page. Found {len(results)} matching book(s).")
             from field_map import flush_candidates
 
@@ -1787,15 +1845,29 @@ class BookCrawler:
                     book = self._book_from_url(product_url)
                 except requests.RequestException as exc:
                     self.report.product_failed += 1
-                    self.progress(f"Skipped a page ({exc.__class__.__name__}). Continuing…")
+                    stub = Book(url=product_url)
+                    stub.mark_scan_failed(f"Could not open the book page: {exc.__class__.__name__}: {exc}")
+                    results.append(stub)
+                    self.progress(f"Kept a failed page ({exc.__class__.__name__}). Continuing…")
                     continue
-                if book and book.matches_year(year, include_unknown_year) and book.title:
+                if book is None:
+                    stub = Book(url=product_url)
+                    stub.mark_scan_failed("The book page returned no data.")
+                    results.append(stub)
+                    self.report.product_failed += 1
+                elif not book.title:
+                    book.mark_scan_failed("Opened the page but could not read a title.")
+                    results.append(book)
+                    self.report.product_failed += 1
+                elif book.matches_year(year, include_unknown_year):
+                    book.append_scan_log("Read the book page.")
+                    book.refresh_scan_status()
                     results.append(book)
                     self.report.matched += 1
                 else:
                     self.report.skipped_year += 1
                 self.progress(
-                    f"Checked {index}/{len(product_urls)} books — {len(results)} from {year or 'any year'}"
+                    f"Checked {index}/{len(product_urls)} books — {len(results)} listed for {year or 'any year'}"
                 )
         except CrawlCancelled:
             self.report.cancelled = True
@@ -2032,52 +2104,66 @@ class BookCrawler:
         from publisher_sites import resolve_publisher_site
 
         filled: list[str] = []
-        publisher_url = resolve_publisher_site(book.publisher)
-        if not publisher_url:
-            note = (
-                f"No publisher website is known for {book.publisher}."
-                if book.publisher
-                else "This book has no publisher, so there is no publisher site to search."
-            )
-            self.progress(note)
-            book.mark_publisher_lookup("", note=note)
-            return filled
-        host = urlparse(publisher_url).netloc
-        book.mark_publisher_lookup(publisher_url, note=f"Looking on {host}…")
-        self.progress(f"Looking on the publisher site {host} for “{book.display_title()}”…")
+        previous = self.progress
+
+        def progress(msg: str) -> None:
+            book.append_scan_log(msg)
+            previous(msg)
+
+        self.progress = progress
         try:
-            match = self.find_matching_product(publisher_url, book, try_slugs=True)
-        except CrawlCancelled:
-            raise
-        except requests.RequestException as exc:
-            note = f"Could not open {host}: {exc.__class__.__name__}"
-            self.progress(note)
-            book.mark_publisher_lookup(publisher_url, note=note)
-            return filled
-        if not match:
-            note = f"No matching book page found on {host}."
-            self.progress(note)
-            book.mark_publisher_lookup(publisher_url, note=note)
-            return filled
-        added = book.merge_missing(match)
-        findings = match.publisher_found_fields() or match._load_field_rows("found_fields")
-        if findings:
-            book.extra["publisher_found"] = json.dumps(findings, ensure_ascii=False)
-            self.progress("Fields found on the publisher book page:")
-            for item in findings:
-                mapped = item.get("field") or "not mapped"
-                self.progress(f"  {item['label']}: {item['value']}  [{mapped}]")
-        if added:
-            note = f"New from {host}: {', '.join(added)}"
-            self.progress(note)
-            self.report.enriched += 1
-        else:
-            note = f"Found the book on {host}, but every fillable field was already set."
-            self.progress(note)
-        if match.url:
-            self.progress(f"Publisher book page: {match.url}")
-        book.mark_publisher_lookup(publisher_url, page=match.url, filled=added, note=note)
-        return added
+            publisher_url = resolve_publisher_site(book.publisher)
+            if not publisher_url:
+                note = (
+                    f"No publisher website is known for {book.publisher}."
+                    if book.publisher
+                    else "This book has no publisher, so there is no publisher site to search."
+                )
+                self.progress(note)
+                book.mark_publisher_lookup("", note=note)
+                book.refresh_scan_status()
+                return filled
+            host = urlparse(publisher_url).netloc
+            book.mark_publisher_lookup(publisher_url, note=f"Looking on {host}…")
+            self.progress(f"Looking on the publisher site {host} for “{book.display_title()}”…")
+            try:
+                match = self.find_matching_product(publisher_url, book, try_slugs=True)
+            except CrawlCancelled:
+                raise
+            except requests.RequestException as exc:
+                note = f"Could not open {host}: {exc.__class__.__name__}"
+                self.progress(note)
+                book.mark_publisher_lookup(publisher_url, note=note)
+                book.refresh_scan_status()
+                return filled
+            if not match:
+                note = f"No matching book page found on {host}."
+                self.progress(note)
+                book.mark_publisher_lookup(publisher_url, note=note)
+                book.refresh_scan_status()
+                return filled
+            added = book.merge_missing(match)
+            findings = match.publisher_found_fields() or match._load_field_rows("found_fields")
+            if findings:
+                book.extra["publisher_found"] = json.dumps(findings, ensure_ascii=False)
+                self.progress("Fields found on the publisher book page:")
+                for item in findings:
+                    mapped = item.get("field") or "not mapped"
+                    self.progress(f"  {item['label']}: {item['value']}  [{mapped}]")
+            if added:
+                note = f"New from {host}: {', '.join(added)}"
+                self.progress(note)
+                self.report.enriched += 1
+            else:
+                note = f"Found the book on {host}, but every fillable field was already set."
+                self.progress(note)
+            if match.url:
+                self.progress(f"Publisher book page: {match.url}")
+            book.mark_publisher_lookup(publisher_url, page=match.url, filled=added, note=note)
+            book.refresh_scan_status()
+            return added
+        finally:
+            self.progress = previous
 
     def enrich_books(self, books: list[Book], extra_urls: list[str], max_searches: int = 24) -> int:
         from book_cache import cached_books_for_host
@@ -2133,6 +2219,9 @@ class BookCrawler:
         from field_map import flush_candidates
 
         flush_candidates()
+        for book in books:
+            if book.title:
+                book.refresh_scan_status()
         return filled
 
 

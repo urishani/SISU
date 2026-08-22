@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from urllib.parse import urlparse
 
@@ -26,13 +26,31 @@ from app_config import (
     normalize_site_url,
     save_config,
 )
-from book_cache import load_last, load_results, save_books
 from book_crawler import Book, BookCrawler, CrawlCancelled, CrawlReport, format_price, parse_site_urls, site_display_name, site_host
-from book_table import BookTable
+from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook
 from field_map import ALIASES_PATH, REPORT_JSON_PATH, reload_aliases, write_field_report
 from hebrew_view import HebrewDescription
 from publisher_sites import publishers_match, resolve_publisher_site
+from scanner_registry import attach_book, attach_books, mark_excel_ids, persist_book_state
+from scan_lists import (
+    books_from_payload,
+    build_payload,
+    default_scan_title,
+    delete_named,
+    empty_payload,
+    list_summaries,
+    load_named,
+    load_stash,
+    load_working,
+    rename_named,
+    save_named,
+    save_stash,
+    save_working,
+    set_named_flags,
+    stash_exists,
+    stash_summary,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 WATCHED_FILES = (
@@ -46,6 +64,8 @@ WATCHED_FILES = (
     "publisher_sites.py",
     "app_config.py",
     "field_map.py",
+    "scanner_registry.py",
+    "scan_lists.py",
 )
 RELOAD_SENTINEL = APP_DIR / "cache" / ".reload"
 SCHEMA_EXCEL = APP_DIR / "master our program.xlsx"
@@ -63,6 +83,7 @@ DEFAULT_URLS = "\n".join(
     (
         "https://www.booknet.co.il/ספרים-חדשים",
         "https://www.e-vrit.co.il/",
+        "https://www.nli.org.il/he/search?materialType=books",
     )
 )
 
@@ -79,14 +100,22 @@ class BookCatalogApp(tk.Tk):
         self.year = tk.StringVar(value="2026")
         self.max_pages = tk.IntVar(value=5)
         self.include_unknown = tk.BooleanVar(value=True)
-        self.use_cache = tk.BooleanVar(value=True)
-        self.status = tk.StringVar(value="Choose bookstore URLs and a publication year, then Search.")
+        self.status = tk.StringVar(value="Start a new list, or open a saved scan list.")
         self.summary = tk.StringVar(value="")
         self.colored_info = tk.StringVar(value="")
         self.excel_columns: list[dict] = []
         self.excel_all_columns: list[dict] = []
 
         self.books: list[Book] = []
+        self.list_title = tk.StringVar(value="New")
+        self.list_status = tk.StringVar(value="Working list · new")
+        self._list_id = ""
+        self._list_locked = False
+        self._list_archived = False
+        self._list_created_at = ""
+        self._list_notes = ""
+        self._list_report: dict = {}
+        self._lists_popup: tk.Toplevel | None = None
         self._selected_book: Book | None = None
         self._description_text = ""
         self._copy_toast: tk.Toplevel | None = None
@@ -112,7 +141,7 @@ class BookCatalogApp(tk.Tk):
         self._setup_style()
         self._build()
         self.refresh_excel_info()
-        self._restore_cache()
+        self._restore_working_list()
         self._mtimes = _source_mtimes()
         self.after(120, self._drain_queue)
         self.after(900, self._watch_for_reload)
@@ -145,10 +174,29 @@ class BookCatalogApp(tk.Tk):
             side="right", padx=(0, 8), pady=12
         )
         ttk.Button(header, text="Field report", command=self.open_field_report).pack(side="right", padx=(0, 8), pady=12)
+        ttk.Button(header, text="Lists", command=self.open_lists_manager).pack(side="right", padx=(0, 8), pady=12)
         ttk.Button(header, text="Settings", command=self.open_settings).pack(side="right", padx=16, pady=12)
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=14, pady=12)
+
+        lists = ttk.LabelFrame(body, text="Scan list")
+        lists.pack(fill="x", pady=(0, 8))
+        lists.columnconfigure(1, weight=1)
+        ttk.Label(lists, text="Title").grid(row=0, column=0, sticky="e", padx=(10, 8), pady=6)
+        self.list_title_entry = ttk.Entry(lists, textvariable=self.list_title)
+        self.list_title_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        self.list_title_entry.bind("<FocusOut>", lambda _e: self._persist_working())
+        list_btns = ttk.Frame(lists)
+        list_btns.grid(row=0, column=2, padx=10, pady=6, sticky="e")
+        ttk.Button(list_btns, text="New", command=self.new_working_list).pack(side="left", padx=(0, 4))
+        ttk.Button(list_btns, text="Stash", command=self.stash_working_list).pack(side="left", padx=(0, 4))
+        ttk.Button(list_btns, text="Restore stash", command=self.restore_stash).pack(side="left", padx=(0, 4))
+        ttk.Button(list_btns, text="Save list", command=self.save_current_list).pack(side="left", padx=(0, 4))
+        ttk.Button(list_btns, text="Open lists…", command=self.open_lists_manager).pack(side="left")
+        ttk.Label(lists, textvariable=self.list_status, wraplength=1100).grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8)
+        )
 
         form = ttk.LabelFrame(body, text="Search")
         form.pack(fill="x")
@@ -173,9 +221,11 @@ class BookCatalogApp(tk.Tk):
         self.url_text.insert("1.0", DEFAULT_URLS)
 
         ttk.Label(form, text="Year").grid(row=2, column=0, sticky="e", padx=(10, 8), pady=6)
-        ttk.Entry(form, textvariable=self.year, width=10).grid(row=2, column=1, sticky="w", pady=6)
+        self.year_entry = ttk.Entry(form, textvariable=self.year, width=10)
+        self.year_entry.grid(row=2, column=1, sticky="w", pady=6)
         ttk.Label(form, text="Max listing pages").grid(row=2, column=2, sticky="e", padx=(16, 8))
-        ttk.Spinbox(form, from_=1, to=40, textvariable=self.max_pages, width=6).grid(row=2, column=3, sticky="w")
+        self.pages_spin = ttk.Spinbox(form, from_=1, to=40, textvariable=self.max_pages, width=6)
+        self.pages_spin.grid(row=2, column=3, sticky="w")
         buttons = ttk.Frame(form)
         buttons.grid(row=2, column=4, sticky="e", padx=10, pady=6)
         self.search_btn = ttk.Button(buttons, text="Search", command=self.start_search, style="Accent.TButton")
@@ -185,12 +235,10 @@ class BookCatalogApp(tk.Tk):
 
         checks = ttk.Frame(form)
         checks.grid(row=3, column=1, columnspan=4, sticky="w", pady=(0, 8))
-        ttk.Checkbutton(checks, text="Also keep books with no year listed", variable=self.include_unknown).pack(
-            side="left"
+        self.unknown_check = ttk.Checkbutton(
+            checks, text="Also keep books with no year listed", variable=self.include_unknown
         )
-        ttk.Checkbutton(checks, text="Use cached results if available", variable=self.use_cache).pack(
-            side="left", padx=(18, 0)
-        )
+        self.unknown_check.pack(side="left")
 
         ttk.Label(body, textvariable=self.colored_info, wraplength=1180).pack(anchor="w", pady=(8, 4))
         self.progress = ttk.Progressbar(body, mode="indeterminate")
@@ -209,7 +257,19 @@ class BookCatalogApp(tk.Tk):
             on_select=self.show_book,
             on_check=self._on_check_change,
             on_publisher=self.ask_publisher_lookup,
+            on_action=self.handle_book_action,
         )
+        filter_bar = ttk.Frame(list_frame)
+        filter_bar.pack(fill="x", pady=(0, 4))
+        ttk.Label(filter_bar, text="Filter").pack(side="left")
+        self._filter_vars: dict[str, tk.BooleanVar] = {}
+        for key, label in ROW_STATUSES:
+            var = tk.BooleanVar(value=False)
+            self._filter_vars[key] = var
+            ttk.Checkbutton(filter_bar, text=label, variable=var, command=self._on_filter_change).pack(
+                side="left", padx=(8, 0)
+            )
+        ttk.Button(filter_bar, text="Clear books…", command=self.clear_books_with_keep).pack(side="right")
         self.table.pack(fill="both", expand=True)
 
         detail_header = ttk.Frame(detail_frame, style="Card.TFrame")
@@ -217,8 +277,12 @@ class BookCatalogApp(tk.Tk):
         ttk.Label(detail_header, text="Selected book", style="Card.TLabel", font=("Segoe UI", 11, "bold")).pack(
             side="left"
         )
+        self.final_btn = ttk.Button(detail_header, text="Mark final", command=self.mark_selected_final, state="disabled")
+        self.final_btn.pack(side="right")
+        self.approve_btn = ttk.Button(detail_header, text="Approve", command=self.approve_selected, state="disabled")
+        self.approve_btn.pack(side="right", padx=(0, 6))
         self.more_btn = ttk.Button(detail_header, text="More", command=self.lookup_more, state="disabled")
-        self.more_btn.pack(side="right")
+        self.more_btn.pack(side="right", padx=(0, 6))
 
         detail_split = ttk.Panedwindow(detail_frame, orient="vertical")
         detail_split.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -297,10 +361,11 @@ class BookCatalogApp(tk.Tk):
         footer.pack(fill="x", pady=(8, 0))
         ttk.Button(footer, text="Select all", command=self.table.select_all).pack(side="left")
         ttk.Button(footer, text="Clear selection", command=self.table.clear_selection).pack(side="left", padx=6)
+        ttk.Button(footer, text="Mark selected final", command=self.mark_selected_final_checked).pack(side="left")
         ttk.Button(
             footer,
-            text="Write selected books to Excel",
-            command=self.write_excel,
+            text="Approve selected",
+            command=self.approve_checked,
             style="Accent.TButton",
         ).pack(side="right")
         ttk.Label(footer, textvariable=self.status).pack(side="left", padx=16)
@@ -666,37 +731,399 @@ class BookCatalogApp(tk.Tk):
         unmapped = [col["header"] for col in catalog.columns if not col.get("field")]
         extra = f" Unmapped orange headers: {', '.join(unmapped)}." if unmapped else ""
         self.colored_info.set(f"Orange/colored columns that will be filled: {names}.{extra}")
+        mark_excel_ids(catalog.existing_scanner_ids())
 
-    def _restore_cache(self) -> None:
-        data = load_last()
-        if not data or not data.get("books"):
-            return
-        self.books = data["books"]
-        self.table.set_books(self.books, keep_checks=False)
-        saved_urls = data.get("urls") or []
-        if saved_urls:
-            self.url_text.delete("1.0", "end")
-            self.url_text.insert("1.0", "\n".join(saved_urls))
-        if data.get("year"):
-            self.year.set(str(data["year"]))
-        saved = str(data.get("saved_at") or "")
-        year = data.get("year") or "any year"
-        self._set_status(
-            f"Loaded {len(self.books)} cached book(s) from {year}. Same URLs will not recrawl."
+    def _current_payload(self, report: dict | None = None) -> dict:
+        return build_payload(
+            books=self.books,
+            urls=self._urls(),
+            year=self.year.get().strip(),
+            title=self.list_title.get().strip() or "New",
+            list_id=self._list_id,
+            locked=self._list_locked,
+            archived=self._list_archived,
+            max_pages=int(self.max_pages.get() or 5),
+            include_unknown=bool(self.include_unknown.get()),
+            report=report if report is not None else self._list_report,
+            notes=self._list_notes,
+            created_at=self._list_created_at,
         )
-        report = data.get("report") or {}
-        if report:
-            summary = CrawlReport(**{k: report[k] for k in CrawlReport.__dataclass_fields__ if k in report})
-            summary.from_cache = True
-            summary.matched = len(self.books)
-            self.summary.set(summary.summary())
+
+    def _persist_working(self, report: dict | None = None) -> None:
+        if report is not None:
+            self._list_report = report
+        save_working(self._current_payload())
+        self._refresh_list_status()
+
+    def _refresh_list_status(self) -> None:
+        if self._list_locked:
+            kind = "Locked list"
+        elif self._list_id:
+            kind = "Saved list"
+        elif self.books:
+            kind = "Working list · unsaved"
         else:
-            self.summary.set(f"From cache: {len(self.books)} book(s) loaded. No pages fetched.")
-        if saved:
-            self.status.set(self.status.get() + f"  ({saved})")
+            kind = "Working list · new"
+        extra = []
+        if self._list_archived:
+            extra.append("archived")
+        if stash_exists():
+            extra.append("stash ready")
+        suffix = f" · {', '.join(extra)}" if extra else ""
+        self.list_status.set(f"{kind} · {len(self.books)} book(s){suffix}")
+        self._apply_lock_state()
+
+    def _apply_lock_state(self) -> None:
+        locked = self._list_locked and not self._busy
+        search_state = "disabled" if (self._list_locked or self._busy) else "normal"
+        edit_state = "disabled" if self._list_locked else "normal"
+        self.search_btn.configure(state=search_state)
+        try:
+            self.url_text.configure(state=edit_state)
+        except tk.TclError:
+            pass
+        self.year_entry.configure(state=edit_state)
+        self.pages_spin.configure(state=edit_state)
+        self.unknown_check.configure(state=edit_state)
+        self.list_title_entry.configure(state=edit_state)
+        if self._list_locked:
+            self.more_btn.configure(state="disabled")
+            self.approve_btn.configure(state="disabled")
+            self.final_btn.configure(state="disabled")
+        elif self._selected_book and not self._busy:
+            self.more_btn.configure(state="normal")
+            self._update_workflow_buttons(self._selected_book)
+
+    def _apply_payload(self, data: dict, *, status: str = "") -> None:
+        self._list_id = str(data.get("id") or "")
+        self._list_locked = bool(data.get("locked"))
+        self._list_archived = bool(data.get("archived"))
+        self._list_created_at = str(data.get("created_at") or "")
+        self._list_notes = str(data.get("notes") or "")
+        self._list_report = data.get("report") or {}
+        self.list_title.set(str(data.get("title") or "New"))
+        urls = [str(url) for url in (data.get("urls") or []) if str(url).strip()]
+        self.url_text.configure(state="normal")
+        self.url_text.delete("1.0", "end")
+        self.url_text.insert("1.0", "\n".join(urls) if urls else DEFAULT_URLS)
+        if data.get("year") not in (None, ""):
+            self.year.set(str(data.get("year")))
+        if data.get("max_pages"):
+            try:
+                self.max_pages.set(int(data.get("max_pages")))
+            except (TypeError, ValueError, tk.TclError):
+                pass
+        if "include_unknown" in data:
+            self.include_unknown.set(bool(data.get("include_unknown")))
+        self.books = books_from_payload(data)
+        self._prepare_books(self.books)
+        self.table.set_books(self.books, keep_checks=False)
+        self._selected_book = None
+        self._persist_working()
+        report = self._list_report
+        if report:
+            try:
+                summary = CrawlReport(**{k: report[k] for k in CrawlReport.__dataclass_fields__ if k in report})
+                summary.matched = len(self.books)
+                self.summary.set(summary.summary())
+            except TypeError:
+                self.summary.set(f"{len(self.books)} book(s) in this list.")
+        else:
+            self.summary.set(f"{len(self.books)} book(s) in this list.")
+        self._set_status(status or f"Opened “{self.list_title.get()}” with {len(self.books)} book(s).")
+        self._refresh_list_status()
+
+    def _restore_working_list(self) -> None:
+        data = load_working()
+        if not data:
+            self._refresh_list_status()
+            return
+        self._apply_payload(
+            data,
+            status=f"Restored the last working list “{data.get('title') or 'New'}” with {len(data.get('books') or [])} book(s).",
+        )
+
+    def new_working_list(self) -> None:
+        if self._busy:
+            return
+        if self.books and not messagebox.askyesno(
+            "New list",
+            "Clear the current working list? Stash it first if you want to keep these books.",
+        ):
+            return
+        urls = self._urls() or parse_site_urls(DEFAULT_URLS)
+        payload = empty_payload(
+            title="New",
+            urls=urls,
+            year=self.year.get().strip(),
+            max_pages=int(self.max_pages.get() or 5),
+            include_unknown=bool(self.include_unknown.get()),
+        )
+        self._apply_payload(payload, status="Started a new empty working list.")
+
+    def stash_working_list(self) -> None:
+        if self._busy:
+            return
+        if stash_exists() and not messagebox.askyesno(
+            "Stash",
+            f"Replace the existing stash?\n\n{stash_summary()}",
+        ):
+            return
+        save_stash(self._current_payload())
+        urls = self._urls() or parse_site_urls(DEFAULT_URLS)
+        payload = empty_payload(
+            title="New",
+            urls=urls,
+            year=self.year.get().strip(),
+            max_pages=int(self.max_pages.get() or 5),
+            include_unknown=bool(self.include_unknown.get()),
+        )
+        self._apply_payload(payload, status="Stashed the previous list. This working list is empty for a new search.")
+
+    def restore_stash(self) -> None:
+        if self._busy:
+            return
+        data = load_stash()
+        if not data:
+            messagebox.showinfo("Stash", "There is no stashed list to restore.")
+            return
+        if self.books and not messagebox.askyesno(
+            "Restore stash",
+            f"Replace the current working list with the stash?\n\n{stash_summary()}",
+        ):
+            return
+        self._apply_payload(data, status=f"Restored stash: {stash_summary()}.")
+
+    def save_current_list(self) -> None:
+        if self._list_locked:
+            messagebox.showinfo("Locked", "This list is locked. Unlock it before saving changes.")
+            return
+        title = self.list_title.get().strip()
+        if not title or title == "New":
+            title = default_scan_title(len(self.books), self.year.get().strip())
+            entered = simpledialog.askstring(
+                "Save list",
+                "Name for this scan list:",
+                initialvalue=title,
+                parent=self,
+            )
+            if entered is None:
+                return
+            title = entered.strip() or title
+            self.list_title.set(title)
+        payload = save_named(self._current_payload())
+        self._list_id = str(payload.get("id") or "")
+        self._list_created_at = str(payload.get("created_at") or "")
+        self._persist_working()
+        self._set_status(f"Saved list “{title}”.")
+        if self._lists_popup is not None:
+            self._reload_lists_table()
+
+    def _guard_locked(self, action: str = "change this list") -> bool:
+        if not self._list_locked:
+            return False
+        messagebox.showinfo("Locked list", f"This list is locked, so you cannot {action}. Unlock it in Lists first.")
+        return True
+
+    def open_lists_manager(self) -> None:
+        existing = getattr(self, "_lists_popup", None)
+        if existing is not None:
+            try:
+                existing.lift()
+                existing.focus_force()
+                return
+            except tk.TclError:
+                self._lists_popup = None
+        win = tk.Toplevel(self)
+        win.title("Scan lists")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.geometry("860x480")
+        win.minsize(720, 380)
+        self._lists_popup = win
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_lists_popup())
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="Saved scan lists. Open one to make it the working list. Locked lists can be viewed but not searched or changed.",
+            wraplength=800,
+        ).pack(anchor="w")
+        self._show_archived = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body,
+            text="Show archived lists",
+            variable=self._show_archived,
+            command=self._reload_lists_table,
+        ).pack(anchor="w", pady=(8, 6))
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True)
+        columns = ("title", "books", "year", "updated", "state")
+        tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="browse", height=12)
+        tree.heading("title", text="Title")
+        tree.heading("books", text="Books")
+        tree.heading("year", text="Year")
+        tree.heading("updated", text="Updated")
+        tree.heading("state", text="State")
+        tree.column("title", width=280, anchor="w")
+        tree.column("books", width=70, anchor="center")
+        tree.column("year", width=70, anchor="center")
+        tree.column("updated", width=160, anchor="center")
+        tree.column("state", width=140, anchor="w")
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self._lists_tree = tree
+        tree.bind("<Double-1>", lambda _e: self._open_selected_saved_list())
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Open", command=self._open_selected_saved_list).pack(side="left")
+        ttk.Button(btns, text="Rename", command=self._rename_selected_list).pack(side="left", padx=4)
+        ttk.Button(btns, text="Lock", command=lambda: self._flag_selected_list(locked=True)).pack(side="left")
+        ttk.Button(btns, text="Unlock", command=lambda: self._flag_selected_list(locked=False)).pack(side="left", padx=4)
+        ttk.Button(btns, text="Archive", command=lambda: self._flag_selected_list(archived=True)).pack(side="left")
+        ttk.Button(btns, text="Unarchive", command=lambda: self._flag_selected_list(archived=False)).pack(
+            side="left", padx=4
+        )
+        ttk.Button(btns, text="Delete…", command=self._delete_selected_list).pack(side="left")
+        ttk.Button(btns, text="Close", command=self._close_lists_popup).pack(side="right")
+        self._reload_lists_table()
+
+    def _close_lists_popup(self) -> None:
+        win = self._lists_popup
+        self._lists_popup = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _reload_lists_table(self) -> None:
+        tree = getattr(self, "_lists_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        for item in list_summaries(include_archived=bool(self._show_archived.get())):
+            state = []
+            if item.get("locked"):
+                state.append("locked")
+            if item.get("archived"):
+                state.append("archived")
+            updated = str(item.get("updated_at") or "")[:16].replace("T", " ")
+            tree.insert(
+                "",
+                "end",
+                iid=str(item.get("id") or ""),
+                values=(
+                    item.get("title") or "Untitled",
+                    item.get("book_count") or 0,
+                    item.get("year") or "",
+                    updated,
+                    ", ".join(state) or "saved",
+                ),
+            )
+
+    def _selected_list_id(self) -> str:
+        tree = getattr(self, "_lists_tree", None)
+        if tree is None:
+            return ""
+        selection = tree.selection()
+        return str(selection[0]) if selection else ""
+
+    def _open_selected_saved_list(self) -> None:
+        list_id = self._selected_list_id()
+        if not list_id:
+            return
+        data = load_named(list_id)
+        if not data:
+            messagebox.showerror("Lists", "That list file could not be opened.")
+            return
+        if self.books and not messagebox.askyesno(
+            "Open list",
+            "Replace the current working list with this saved list?\nStash first if you want to keep the unsaved books.",
+        ):
+            return
+        self._apply_payload(data)
+        self._close_lists_popup()
+
+    def _rename_selected_list(self) -> None:
+        list_id = self._selected_list_id()
+        if not list_id:
+            return
+        current = load_named(list_id) or {}
+        if current.get("locked"):
+            messagebox.showinfo("Locked", "Unlock the list before renaming it.")
+            return
+        entered = simpledialog.askstring(
+            "Rename list",
+            "New title:",
+            initialvalue=str(current.get("title") or ""),
+            parent=self._lists_popup or self,
+        )
+        if entered is None or not entered.strip():
+            return
+        rename_named(list_id, entered.strip())
+        if self._list_id == list_id:
+            self.list_title.set(entered.strip())
+            self._persist_working()
+        self._reload_lists_table()
+
+    def _flag_selected_list(self, locked: bool | None = None, archived: bool | None = None) -> None:
+        list_id = self._selected_list_id()
+        if not list_id:
+            return
+        payload = set_named_flags(list_id, locked=locked, archived=archived)
+        if not payload:
+            return
+        if self._list_id == list_id:
+            if locked is not None:
+                self._list_locked = bool(locked)
+            if archived is not None:
+                self._list_archived = bool(archived)
+            self._persist_working()
+        self._reload_lists_table()
+
+    def _delete_selected_list(self) -> None:
+        list_id = self._selected_list_id()
+        if not list_id:
+            return
+        current = load_named(list_id) or {}
+        title = str(current.get("title") or "this list")
+        if current.get("locked"):
+            messagebox.showinfo("Locked", "Unlock the list before deleting it.")
+            return
+        if not messagebox.askyesno(
+            "Delete list",
+            f"Delete the saved list “{title}”?\n\nThis does not delete the books from Excel. It only removes this scan list.",
+        ):
+            return
+        if not messagebox.askyesno(
+            "Delete list",
+            "This cannot be undone. Delete the list permanently?",
+        ):
+            return
+        typed = simpledialog.askstring(
+            "Confirm delete",
+            f'Type DELETE to permanently remove “{title}”:',
+            parent=self._lists_popup or self,
+        )
+        if (typed or "").strip().upper() != "DELETE":
+            messagebox.showinfo("Delete cancelled", "The list was not deleted.")
+            return
+        delete_named(list_id)
+        if self._list_id == list_id:
+            self._list_id = ""
+            self._list_locked = False
+            self._list_archived = False
+            self._persist_working()
+        self._reload_lists_table()
+        self._set_status(f"Deleted list “{title}”.")
 
     def start_search(self) -> None:
         if self._busy:
+            return
+        if self._guard_locked("search again"):
             return
         urls = self._urls()
         year = self.year.get().strip()
@@ -706,31 +1133,30 @@ class BookCatalogApp(tk.Tk):
         if year and not year.isdigit():
             messagebox.showwarning("Year", "Publication year should be a number such as 2026.")
             return
-        if self.use_cache.get():
-            cached = load_results(urls, year)
-            if cached and cached.get("books"):
-                self.books = cached["books"]
-                self.table.set_books(self.books, keep_checks=False)
-                report = cached.get("report") or {}
-                summary = CrawlReport(**{k: report[k] for k in CrawlReport.__dataclass_fields__ if k in report})
-                summary.from_cache = True
-                summary.matched = len(self.books)
-                self.summary.set(summary.summary())
-                self._set_status(
-                    f"Loaded {len(self.books)} book(s) from cache instantly. Uncheck “Use cached results” to crawl again."
-                )
-                return
 
         self._cancel.clear()
         self._busy = True
         self.search_btn.configure(state="disabled")
         self.more_btn.configure(state="disabled")
+        self.approve_btn.configure(state="disabled")
+        self.final_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.start(12)
         self._set_status("Starting crawl…")
         thread = threading.Thread(
             target=self._run_crawl,
-            args=(urls, year, int(self.max_pages.get() or 5), bool(self.include_unknown.get())),
+            args=(
+                urls,
+                year,
+                int(self.max_pages.get() or 5),
+                bool(self.include_unknown.get()),
+                self.list_title.get().strip(),
+                self._list_id,
+                self._list_locked,
+                self._list_archived,
+                self._list_notes,
+                self._list_created_at,
+            ),
             daemon=True,
         )
         thread.start()
@@ -739,7 +1165,19 @@ class BookCatalogApp(tk.Tk):
         self._cancel.set()
         self._set_status("Stopping…")
 
-    def _run_crawl(self, urls: list[str], year: str, max_pages: int, include_unknown: bool) -> None:
+    def _run_crawl(
+        self,
+        urls: list[str],
+        year: str,
+        max_pages: int,
+        include_unknown: bool,
+        title: str,
+        list_id: str,
+        locked: bool,
+        archived: bool,
+        notes: str,
+        created_at: str,
+    ) -> None:
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
             progress=lambda msg: self._ui_queue.put(("status", msg)),
@@ -754,7 +1192,23 @@ class BookCatalogApp(tk.Tk):
             )
             if urls[1:] and books:
                 crawler.enrich_books(books, urls[1:])
-            save_books(books, urls, year, report=asdict(crawler.report))
+            self._prepare_books(books)
+            save_working(
+                build_payload(
+                    books=books,
+                    urls=urls,
+                    year=year,
+                    title=title or default_scan_title(len(books), year),
+                    list_id=list_id,
+                    locked=locked,
+                    archived=archived,
+                    max_pages=max_pages,
+                    include_unknown=include_unknown,
+                    report=asdict(crawler.report),
+                    notes=notes,
+                    created_at=created_at,
+                )
+            )
             try:
                 write_field_report(self.excel_path.get().strip() or None)
             except Exception:
@@ -803,22 +1257,28 @@ class BookCatalogApp(tk.Tk):
 
     def _finish_search(self, books: list[Book], cancelled: bool, report: CrawlReport | None = None) -> None:
         self._busy = False
-        self.search_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.progress.stop()
-        if self._selected_book:
-            self.more_btn.configure(state="normal")
         if books:
             self.books = books
+            self._prepare_books(self.books)
             self.table.set_books(self.books, keep_checks=False)
+        if (not self.list_title.get().strip() or self.list_title.get().strip() == "New") and self.books:
+            self.list_title.set(default_scan_title(len(self.books), self.year.get().strip()))
+        if report is None:
+            report = CrawlReport(matched=len(self.books), cancelled=cancelled)
+        self._list_report = asdict(report)
+        self._persist_working(self._list_report)
         year = self.year.get().strip() or "any year"
         prefix = "Stopped. " if cancelled else ""
         self.status.set(
-            f"{prefix}{len(self.books)} book(s) from {year}. Results are cached for the next UI run."
+            f"{prefix}{len(self.books)} book(s) from {year}. The working list is kept until you save or clear it."
         )
-        if report is None:
-            report = CrawlReport(matched=len(self.books), cancelled=cancelled)
         self.summary.set(report.summary())
+        if self._selected_book:
+            self.more_btn.configure(state="normal")
+            self._update_workflow_buttons(self._selected_book)
+        self._refresh_list_status()
 
     def _on_check_change(self) -> None:
         self._set_status(f"{len(self.table.checked)} selected")
@@ -827,11 +1287,13 @@ class BookCatalogApp(tk.Tk):
         self._selected_book = book
         if not self._busy:
             self.more_btn.configure(state="normal")
+        self._update_workflow_buttons(book)
         fields = book.to_excel_fields()
         self._set_details(book, fields)
         self._set_links(_book_link_items(book))
         description = fields["description_he"] or book.description or ""
         self._set_description(description)
+        new_fields = {part for part in (book.extra.get("new_fields") or "").split(",") if part}
         if "description" in new_fields:
             self.desc_new_label.configure(text="new")
             self.desc_new_label.pack(side="left", padx=(8, 0))
@@ -839,6 +1301,8 @@ class BookCatalogApp(tk.Tk):
             self.desc_new_label.pack_forget()
 
     def lookup_more(self) -> None:
+        if self._guard_locked("look up more details"):
+            return
         book = self._selected_book
         if not book or self._busy:
             return
@@ -857,6 +1321,8 @@ class BookCatalogApp(tk.Tk):
         self._start_publisher_lookup([book], selected=book)
 
     def ask_publisher_lookup(self, book: Book) -> None:
+        if self._guard_locked("look up publisher details"):
+            return
         if self._busy:
             return
         name = (book.publisher or "").strip()
@@ -896,6 +1362,8 @@ class BookCatalogApp(tk.Tk):
         self._busy = True
         self.search_btn.configure(state="disabled")
         self.more_btn.configure(state="disabled")
+        self.approve_btn.configure(state="disabled")
+        self.final_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.start(12)
         label = books[0].publisher.strip() if books else "publisher"
@@ -1151,7 +1619,7 @@ class BookCatalogApp(tk.Tk):
                     remap[old_key] = book.key()
                 if filled:
                     updated += 1
-            save_books(self.books, self._urls(), self.year.get().strip())
+            save_working(self._current_payload())
             try:
                 write_field_report(self.excel_path.get().strip() or None)
             except Exception:
@@ -1170,7 +1638,7 @@ class BookCatalogApp(tk.Tk):
                 )
             )
         except CrawlCancelled:
-            save_books(self.books, self._urls(), self.year.get().strip())
+            save_working(self._current_payload())
             self._ui_queue.put(
                 (
                     "more_done",
@@ -1237,6 +1705,8 @@ class BookCatalogApp(tk.Tk):
         self.progress.stop()
         remap = (payload or {}).get("remap") or None
         selected = (payload or {}).get("selected") or self._selected_book
+        self._prepare_books(self.books)
+        self._persist_working()
         self.table.set_books(self.books, keep_checks=True, key_map=remap)
         if selected:
             self.table.select_book(selected)
@@ -1417,6 +1887,12 @@ class BookCatalogApp(tk.Tk):
         captured = book.captured_fields()
         shown: set[str] = set()
         self._clear_detail_panel()
+        self._add_detail_section("Scan")
+        self._add_detail_row("Scanner ID", book.scanner_id or "—")
+        workflow = "Final" if book.final else "Approved" if book.approved else "In Excel" if book.excel_passed else "Not approved"
+        self._add_detail_row("Workflow", workflow)
+        self._add_detail_row("Status", book.scan_status or "—")
+        self._add_detail_row("Message", book.scan_message or "—")
         if note:
             tk.Label(
                 self.detail_inner,
@@ -1442,6 +1918,9 @@ class BookCatalogApp(tk.Tk):
                 field = col.get("field") or ""
                 header = str(col.get("header") or "")
                 if field == "description_he":
+                    shown.add(field)
+                    continue
+                if field == "scanner_id":
                     shown.add(field)
                     continue
                 value = fields.get(field, "") if field else ""
@@ -1509,29 +1988,248 @@ class BookCatalogApp(tk.Tk):
         self._draw_copy_icon(bool(self._description_text.strip()))
         self.desc_view.set_text(self._description_text)
 
-    def write_excel(self) -> None:
+    def _on_filter_change(self, _event=None) -> None:
+        keys = {key for key, var in self._filter_vars.items() if var.get()}
+        self.table.set_filters(keys)
+        if not keys:
+            self._set_status("Showing all books.")
+            return
+        labels = [label for key, label in ROW_STATUSES if key in keys]
+        self._set_status("Showing: " + ", ".join(labels).lower() + ".")
+
+    def clear_books_with_keep(self) -> None:
+        if self._busy:
+            return
+        if self._guard_locked("clear books from this list"):
+            return
+        if not self.books:
+            messagebox.showinfo("Clear books", "This list is already empty.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Clear books")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="Choose the row statuses to keep. Books that do not match any of these will be removed from this list (not from Excel).",
+            wraplength=420,
+        ).pack(anchor="w")
+        keep_vars: dict[str, tk.BooleanVar] = {}
+        box = ttk.Frame(body)
+        box.pack(anchor="w", pady=(10, 8))
+        defaults = {"checked", "approved", "final"}
+        for key, label in ROW_STATUSES:
+            var = tk.BooleanVar(value=key in defaults)
+            keep_vars[key] = var
+            ttk.Checkbutton(box, text=f"Keep {label.lower()}", variable=var).pack(anchor="w", pady=2)
+
+        def cancel() -> None:
+            win.grab_release()
+            win.destroy()
+
+        def confirm() -> None:
+            keep = {key for key, var in keep_vars.items() if var.get()}
+            remaining = [
+                book
+                for book in self.books
+                if keep and any(self.table.book_has_status(book, key) for key in keep)
+            ]
+            removed = len(self.books) - len(remaining)
+            if removed <= 0:
+                messagebox.showinfo("Clear books", "Nothing to remove with those keep choices.")
+                cancel()
+                return
+            if not keep:
+                extra = f"No statuses are marked to keep, so all {len(self.books)} book(s) will be removed."
+            else:
+                labels = [label for key, label in ROW_STATUSES if key in keep]
+                extra = f"Keep {', '.join(labels).lower()}. Remove {removed} book(s)."
+            if not messagebox.askyesno("Clear books", extra + "\n\nContinue?"):
+                return
+            selected = self._selected_book
+            self.books = remaining
+            self._prepare_books(self.books)
+            self.table.set_books(self.books, keep_checks=True)
+            if selected not in self.books:
+                self._selected_book = None
+            self._persist_working()
+            self._refresh_list_status()
+            self._set_status(f"Removed {removed} book(s). {len(self.books)} remaining.")
+            cancel()
+
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="Cancel", command=cancel).pack(side="right")
+        ttk.Button(btns, text="Clear others", command=confirm).pack(side="right", padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.lift()
+        win.focus_force()
+
+    def _prepare_books(self, books: list[Book]) -> None:
+        for book in books:
+            if book.title:
+                book.refresh_scan_status()
+            elif not book.scan_status:
+                book.scan_status = "failed"
+                if not book.scan_message:
+                    book.scan_message = "Scan did not complete."
+        attach_books(books)
+
+    def _update_workflow_buttons(self, book: Book | None) -> None:
+        if book is None or self._busy or self._list_locked:
+            self.approve_btn.configure(state="disabled")
+            self.final_btn.configure(state="disabled")
+            return
+        can_approve = bool(book) and (not book.final) and (not book.excel_passed) and book.workflow_label() == "Approve"
+        can_final = bool(book) and (not book.final) and book.excel_passed
+        self.approve_btn.configure(state="normal" if can_approve else "disabled")
+        self.final_btn.configure(state="normal" if can_final else "disabled")
+
+    def handle_book_action(self, book: Book) -> None:
+        if self._guard_locked("change books on this list"):
+            return
+        label = book.workflow_label()
+        if label == "Approve":
+            self._approve_books([book])
+        elif label == "Mark final":
+            self._mark_books_final([book])
+
+    def approve_selected(self) -> None:
+        if self._guard_locked("approve books"):
+            return
+        if self._selected_book:
+            self._approve_books([self._selected_book])
+
+    def approve_checked(self) -> None:
+        if self._guard_locked("approve books"):
+            return
         selected = self.table.selected_books()
         if not selected:
             messagebox.showinfo("Nothing selected", "Check one or more books in the list first.")
             return
+        self._approve_books(selected)
+
+    def mark_selected_final(self) -> None:
+        if self._guard_locked("mark books final"):
+            return
+        if self._selected_book:
+            self._mark_books_final([self._selected_book])
+
+    def mark_selected_final_checked(self) -> None:
+        if self._guard_locked("mark books final"):
+            return
+        selected = self.table.selected_books()
+        if not selected:
+            messagebox.showinfo("Nothing selected", "Check one or more approved books first.")
+            return
+        self._mark_books_final(selected)
+
+    def _approve_books(self, books: list[Book]) -> None:
+        to_write: list[Book] = []
+        skipped_final = 0
+        skipped_failed = 0
+        already = 0
+        for book in books:
+            attach_book(book)
+            if book.final:
+                skipped_final += 1
+                continue
+            if book.scan_status == "failed" and not (book.title or "").strip():
+                skipped_failed += 1
+                continue
+            if book.excel_passed:
+                book.approved = True
+                persist_book_state(book)
+                already += 1
+            else:
+                to_write.append(book)
+        written = 0
+        skipped_excel = 0
+        saved = None
+        note = ""
+        if to_write:
+            written, skipped_excel, saved, note = self._pass_books_to_excel(to_write)
+        for book in books:
+            self.table.refresh_book(book)
+        if self._selected_book:
+            self.show_book(self._selected_book)
+        self._persist_working()
+        parts = []
+        if written:
+            parts.append(f"Approved and passed {written} book(s) to Excel")
+        if already:
+            parts.append(f"{already} already in Excel")
+        if skipped_excel:
+            parts.append(f"{skipped_excel} already in Excel (duplicate)")
+        if skipped_failed:
+            parts.append(f"{skipped_failed} failed scan(s) need a title first")
+        if skipped_final:
+            parts.append(f"{skipped_final} already final")
+        summary = "; ".join(parts) or "Nothing to approve."
+        if saved and note:
+            summary += note
+        self._set_status(summary)
+        if written or already or skipped_excel:
+            messagebox.showinfo("Approved", summary)
+
+    def _mark_books_final(self, books: list[Book]) -> None:
+        marked = 0
+        skipped = 0
+        for book in books:
+            if book.final:
+                continue
+            if not book.excel_passed:
+                skipped += 1
+                continue
+            book.final = True
+            book.approved = True
+            persist_book_state(book)
+            self.table.refresh_book(book)
+            marked += 1
+        if self._selected_book:
+            self.show_book(self._selected_book)
+        self._persist_working()
+        if not marked:
+            messagebox.showinfo(
+                "Mark final",
+                "Pass the book to Excel first by clicking Approve. After you process the spreadsheet, mark it final so it will not be written again.",
+            )
+            return
+        extra = f" {skipped} book(s) are not in Excel yet." if skipped else ""
+        self._set_status(f"Marked {marked} book(s) final.{extra}")
+        self._persist_working()
+
+    def _pass_books_to_excel(self, books: list[Book]) -> tuple[int, int, Path | None, str]:
         path = Path(self.excel_path.get().strip())
         if not path.exists():
             messagebox.showerror("Excel", "The Excel file was not found.")
-            return
+            return 0, 0, None, ""
         try:
             catalog = CatalogWorkbook(path)
-            payload = [book.to_excel_fields() for book in selected]
-            written, skipped = catalog.append_books(payload)
+            mark_excel_ids(catalog.existing_scanner_ids())
+            payload = [book.to_excel_fields() for book in books]
+            written, skipped, written_ids, skipped_ids = catalog.append_books(payload)
             saved = catalog.save()
         except Exception as exc:
             messagebox.showerror("Could not write Excel", str(exc))
-            return
-        extra = f"\nSkipped {skipped} duplicate(s) already in the file." if skipped else ""
+            return 0, 0, None, ""
+        done = set(written_ids) | set(skipped_ids)
+        for book in books:
+            if book.scanner_id in done:
+                book.approved = True
+                book.excel_passed = True
+                persist_book_state(book)
         note = ""
         if saved != path:
             note = f"\n\nThe original file is open or locked, so results were saved as:\n{saved}"
-        messagebox.showinfo("Excel updated", f"Wrote {written} book(s) into the colored columns.{extra}{note}")
-        self._set_status(f"Wrote {written} book(s) to {saved.name}")
+        return written, skipped, saved, note
+
+    def write_excel(self) -> None:
+        self.approve_checked()
 
     def _set_status(self, text: str) -> None:
         self.status.set(text)
@@ -1614,6 +2312,8 @@ class BookCatalogApp(tk.Tk):
         self._updating = True
         self.search_btn.configure(state="disabled")
         self.more_btn.configure(state="disabled")
+        self.approve_btn.configure(state="disabled")
+        self.final_btn.configure(state="disabled")
         self._set_status("Updating SISU from GitHub. The window will restart when it is done.")
         thread = threading.Thread(target=self._run_self_update, daemon=True)
         thread.start()

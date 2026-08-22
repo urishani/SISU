@@ -1,4 +1,5 @@
 cache/
+lists/
 __pycache__/
 *.pyc
 _test_write.xlsx

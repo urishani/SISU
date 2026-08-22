@@ -59,6 +59,8 @@ HEADER_TO_FIELD: dict[str, str] = {
     "back image url": "back_image_url",
     "back page image url": "back_image_url",
     "back page url": "back_image_url",
+    "scanner id": "scanner_id",
+    "scannerid": "scanner_id",
     "comments": "comments",
     "keywords": "keywords",
 }
@@ -67,6 +69,7 @@ ORANGE_FILL = PatternFill(fill_type="solid", fgColor="FFFFC000")
 REQUIRED_COLORED_HEADERS = (
     "Cover image URL",
     "Back image URL",
+    "Scanner ID",
 )
 
 BLANK_FILLS = {
@@ -116,27 +119,27 @@ class CatalogWorkbook:
             raise FileNotFoundError(f"Excel file not found: {self.path}")
         self.workbook: Workbook = load_workbook(self.path)
         self.sheet: Worksheet = self.workbook.active
-        self._ensure_image_url_columns()
+        self._ensure_required_columns()
         self.all_columns: list[dict[str, Any]] = self._detect_all_columns()
         self.columns: list[dict[str, Any]] = [col for col in self.all_columns if col["colored"]]
 
-    def _ensure_image_url_columns(self) -> None:
-        existing = {str(cell.value or "").strip() for cell in self.sheet[1] if cell.value}
+    def _ensure_required_columns(self) -> None:
+        by_name = {str(cell.value or "").strip(): cell for cell in self.sheet[1] if cell.value}
         template = self.sheet["D1"]
         column = self.sheet.max_column
         for header in REQUIRED_COLORED_HEADERS:
-            if header in existing:
-                continue
-            column += 1
-            cell = self.sheet.cell(1, column, header)
-            if template.has_style:
-                cell.font = copy(template.font)
-                cell.border = copy(template.border)
-                cell.alignment = copy(template.alignment)
-                cell.number_format = template.number_format
-                cell.protection = copy(template.protection)
+            cell = by_name.get(header)
+            if cell is None:
+                column += 1
+                cell = self.sheet.cell(1, column, header)
+                if template.has_style:
+                    cell.font = copy(template.font)
+                    cell.border = copy(template.border)
+                    cell.alignment = copy(template.alignment)
+                    cell.number_format = template.number_format
+                    cell.protection = copy(template.protection)
+                self.sheet.column_dimensions[get_column_letter(column)].width = 28
             cell.fill = ORANGE_FILL
-            self.sheet.column_dimensions[get_column_letter(column)].width = 28
 
     def _detect_all_columns(self) -> list[dict[str, Any]]:
         columns: list[dict[str, Any]] = []
@@ -164,8 +167,13 @@ class CatalogWorkbook:
         isbn_col = next((c["index"] for c in self.columns if c["field"] == "isbn"), None)
         title_he_col = next((c["index"] for c in self.columns if c["field"] == "title_he"), None)
         title_en_col = next((c["index"] for c in self.columns if c["field"] == "title_en"), None)
+        scanner_col = next((c["index"] for c in self.all_columns if c["field"] == "scanner_id"), None)
         keys: set[str] = set()
         for row in range(2, self.sheet.max_row + 1):
+            if scanner_col:
+                scanner_id = str(self.sheet.cell(row, scanner_col).value or "").strip()
+                if scanner_id:
+                    keys.add(f"scanner:{scanner_id}")
             if isbn_col:
                 isbn = self.sheet.cell(row, isbn_col).value
                 if isbn:
@@ -179,6 +187,9 @@ class CatalogWorkbook:
                 keys.add(f"title:{title.casefold()}")
         return keys
 
+    def existing_scanner_ids(self) -> set[str]:
+        return {key[8:] for key in self.existing_keys() if key.startswith("scanner:")}
+
     def next_empty_row(self) -> int:
         for row in range(2, self.sheet.max_row + 2):
             values = [
@@ -189,20 +200,31 @@ class CatalogWorkbook:
                 return row
         return self.sheet.max_row + 1
 
-    def append_books(self, books: list[dict[str, Any]]) -> tuple[int, int]:
-        """Write selected books into colored columns only. Returns (written, skipped)."""
+    def append_books(self, books: list[dict[str, Any]]) -> tuple[int, int, list[str], list[str]]:
+        """Write selected books into colored columns only. Returns (written, skipped, written ids, skipped ids)."""
         existing = self.existing_keys()
         row = self.next_empty_row()
         written = 0
         skipped = 0
+        written_ids: list[str] = []
+        skipped_ids: list[str] = []
         for book in books:
+            scanner_id = str(book.get("scanner_id") or "").strip()
             isbn = str(book.get("isbn") or "").strip()
             title = str(book.get("title_he") or book.get("title_en") or "").strip()
+            if scanner_id and f"scanner:{scanner_id}" in existing:
+                skipped += 1
+                skipped_ids.append(scanner_id)
+                continue
             if isbn and f"isbn:{isbn}" in existing:
                 skipped += 1
+                if scanner_id:
+                    skipped_ids.append(scanner_id)
                 continue
             if title and f"title:{title.casefold()}" in existing:
                 skipped += 1
+                if scanner_id:
+                    skipped_ids.append(scanner_id)
                 continue
             for col in self.columns:
                 field = col["field"]
@@ -212,13 +234,16 @@ class CatalogWorkbook:
                 if value in (None, ""):
                     continue
                 self.sheet.cell(row, col["index"], value)
+            if scanner_id:
+                existing.add(f"scanner:{scanner_id}")
+                written_ids.append(scanner_id)
             if isbn:
                 existing.add(f"isbn:{isbn}")
             if title:
                 existing.add(f"title:{title.casefold()}")
             row += 1
             written += 1
-        return written, skipped
+        return written, skipped, written_ids, skipped_ids
 
     def save(self) -> Path:
         try:
