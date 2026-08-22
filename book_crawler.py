@@ -1061,13 +1061,132 @@ def extract_book_from_html(html: str, url: str) -> Book:
     return book
 
 
+SEARCH_PATH_HINTS = ("/search", "/catalogsearch", "/חיפוש", "/advancedsearch")
+SEARCH_QUERY_KEYS = ("q", "s", "query", "keyword")
+SEARCH_HEADING_RE = re.compile(
+    r"(תוצאות\s*חיפוש|חיפוש\s*:|search\s*results|\d+\s+results?\s+for)",
+    re.I,
+)
+HEBREW_VOLUME_LETTERS = {
+    "א": "1",
+    "ב": "2",
+    "ג": "3",
+    "ד": "4",
+    "ה": "5",
+    "ו": "6",
+    "ז": "7",
+    "ח": "8",
+    "ט": "9",
+    "י": "10",
+}
+
+
+def is_query_listing_url(url: str) -> bool:
+    """True for publisher search/query pages such as /search?q=series-name."""
+    parsed = urlparse(url)
+    path = unquote(parsed.path)
+    path_l = path.lower()
+    qs = parse_qs(parsed.query)
+    has_query = any((qs.get(key) or [""])[0] for key in SEARCH_QUERY_KEYS)
+    if any(hint in path or hint in path_l for hint in SEARCH_PATH_HINTS):
+        return True
+    if not has_query:
+        return False
+    stripped = path.rstrip("/") or "/"
+    if any(hint in path_l or hint in path for hint in PRODUCT_PATH_HINTS) and stripped.count("/") >= 2:
+        return False
+    return True
+
+
+def is_search_results_page(soup: BeautifulSoup, url: str) -> bool:
+    if is_query_listing_url(url):
+        return True
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    heading = soup.find("h1")
+    blob = f"{title} {heading.get_text(' ', strip=True) if heading else ''}"
+    return bool(SEARCH_HEADING_RE.search(blob))
+
+
 def is_product_page(soup: BeautifulSoup, url: str) -> bool:
+    if is_query_listing_url(url):
+        return False
     if soup.select_one("#book-inr-main, #product-page-title, [itemtype*='schema.org/Book']"):
         return True
     if soup.select_one(".catalog-product-view, .product-info-main, #product_addtocart_form"):
         return True
     path = urlparse(url).path.lower()
     return any(hint in path for hint in ("/מוצרים/", "/product/", "/products/", "/product-page/", "/book/"))
+
+
+def series_volume(text: str) -> str:
+    name = normalize_name(text)
+    if not name:
+        return ""
+    labeled = re.search(r"(?:חלק|כרך|ספר|volume|vol)\s+(\d{1,2})\b", name)
+    if labeled:
+        return labeled.group(1)
+    labeled_he = re.search(r"(?:חלק|כרך|ספר)\s+([א-י])\b", name)
+    if labeled_he:
+        return HEBREW_VOLUME_LETTERS.get(labeled_he.group(1), "")
+    middle = re.search(r"\s+(\d{1,2})\s+(?:-|–|—)", name)
+    if middle:
+        return middle.group(1)
+    trailing = re.search(r"\b(\d{1,2})$", name)
+    if trailing:
+        return trailing.group(1)
+    trailing_he = re.search(r"\b([א-י])$", name)
+    if trailing_he and len(name.split()) >= 2:
+        return HEBREW_VOLUME_LETTERS.get(trailing_he.group(1), "")
+    numbers = re.findall(r"\b(\d{1,2})\b", name)
+    if numbers:
+        return numbers[-1]
+    return ""
+
+
+def series_title_core(text: str) -> str:
+    name = normalize_name(text)
+    name = re.sub(r"\s+(?:חלק|כרך|ספר|volume|vol)\s+(?:\d{1,2}|[א-י])$", "", name)
+    name = re.sub(r"\s+\d{1,2}$", "", name)
+    return name.strip()
+
+
+def search_result_rank(wanted: Book, card_title: str, url: str) -> int | None:
+    """Lower is better. None means the card is unrelated to the wanted book."""
+    for code in (wanted.isbn, wanted.danacode, wanted.upc):
+        if code and code in (url or ""):
+            return 0
+    want = normalize_name(wanted.display_title())
+    card = normalize_name(card_title)
+    want_core = series_title_core(wanted.display_title())
+    card_core = series_title_core(card_title)
+    want_vol = series_volume(wanted.display_title())
+    card_vol = series_volume(card_title)
+    if not card:
+        return 80
+    if want and card == want:
+        return 1
+    core_hit = bool(
+        want_core
+        and card_core
+        and len(want_core) >= 6
+        and (want_core == card_core or want_core in card_core or card_core in want_core)
+    )
+    contain_hit = bool(want and card and len(min(want, card, key=len)) >= 6 and (want in card or card in want))
+    vol_match = bool(want_vol and card_vol and want_vol == card_vol)
+    vol_mismatch = bool(want_vol and card_vol and want_vol != card_vol)
+    if core_hit and vol_match:
+        return 2
+    if contain_hit and vol_match:
+        return 3
+    if core_hit and not vol_mismatch:
+        return 4
+    if contain_hit and not vol_mismatch:
+        return 5
+    if core_hit:
+        return 40
+    if contain_hit:
+        return 50
+    return None
 
 
 def same_domain(left: str, right: str) -> bool:
@@ -1337,7 +1456,77 @@ def collect_product_links(soup: BeautifulSoup, page_url: str) -> list[str]:
 def _url_key(url: str) -> str:
     parsed = urlparse(url)
     path = unquote(parsed.path).rstrip("/") or "/"
-    return f"{parsed.netloc.lstrip('www.')}{path}".casefold()
+    host_path = f"{parsed.netloc.lstrip('www.')}{path}".casefold()
+    if not is_query_listing_url(url):
+        return host_path
+    qs = parse_qs(parsed.query)
+    query = ""
+    for key in SEARCH_QUERY_KEYS:
+        if qs.get(key):
+            query = qs[key][0]
+            break
+    return f"{host_path}?q={normalize_name(query)}"
+
+
+def collect_search_result_links(soup: BeautifulSoup, page_url: str, book: Book) -> list[str]:
+    """Product links on a ?q= search page, ranked toward the matching series volume."""
+    current = _url_key(page_url)
+    cards: dict[str, tuple[str, str]] = {}
+
+    def add(href: str | None, title_text: str = "") -> None:
+        url = normalize_url(page_url, href or "")
+        if not url or not same_domain(page_url, url) or is_query_listing_url(url):
+            return
+        key = _url_key(url)
+        if key == current:
+            return
+        path = unquote(urlparse(url).path)
+        productish = any(hint in path.lower() or hint in path for hint in PRODUCT_PATH_HINTS)
+        title_text = clean(title_text)
+        if not productish and not title_text:
+            return
+        previous = cards.get(key)
+        if previous is None:
+            cards[key] = (url, title_text)
+            return
+        old_title = previous[1]
+        old_vol = bool(series_volume(old_title))
+        new_vol = bool(series_volume(title_text))
+        if (new_vol and not old_vol) or (new_vol == old_vol and len(title_text) > len(old_title)):
+            cards[key] = (url, title_text)
+
+    for selector in (
+        "h3.card__heading a[href]",
+        "a.full-unstyled-link[href]",
+        "a.product-item-link[href]",
+        ".product-item-info a[href]",
+        ".product-card a[href]",
+        ".book-item a[href]",
+        ".grid-product__title a[href]",
+        "a.product-title[href]",
+    ):
+        for tag in soup.select(selector):
+            add(tag.get("href"), tag.get_text(" ", strip=True))
+    for img in soup.find_all("img"):
+        parent = img.find_parent("a")
+        if parent:
+            add(parent.get("href"), img.get("alt") or "")
+    for url in collect_product_links(soup, page_url):
+        add(url)
+
+    ranked: list[tuple[tuple[int, int, int], str]] = []
+    for url, title_text in cards.values():
+        rank = search_result_rank(book, title_text, url)
+        if rank is None:
+            continue
+        volume = series_volume(title_text)
+        tie = int(volume) if volume.isdigit() else 99
+        ranked.append(((rank, tie, -len(title_text)), url))
+    ranked.sort()
+    strong = [url for (rank, _tie, _length), url in ranked if rank < 40]
+    if strong:
+        return list(dict.fromkeys(strong))
+    return list(dict.fromkeys(url for _score, url in ranked))
 
 
 def collect_detail_links(soup: BeautifulSoup, page_url: str, book: Book) -> list[str]:
@@ -1500,7 +1689,7 @@ class BookCrawler:
         html, resolved = self.fetch(product_url)
         book = extract_book_from_html(html, resolved)
         self.report.product_fetched += 1
-        if remember and book.title:
+        if remember and book.title and not is_query_listing_url(resolved):
             remember_page_book(book)
             save_page_cache()
         return book, html, resolved
@@ -1668,10 +1857,19 @@ class BookCrawler:
         depth: int,
         current: Book | None,
     ) -> Book | None:
-        best = current
+        best = None if current and is_query_listing_url(current.url) else current
         if depth >= 2:
             return best
-        for product_url in collect_detail_links(soup, page_url, wanted)[:8]:
+        listing = is_search_results_page(soup, page_url)
+        if listing:
+            product_urls = collect_search_result_links(soup, page_url, wanted)
+            if not product_urls:
+                product_urls = collect_product_links(soup, page_url)
+            limit = 16
+        else:
+            product_urls = collect_detail_links(soup, page_url, wanted)
+            limit = 8
+        for product_url in product_urls[:limit]:
             found = self._consider_book_page(product_url, wanted, seen, remember=False, depth=depth + 1)
             if found is None:
                 continue
@@ -1702,8 +1900,11 @@ class BookCrawler:
             candidate, html, resolved = self._book_and_html(product_url, remember=remember)
         except requests.RequestException:
             return None
+        listing = is_query_listing_url(resolved or product_url)
         matched = candidate if candidate and candidate.title and books_match(wanted, candidate) else None
-        if matched is None and depth > 0:
+        if matched is not None and listing:
+            matched = None
+        if matched is None and depth > 0 and not listing:
             return None
         if not html:
             try:
@@ -1712,10 +1913,17 @@ class BookCrawler:
                 html = ""
         if html:
             soup = parse_html(html)
-            if matched is None:
+            listing = listing or is_search_results_page(soup, resolved)
+            if listing:
+                if depth == 0:
+                    self.progress("Search listed several books — opening a matching volume…")
+                matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
+            elif matched is None:
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
             elif fills_needed(matched, wanted) < len(wanted.missing_fields()) or not is_product_page(soup, resolved):
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, matched)
+        if matched and is_query_listing_url(matched.url):
+            return None
         if matched:
             remember_page_book(matched)
             save_page_cache()
@@ -1729,22 +1937,25 @@ class BookCrawler:
         host = parsed.netloc
         seen: set[str] = set()
         for candidate in cached_books_for_host(host):
-            if candidate.title and books_match(book, candidate):
-                self.progress(f"Matched from cached {host} pages.")
-                if fills_needed(candidate, book) >= len(book.missing_fields()) and fillable_count(candidate) >= 5:
-                    return candidate
-                try:
-                    html, final_url = self.fetch(candidate.url)
-                except requests.RequestException:
-                    return candidate
-                soup = parse_html(html)
-                seen.add(_url_key(candidate.url))
-                richer = self._follow_book_cover_links(soup, final_url, book, seen, 0, candidate)
-                if richer:
-                    remember_page_book(richer)
-                    save_page_cache()
-                    return richer
+            if not (candidate.title and books_match(book, candidate)):
+                continue
+            if is_query_listing_url(candidate.url):
+                continue
+            self.progress(f"Matched from cached {host} pages.")
+            if fills_needed(candidate, book) >= len(book.missing_fields()) and fillable_count(candidate) >= 5:
                 return candidate
+            try:
+                html, final_url = self.fetch(candidate.url)
+            except requests.RequestException:
+                return candidate
+            soup = parse_html(html)
+            seen.add(_url_key(candidate.url))
+            richer = self._follow_book_cover_links(soup, final_url, book, seen, 0, candidate)
+            if richer and not is_query_listing_url(richer.url):
+                remember_page_book(richer)
+                save_page_cache()
+                return richer
+            return candidate
 
         def consider(product_url: str, remember: bool) -> Book | None:
             return self._consider_book_page(product_url, book, seen, remember=remember)
@@ -1780,6 +1991,17 @@ class BookCrawler:
                 except requests.RequestException:
                     continue
                 soup = parse_html(html)
+                if is_search_results_page(soup, final_url):
+                    self.progress("Search listed several books — opening a matching volume…")
+                    product_urls = collect_search_result_links(soup, final_url, book)
+                    if not product_urls:
+                        product_urls = collect_product_links(soup, final_url)
+                    for product_url in product_urls[:16]:
+                        found = consider(product_url, remember=False)
+                        if found:
+                            self.progress(f"Found book page: {found.url}")
+                            return found
+                    continue
                 page_book = extract_book_from_html(html, final_url)
                 matched = page_book if page_book.title and books_match(book, page_book) else None
                 if matched:
@@ -1789,6 +2011,8 @@ class BookCrawler:
                     if richer:
                         self.progress(f"Found book page: {richer.url}")
                         return richer
+                    if is_query_listing_url(matched.url):
+                        continue
                     self.progress(f"Found book page: {matched.url}")
                     return matched
                 product_urls = collect_detail_links(soup, final_url, book)
