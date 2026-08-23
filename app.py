@@ -83,6 +83,76 @@ def app_title() -> str:
     return APP_NAME
 
 
+class HoverTip:
+    """Callout that names a button or card when the pointer rests on it."""
+
+    def __init__(self, widget: tk.Misc, text: str) -> None:
+        self.widget = widget
+        self.text = (text or "").strip()
+        self._after: str | None = None
+        self._tip: tk.Toplevel | None = None
+        if not self.text:
+            return
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        try:
+            self._after = self.widget.after(450, self._show)
+        except tk.TclError:
+            self._after = None
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+    def _show(self) -> None:
+        self._after = None
+        if self._tip is not None or not self.widget.winfo_ismapped():
+            return
+        try:
+            x = self.widget.winfo_rootx() + 8
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except tk.TclError:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        try:
+            tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tip,
+            text=self.text,
+            justify="left",
+            wraplength=320,
+            background="#FFF8E8",
+            foreground=NAVY,
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+            padx=8,
+            pady=6,
+        ).pack()
+        self._tip = tip
+
+
 RELOAD_SENTINEL = APP_DIR / "cache" / ".reload"
 SCHEMA_EXCEL = APP_DIR / "master our program.xlsx"
 DEFAULT_EXCEL = APP_DIR / "Data enter - bulk - MASTER our program.xlsx"
@@ -200,8 +270,8 @@ class BookCatalogApp(tk.Tk):
         header_btns = tk.Frame(header, bg=NAVY)
         header_btns.pack(side="right", padx=12, pady=6)
 
-        def header_button(text: str, command) -> None:
-            tk.Button(
+        def header_button(text: str, command, tip: str) -> tk.Button:
+            btn = tk.Button(
                 header_btns,
                 text=text,
                 command=command,
@@ -215,12 +285,27 @@ class BookCatalogApp(tk.Tk):
                 padx=10,
                 pady=4,
                 cursor="hand2",
-            ).pack(side="left", padx=4)
+            )
+            btn.pack(side="left", padx=4)
+            self._callout(btn, tip)
+            return btn
 
-        header_button("Check for updates", lambda: self.check_for_updates(silent=False))
-        header_button("Field report", self.open_field_report)
-        header_button("Lists", self.open_lists_manager)
-        header_button("Settings", self.open_settings)
+        header_button(
+            "Check for updates",
+            lambda: self.check_for_updates(silent=False),
+            "Look on GitHub for a newer SISU and offer to install it.",
+        )
+        header_button(
+            "Field report",
+            self.open_field_report,
+            "Show which page labels matched the Excel columns, and which still need aliases.",
+        )
+        header_button(
+            "Lists",
+            self.open_lists_manager,
+            "Open, rename, or delete saved scan lists.",
+        )
+        header_button("Settings", self.open_settings, "Publisher websites, field aliases, and the browser to open.")
         self.after_idle(self._fit_search_fields)
 
         body = ttk.Frame(self)
@@ -231,38 +316,62 @@ class BookCatalogApp(tk.Tk):
 
         lists = ttk.LabelFrame(body, text="Scan list", padding=(8, 4, 8, 6))
         lists.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self._callout(
+            lists,
+            "This card is the scan list you are working on: its title, save/open actions, and whether it is locked.",
+        )
         lists.columnconfigure(1, weight=2)
         lists.columnconfigure(3, weight=1)
         ttk.Label(lists, text="Title").grid(row=0, column=0, sticky="e", padx=(0, 8))
         self.list_title_entry = ttk.Entry(lists, textvariable=self.list_title)
         self.list_title_entry.grid(row=0, column=1, sticky="ew")
         self.list_title_entry.bind("<FocusOut>", lambda _e: self._on_list_title_change())
+        self._callout(self.list_title_entry, "Name of this scan list. It is also used in the Excel file name.")
         list_btns = ttk.Frame(lists)
         list_btns.grid(row=0, column=2, sticky="w", padx=(8, 8))
-        ttk.Button(list_btns, text="New", command=self.new_working_list).pack(side="left", padx=(0, 4))
-        ttk.Button(list_btns, text="Stash", command=self.stash_working_list).pack(side="left", padx=(0, 4))
-        ttk.Button(list_btns, text="Restore stash", command=self.restore_stash).pack(side="left", padx=(0, 4))
-        ttk.Button(list_btns, text="Save list", command=self.save_current_list).pack(side="left", padx=(0, 4))
-        ttk.Button(list_btns, text="Open lists…", command=self.open_lists_manager).pack(side="left")
+        new_btn = ttk.Button(list_btns, text="New", command=self.new_working_list)
+        new_btn.pack(side="left", padx=(0, 4))
+        self._callout(new_btn, "Start a fresh working list. The current unsaved list can be stashed first if you need it.")
+        stash_btn = ttk.Button(list_btns, text="Stash", command=self.stash_working_list)
+        stash_btn.pack(side="left", padx=(0, 4))
+        self._callout(stash_btn, "Put this working list aside so you can start another search.")
+        restore_btn = ttk.Button(list_btns, text="Restore stash", command=self.restore_stash)
+        restore_btn.pack(side="left", padx=(0, 4))
+        self._callout(restore_btn, "Bring back the list you stashed.")
+        save_btn = ttk.Button(list_btns, text="Save list", command=self.save_current_list)
+        save_btn.pack(side="left", padx=(0, 4))
+        self._callout(save_btn, "Save this scan list by name so you can open it later.")
+        open_lists_btn = ttk.Button(list_btns, text="Open lists…", command=self.open_lists_manager)
+        open_lists_btn.pack(side="left")
+        self._callout(open_lists_btn, "Browse saved scan lists.")
         self.list_status_label = ttk.Label(lists, textvariable=self.list_status, wraplength=1, justify="left")
         self.list_status_label.grid(row=0, column=3, sticky="ew")
+        self._callout(self.list_status_label, "Whether this list is new, saved, locked, or archived.")
 
         form = ttk.LabelFrame(body, text="Search", padding=(8, 4, 8, 6))
         form.grid(row=1, column=0, sticky="ew")
+        self._callout(
+            form,
+            "Search every bookstore and catalog URL for this publication year, list all titles, then fill book and publisher pages.",
+        )
         form.columnconfigure(1, weight=0)
         form.columnconfigure(3, weight=1)
 
         ttk.Label(form, text="List Excel").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=(0, 4))
         self.excel_entry = ttk.Entry(form, textvariable=self.excel_path, state="readonly", width=52)
         self.excel_entry.grid(row=0, column=1, sticky="w", pady=(0, 4))
+        self._callout(self.excel_entry, "Excel file for this scan list. Final books are written here.")
         excel_btns = ttk.Frame(form)
         excel_btns.grid(row=0, column=2, padx=(8, 0), pady=(0, 4), sticky="w")
         self.excel_folder_btn = ttk.Button(excel_btns, text="Folder…", command=self.browse_excel_folder)
         self.excel_folder_btn.pack(side="left")
+        self._callout(self.excel_folder_btn, "Choose the folder where this list’s Excel file is kept.")
         self.excel_open_btn = ttk.Button(excel_btns, text="Open", command=self.open_excel)
         self.excel_open_btn.pack(side="left", padx=(6, 0))
+        self._callout(self.excel_open_btn, "Open this list’s Excel file.")
         self.excel_share_btn = ttk.Button(excel_btns, text="Share", command=self.share_excel)
         self.excel_share_btn.pack(side="left", padx=(6, 0))
+        self._callout(self.excel_share_btn, "Start an email with this list’s Excel file attached.")
 
         ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=(2, 0))
         url_wrap = ttk.Frame(form)
@@ -276,6 +385,10 @@ class BookCatalogApp(tk.Tk):
         url_scroll_y.grid(row=0, column=1, sticky="ns")
         self.url_text.insert("1.0", DEFAULT_URLS)
         self.url_text.bind("<<Modified>>", self._on_url_text_modified)
+        self._callout(
+            self.url_text,
+            "One bookstore or catalog URL per line. Search reads all of them, not only the first.",
+        )
         self.excel_path.trace_add("write", lambda *_args: self._fit_search_fields())
 
         search_side = ttk.Frame(form)
@@ -285,19 +398,27 @@ class BookCatalogApp(tk.Tk):
         ttk.Label(year_row, text="Year").pack(side="left")
         self.year_entry = ttk.Entry(year_row, textvariable=self.year, width=8)
         self.year_entry.pack(side="left", padx=(6, 10))
+        self._callout(self.year_entry, "Keep books with this publication year, for example 2026.")
         ttk.Label(year_row, text="Max pages").pack(side="left")
         self.pages_spin = ttk.Spinbox(year_row, from_=1, to=40, textvariable=self.max_pages, width=5)
         self.pages_spin.pack(side="left", padx=(6, 0))
+        self._callout(self.pages_spin, "How many listing pages to read on each bookstore site.")
         self.unknown_check = ttk.Checkbutton(
             search_side, text="Also keep books with no year listed", variable=self.include_unknown
         )
         self.unknown_check.pack(anchor="w", pady=(6, 6))
+        self._callout(self.unknown_check, "If a book page has no year, still keep it in the list.")
         buttons = ttk.Frame(search_side)
         buttons.pack(anchor="w")
         self.search_btn = ttk.Button(buttons, text="Search", command=self.start_search, style="Accent.TButton")
         self.search_btn.pack(side="left", padx=(0, 4))
+        self._callout(
+            self.search_btn,
+            "List every matching book from all bookstore URLs, then fill catalog links and publisher pages.",
+        )
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self.stop_btn.pack(side="left")
+        self._callout(self.stop_btn, "Stop the current search. Books found so far are kept.")
 
         self.colored_info_label = ttk.Label(form, textvariable=self.colored_info, wraplength=1, justify="left")
         self.colored_info_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -315,6 +436,14 @@ class BookCatalogApp(tk.Tk):
         detail_frame = ttk.Frame(split, style="Card.TFrame")
         split.add(list_frame, weight=3)
         split.add(detail_frame, weight=2)
+        self._callout(
+            list_frame,
+            "Books found for this year. Click a row for details. Click the ☑ column to select books.",
+        )
+        self._callout(
+            detail_frame,
+            "Details for the book you clicked: catalog fields, publisher page, approve, and mark final.",
+        )
 
         self.table = BookTable(
             list_frame,
@@ -326,14 +455,27 @@ class BookCatalogApp(tk.Tk):
         filter_bar.pack(fill="x", pady=(0, 4))
         ttk.Label(filter_bar, text="Filter").pack(side="left")
         self._filter_vars: dict[str, tk.BooleanVar] = {}
+        filter_tips = {
+            "checked": "Show only books you ticked in the ☑ column.",
+            "approved": "Show only books you approved.",
+            "failed": "Show only books that had an error.",
+            "successful": "Show only books that were read successfully.",
+            "fully scanned": "Show only books with every fillable field set.",
+            "final": "Show only books marked final (written to this list’s Excel).",
+            "excel": "Show only books that are already in this list’s Excel.",
+        }
         for key, label in ROW_STATUSES:
             var = tk.BooleanVar(value=False)
             self._filter_vars[key] = var
-            ttk.Checkbutton(filter_bar, text=label, variable=var, command=self._on_filter_change).pack(
-                side="left", padx=(8, 0)
-            )
-        ttk.Button(filter_bar, text="Clear books…", command=self.clear_books_with_keep).pack(side="right")
+            box = ttk.Checkbutton(filter_bar, text=label, variable=var, command=self._on_filter_change)
+            box.pack(side="left", padx=(8, 0))
+            self._callout(box, filter_tips.get(key, f"Show only {label.lower()} books."))
+        clear_btn = ttk.Button(filter_bar, text="Clear books…", command=self.clear_books_with_keep)
+        clear_btn.pack(side="right")
+        self._callout(clear_btn, "Remove books from this list, while keeping chosen statuses.")
         self.table.pack(fill="both", expand=True)
+        self._callout(self.table, "The book table. Click a title to open it on the right.")
+        self._callout(self.table.tree, "Click a book row to see its fields. Click ☑ to select it. Click the publisher to look it up.")
 
         detail_header = ttk.Frame(detail_frame, style="Card.TFrame")
         detail_header.pack(fill="x", padx=12, pady=(10, 6))
@@ -344,12 +486,16 @@ class BookCatalogApp(tk.Tk):
             detail_header, text="Remove final", command=self.remove_selected_final, state="disabled"
         )
         self.unfinal_btn.pack(side="right")
+        self._callout(self.unfinal_btn, "Take this book off this list’s Excel and return it to Approved.")
         self.final_btn = ttk.Button(detail_header, text="Mark final", command=self.mark_selected_final, state="disabled")
         self.final_btn.pack(side="right", padx=(0, 6))
+        self._callout(self.final_btn, "Write this book to this list’s Excel and mark it Final.")
         self.approve_btn = ttk.Button(detail_header, text="Approve", command=self.approve_selected, state="disabled")
         self.approve_btn.pack(side="right", padx=(0, 6))
+        self._callout(self.approve_btn, "Mark this book Approved. It is not written to Excel until you mark it Final.")
         self.more_btn = ttk.Button(detail_header, text="More", command=self.lookup_more, state="disabled")
         self.more_btn.pack(side="right", padx=(0, 6))
+        self._callout(self.more_btn, "Search the publisher website again for missing fields on this book.")
 
         detail_split = ttk.Panedwindow(detail_frame, orient="vertical")
         detail_split.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -419,6 +565,8 @@ class BookCatalogApp(tk.Tk):
         )
         self.copy_desc_btn.pack(side="right")
         self.copy_desc_btn.bind("<Button-1>", lambda _e: self.copy_description())
+        self._callout(self.copy_desc_btn, "Copy the description to the clipboard.")
+        self._callout(desc_pane, "The book description from the catalog or publisher page.")
         self._draw_copy_icon(False)
         desc_wrap = tk.Frame(desc_pane, bg=WHITE)
         desc_wrap.pack(fill="both", expand=True, padx=4, pady=(0, 4))
@@ -426,10 +574,17 @@ class BookCatalogApp(tk.Tk):
         self.desc_view.pack(fill="both", expand=True)
 
         footer = ttk.Frame(body)
-        ttk.Button(footer, text="Select all", command=self.table.select_all).pack(side="left", pady=2)
-        ttk.Button(footer, text="Clear selection", command=self.table.clear_selection).pack(side="left", padx=6, pady=2)
+        select_all_btn = ttk.Button(footer, text="Select all", command=self.table.select_all)
+        select_all_btn.pack(side="left", pady=2)
+        self._callout(select_all_btn, "Tick every book currently shown in the table.")
+        clear_sel_btn = ttk.Button(footer, text="Clear selection", command=self.table.clear_selection)
+        clear_sel_btn.pack(side="left", padx=6, pady=2)
+        self._callout(clear_sel_btn, "Clear the ☑ ticks. This does not delete books from the list.")
         self.status_label = ttk.Label(footer, textvariable=self.status, wraplength=1, justify="left")
         self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=2)
+        self._callout(self.status_label, "What SISU is doing right now.")
+        self._callout(self.progress, "Progress while Search or a publisher lookup is running.")
+        self._callout(self.summary_label, "Summary of the last search: how many books were listed and filled.")
         footer.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         split.grid(row=4, column=0, sticky="nsew")
         self._bind_list_excel_path(rename_existing=False)
@@ -440,6 +595,9 @@ class BookCatalogApp(tk.Tk):
             add="+",
         )
         footer.bind("<Configure>", lambda event: self._set_label_wrap(self.status_label, max(120, event.width - 220)), add="+")
+
+    def _callout(self, widget: tk.Misc, text: str) -> None:
+        HoverTip(widget, text)
 
     def _set_label_wrap(self, label: ttk.Label, width: int) -> None:
         width = max(40, int(width))
@@ -1561,15 +1719,13 @@ class BookCatalogApp(tk.Tk):
             progress=lambda msg: self._ui_queue.put(("status", msg)),
         )
         try:
-            self._ui_queue.put(("status", f"Searching first site: {urls[0]}"))
-            books = crawler.crawl(
-                start_url=urls[0],
+            self._ui_queue.put(("status", f"Searching {len(urls)} bookstore and catalog URL(s)…"))
+            books = crawler.search_all_sites(
+                urls=urls,
                 year=year,
                 max_listing_pages=max_pages,
                 include_unknown_year=include_unknown,
             )
-            if urls[1:] and books:
-                crawler.enrich_books(books, urls[1:])
             self._prepare_books(books)
             save_working(
                 build_payload(

@@ -909,6 +909,24 @@ def merge_catalog(primary: list[Book], extras: list[Book]) -> int:
     return filled
 
 
+def union_catalog(primary: list[Book], extras: list[Book]) -> int:
+    """Merge matching books, and append titles that are not already in the list."""
+    added = 0
+    for extra in extras:
+        if not (extra.title or "").strip():
+            continue
+        matched = False
+        for book in primary:
+            if books_match(book, extra):
+                book.merge_missing(extra)
+                matched = True
+                break
+        if not matched:
+            primary.append(extra)
+            added += 1
+    return added
+
+
 def extract_year(text: str | None) -> str:
     if not text:
         return ""
@@ -1797,6 +1815,88 @@ def _url_key(url: str) -> str:
     return f"{host_path}?q={normalize_name(query)}"
 
 
+def _looks_like_cover_image(img: Tag) -> bool:
+    if not isinstance(img, Tag) or (img.name or "").lower() != "img":
+        return False
+    alt = clean(img.get("alt") or "")
+    src = " ".join(
+        str(img.get(key) or "")
+        for key in ("src", "data-src", "data-original", "srcset")
+    ).casefold()
+    blob = f"{alt} {src}"
+    skip = ("logo", "icon", "sprite", "placeholder", "facebook", "whatsapp", "cart", "wishlist", "account", "pixel", "avatar", "badge")
+    if any(bit in blob for bit in skip):
+        return False
+    if alt and len(alt) >= 2:
+        return True
+    classes = " ".join(img.get("class") or []).casefold()
+    parent_classes = " ".join((img.parent.get("class") if img.parent else []) or []).casefold()
+    return any(hint in classes or hint in parent_classes for hint in ("product", "card__media", "media", "book", "cover"))
+
+
+def product_link_from_cover_image(img: Tag, page_url: str) -> tuple[str, str] | None:
+    """On a ?q= picture grid, the cover is often not itself a link — the product link is on the card."""
+    alt = clean(img.get("alt") or "")
+    node: Tag | None = img
+    for _ in range(10):
+        parent = getattr(node, "parent", None)
+        if not isinstance(parent, Tag):
+            break
+        node = parent
+        name = (node.name or "").casefold()
+        if name in {"body", "html", "ul", "ol", "main", "nav", "header", "footer"}:
+            break
+        for tag in node.select("a[href]"):
+            url = normalize_url(page_url, tag.get("href") or "")
+            if not url or is_asset_url(url) or is_query_listing_url(url) or not same_domain(page_url, url):
+                continue
+            path = unquote(urlparse(url).path)
+            if not any(hint in path.lower() or hint in path for hint in PRODUCT_PATH_HINTS):
+                continue
+            if path.rstrip("/") in {"", "/"}:
+                continue
+            title = clean(tag.get_text(" ", strip=True)) or alt
+            if title or path:
+                return url, title
+    parent_a = img.find_parent("a")
+    if parent_a:
+        url = normalize_url(page_url, parent_a.get("href") or "")
+        path = unquote(urlparse(url or "").path)
+        if (
+            url
+            and not is_asset_url(url)
+            and not is_query_listing_url(url)
+            and same_domain(page_url, url)
+            and any(hint in path.lower() or hint in path for hint in PRODUCT_PATH_HINTS)
+            and path.rstrip("/") not in {"", "/"}
+        ):
+            return url, alt
+    return None
+
+
+def collect_cover_picture_links(soup: BeautifulSoup, page_url: str) -> list[tuple[str, str]]:
+    """Product pages reached by clicking book pictures on a search/query listing."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for img in soup.find_all("img"):
+        if not _looks_like_cover_image(img):
+            continue
+        hit = product_link_from_cover_image(img, page_url)
+        if not hit:
+            continue
+        url, title = hit
+        key = _url_key(url)
+        if key in seen:
+            if title:
+                previous = next((item for item in found if _url_key(item[0]) == key), None)
+                if previous and len(title) > len(previous[1]):
+                    found[found.index(previous)] = (url, title)
+            continue
+        seen.add(key)
+        found.append((url, title))
+    return found
+
+
 def collect_search_result_links(soup: BeautifulSoup, page_url: str, book: Book) -> list[str]:
     """Product links on a ?q= search page, ranked toward the matching series volume."""
     current = _url_key(page_url)
@@ -1836,6 +1936,8 @@ def collect_search_result_links(soup: BeautifulSoup, page_url: str, book: Book) 
     ):
         for tag in soup.select(selector):
             add(tag.get("href"), tag.get_text(" ", strip=True))
+    for url, title_text in collect_cover_picture_links(soup, page_url):
+        add(url, title_text)
     for img in soup.find_all("img"):
         parent = img.find_parent("a")
         if parent:
@@ -1897,6 +1999,9 @@ def collect_detail_links(soup: BeautifulSoup, page_url: str, book: Book) -> list
         parent = img.find_parent("a")
         if parent:
             add(parent.get("href"), image=True)
+        hit = product_link_from_cover_image(img, page_url) if _looks_like_cover_image(img) else None
+        if hit:
+            add(hit[0], image=True)
     for tag in soup.select(
         "a.product-item-photo, a.product-image-wrapper, a.product-item-link, "
         ".product-image a, .book-cover a, .book-item a, figure a"
@@ -2042,6 +2147,7 @@ class BookCrawler:
         max_listing_pages: int = 5,
         max_products: int = 150,
         include_unknown_year: bool = True,
+        start_error: bool = True,
     ) -> list[Book]:
         start_url = start_url.strip()
         if not start_url.startswith(("http://", "https://")):
@@ -2053,8 +2159,10 @@ class BookCrawler:
             self.report.listing_pages += 1
         except (SiteError, requests.RequestException) as exc:
             self.report.listing_failed += 1
-            self.report.error = str(exc) if isinstance(exc, SiteError) else "Could not open the start URL."
-            self.progress(self.report.error)
+            message = str(exc) if isinstance(exc, SiteError) else "Could not open the start URL."
+            if start_error:
+                self.report.error = message
+            self.progress(message)
             from field_map import flush_candidates
 
             flush_candidates()
@@ -2176,6 +2284,8 @@ class BookCrawler:
         encoded = quote(query)
         if "e-vrit" in host or "evrit" in host:
             return [f"{origin}/search?q={encoded}"]
+        if "ybook" in host:
+            return [f"{origin}/search?q={encoded}"]
         if "booknet" in host:
             return [f"{origin}/%D7%97%D7%99%D7%A4%D7%95%D7%A9?q={encoded}"]
         return [
@@ -2224,6 +2334,8 @@ class BookCrawler:
         listing = is_search_results_page(soup, page_url)
         if listing:
             product_urls = collect_search_result_links(soup, page_url, wanted)
+            if not product_urls:
+                product_urls = [url for url, _title in collect_cover_picture_links(soup, page_url)]
             if not product_urls:
                 product_urls = collect_product_links(soup, page_url)
             limit = 16
@@ -2277,7 +2389,7 @@ class BookCrawler:
             listing = listing or is_search_results_page(soup, resolved)
             if listing:
                 if depth == 0:
-                    self.progress("Search listed several books — opening a matching volume…")
+                    self.progress("Search listed several books — opening a matching cover…")
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
             elif matched is None:
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
@@ -2360,8 +2472,10 @@ class BookCrawler:
                     continue
                 soup = parse_html(html)
                 if is_search_results_page(soup, final_url):
-                    self.progress("Search listed several books — opening a matching volume…")
+                    self.progress("Search listed several books — opening a matching cover…")
                     product_urls = collect_search_result_links(soup, final_url, book)
+                    if not product_urls:
+                        product_urls = [url for url, _title in collect_cover_picture_links(soup, final_url)]
                     if not product_urls:
                         product_urls = collect_product_links(soup, final_url)
                     for product_url in product_urls[:16]:
@@ -2524,6 +2638,72 @@ class BookCrawler:
             if book.title:
                 book.refresh_scan_status()
         return filled
+
+    def enrich_from_publishers(self, books: list[Book]) -> int:
+        from publisher_sites import resolve_publisher_site
+
+        pending = [
+            book
+            for book in books
+            if (book.title or "").strip()
+            and (book.publisher or "").strip()
+            and resolve_publisher_site(book.publisher)
+            and not (book.extra.get("publisher_page") or "").strip()
+            and book.missing_fields()
+        ]
+        filled = 0
+        total = len(pending)
+        for index, book in enumerate(pending, start=1):
+            self._check_cancel()
+            host = urlparse(resolve_publisher_site(book.publisher) or "").netloc
+            self.progress(f"Publisher page {index}/{total} on {host}: {book.display_title()}")
+            added = self.enrich_one_book(book)
+            if added:
+                filled += 1
+        return filled
+
+    def search_all_sites(
+        self,
+        urls: list[str],
+        year: str,
+        max_listing_pages: int = 5,
+        include_unknown_year: bool = True,
+    ) -> list[Book]:
+        books: list[Book] = []
+        max_products = max(1000, int(max_listing_pages or 5) * 100)
+        listed = 0
+        for index, url in enumerate(urls, start=1):
+            self._check_cancel()
+            host = site_display_name(url)
+            self.progress(f"Listing books from site {index}/{len(urls)}: {host}")
+            found = self.crawl(
+                start_url=url,
+                year=year,
+                max_listing_pages=max_listing_pages,
+                max_products=max_products,
+                include_unknown_year=include_unknown_year,
+                start_error=False,
+            )
+            added = union_catalog(books, found)
+            listed += 1 if found else 0
+            self.progress(
+                f"{host}: {len([book for book in found if book.title])} book(s) this year. "
+                f"{added} new name(s). Combined list: {len(books)}."
+            )
+        self.report.error = ""
+        self.report.matched = len(books)
+        if not books:
+            self.report.error = "Could not list books from the bookstore or catalog URLs."
+            self.progress(self.report.error)
+            return books
+        self.progress(
+            f"Listed {len(books)} book(s) from {listed} site(s). "
+            "Filling catalog pages, then publisher pages…"
+        )
+        self.enrich_books(books, urls, max_searches=max(len(books), 24))
+        self.enrich_from_publishers(books)
+        self.report.matched = len(books)
+        return books
 
 
 def parse_site_urls(text: str) -> list[str]:
