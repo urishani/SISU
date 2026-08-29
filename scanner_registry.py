@@ -46,7 +46,10 @@ def load_registry() -> dict[str, Any]:
 def save_registry() -> None:
     data = load_registry()
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REGISTRY_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        REGISTRY_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def scanner_fingerprints(book: Book) -> list[str]:
@@ -88,12 +91,18 @@ def _record(scanner_id: str) -> dict[str, Any]:
             "approved_at": "",
             "excel_passed_at": "",
             "final_at": "",
+            "created_at": "",
+            "modified_at": "",
+            "database_passed_at": "",
         }
         data["records"][scanner_id] = item
     item.setdefault("scanner_id", scanner_id)
     item.setdefault("approved", False)
     item.setdefault("excel_passed", False)
     item.setdefault("final", False)
+    item.setdefault("created_at", "")
+    item.setdefault("modified_at", "")
+    item.setdefault("database_passed_at", "")
     return item
 
 
@@ -116,13 +125,26 @@ def attach_book(book: Book) -> str:
     for key in scanner_fingerprints(book):
         data["fingerprints"][key] = found
     record = _record(found)
+    if not (book.created_at or "").strip():
+        book.created_at = str(record.get("created_at") or "")
+    if not (book.modified_at or "").strip():
+        book.modified_at = str(record.get("modified_at") or "")
+    if not (book.database_passed_at or "").strip():
+        book.database_passed_at = str(record.get("database_passed_at") or record.get("excel_passed_at") or "")
+    if book.created_at and not record.get("created_at"):
+        record["created_at"] = book.created_at
+    if book.modified_at:
+        record["modified_at"] = book.modified_at
+    if book.database_passed_at:
+        record["database_passed_at"] = book.database_passed_at
     return found
 
 
-def attach_books(books: list[Book]) -> None:
+def attach_books(books: list[Book], *, save: bool = True) -> None:
     for book in books:
         attach_book(book)
-    save_registry()
+    if save:
+        save_registry()
 
 
 def persist_book_state(book: Book) -> None:
@@ -138,6 +160,14 @@ def persist_book_state(book: Book) -> None:
     record["approved"] = bool(book.approved)
     record["excel_passed"] = bool(book.excel_passed)
     record["final"] = bool(book.final)
+    if book.created_at:
+        record["created_at"] = book.created_at
+    if book.modified_at:
+        record["modified_at"] = book.modified_at
+    if book.database_passed_at:
+        record["database_passed_at"] = book.database_passed_at
+    elif not book.excel_passed:
+        record["database_passed_at"] = ""
     for key in scanner_fingerprints(book):
         load_registry()["fingerprints"][key] = book.scanner_id
     save_registry()

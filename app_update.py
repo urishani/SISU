@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+_DATA_ROOTS = ("cache/", "lists/")
+_DATA_FILES = {"field_aliases.json", "config.json"}
 
 
 @dataclass
@@ -18,6 +21,8 @@ class UpdateInfo:
     remote: str
     ahead_behind: str
     dirty: bool
+    data_files: list[str] = field(default_factory=list)
+    code_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -100,6 +105,68 @@ def read_app_version() -> AppVersion:
     )
 
 
+def _normalize_git_path(path: str) -> str:
+    return path.replace("\\", "/").strip().lstrip("./")
+
+
+def is_data_json(path: str) -> bool:
+    """Local scan cache / aliases JSON that should not block an update."""
+    name = _normalize_git_path(path)
+    if not name:
+        return False
+    if any(name == root.rstrip("/") or name.startswith(root) for root in _DATA_ROOTS):
+        return True
+    if Path(name).name.lower() in _DATA_FILES:
+        return True
+    return name.lower().endswith(".json") and name.split("/", 1)[0] in {"cache", "lists"}
+
+
+def _changed_paths() -> list[str]:
+    result = _git("status", "--porcelain", timeout=8)
+    if result.returncode != 0:
+        return []
+    paths: list[str] = []
+    for raw in result.stdout.splitlines():
+        if len(raw) < 4:
+            continue
+        body = raw[3:].strip()
+        if " -> " in body:
+            body = body.split(" -> ", 1)[1]
+        if body.startswith('"') and body.endswith('"'):
+            body = body[1:-1]
+        name = _normalize_git_path(body)
+        if name:
+            paths.append(name)
+    return paths
+
+
+def _classify_changes(paths: list[str] | None = None) -> tuple[list[str], list[str]]:
+    data: list[str] = []
+    code: list[str] = []
+    for path in paths if paths is not None else _changed_paths():
+        if is_data_json(path):
+            data.append(path)
+        else:
+            code.append(path)
+    return data, code
+
+
+def _conflicted_paths() -> list[str]:
+    result = _git("diff", "--name-only", "--diff-filter=U", timeout=8)
+    return [_normalize_git_path(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _keep_local_data_json(paths: list[str]) -> None:
+    for path in paths:
+        checkout = _git("checkout", "--theirs", "--", path, timeout=15)
+        if checkout.returncode != 0:
+            raise UpdateError(
+                f"Could not keep the local cache file {path} after the update.\n"
+                "Finish the update by hand."
+            )
+        _git("add", "--", path, timeout=8)
+
+
 def check_for_update() -> UpdateInfo | None:
     if not is_git_copy():
         return None
@@ -117,12 +184,14 @@ def check_for_update() -> UpdateInfo | None:
     if local_hash == remote_hash:
         return None
     status = _git("status", "-sb", timeout=8)
-    dirty = _git("status", "--porcelain", timeout=8)
+    data_files, code_files = _classify_changes()
     return UpdateInfo(
         local=local_hash,
         remote=remote_hash,
         ahead_behind=(status.stdout.splitlines() or [""])[0].strip(),
-        dirty=bool(dirty.stdout.strip()),
+        dirty=bool(code_files),
+        data_files=data_files,
+        code_files=code_files,
     )
 
 
@@ -132,14 +201,45 @@ def apply_update() -> None:
     info = check_for_update()
     if info is None:
         return
-    if info.dirty:
+    data_files, code_files = _classify_changes()
+    if code_files:
+        listed = "\n".join(f"• {path}" for path in code_files[:12])
+        extra = "" if len(code_files) <= 12 else f"\n• … and {len(code_files) - 12} more"
         raise UpdateError(
-            "This copy of SISU has local file changes, so it cannot update automatically.\n"
-            "Update this folder by hand, or wait until local changes are cleared."
+            "This copy of SISU has local program-file changes, so it cannot update automatically.\n"
+            "Stash or copy those files, update this folder by hand, then put them back.\n\n"
+            f"{listed}{extra}"
         )
-    pull = _git("pull", "--ff-only")
+    stashed = False
+    stash_message = f"sisu-auto-update {int(time.time())}"
+    if data_files:
+        stash = _git("stash", "push", "-m", stash_message, "--", *data_files, timeout=30)
+        if stash.returncode != 0:
+            raise UpdateError(
+                stash.stderr.strip()
+                or "Could not stash the local JSON cache so the update can download."
+            )
+        stashed = "No local changes to save" not in (stash.stdout + stash.stderr)
+    pull = _git("pull", "--ff-only", timeout=60)
     if pull.returncode != 0:
+        if stashed:
+            _git("stash", "pop", timeout=30)
         raise UpdateError(pull.stderr.strip() or "Git could not apply the new version.")
+    if stashed:
+        pop = _git("stash", "pop", timeout=30)
+        if pop.returncode != 0:
+            conflicts = _conflicted_paths()
+            if conflicts and all(is_data_json(path) for path in conflicts):
+                _keep_local_data_json(conflicts)
+                _git("stash", "drop", timeout=15)
+            else:
+                names = ", ".join(conflicts) if conflicts else "local files"
+                raise UpdateError(
+                    "The new version downloaded, but restoring local files needs a manual step.\n"
+                    f"Git could not put these back automatically: {names}\n\n"
+                    "Your changes are still in git stash. Finish with git stash pop after resolving, "
+                    "or update this folder by hand."
+                )
     pip = subprocess.run(
         [_python_for_pip(), "-m", "pip", "install", "-r", str(APP_DIR / "requirements.txt")],
         cwd=str(APP_DIR),

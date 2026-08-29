@@ -62,6 +62,9 @@ EXCEL_TARGETS: dict[str, str] = {
     "marc": "MARC",
     "ddc": "DDC",
     "scanner_id": "Scanner ID",
+    "created_at": "Created",
+    "modified_at": "Modified",
+    "database_passed_at": "Passed to database",
 }
 
 CORE_FIELDS = {

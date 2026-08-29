@@ -63,6 +63,17 @@ HEADER_TO_FIELD: dict[str, str] = {
     "back page url": "back_image_url",
     "scanner id": "scanner_id",
     "scannerid": "scanner_id",
+    "created": "created_at",
+    "created at": "created_at",
+    "entry created": "created_at",
+    "modified": "modified_at",
+    "modified at": "modified_at",
+    "updated": "modified_at",
+    "updated at": "modified_at",
+    "passed to database": "database_passed_at",
+    "passed to db": "database_passed_at",
+    "database passed": "database_passed_at",
+    "to database": "database_passed_at",
     "translator": "translator",
     "illustrator": "illustrator",
     "marc": "marc",
@@ -81,6 +92,9 @@ REQUIRED_COLORED_HEADERS = (
     "Illustrator",
     "MARC",
     "DDC",
+    "Created",
+    "Modified",
+    "Passed to database",
 )
 
 BLANK_FILLS = {

@@ -20,6 +20,7 @@ from urllib.parse import quote, urlparse
 
 from dataclasses import asdict
 
+from activity_log import ActivityLog
 from app_config import (
     BROWSERS,
     browser_executable,
@@ -35,6 +36,7 @@ from book_crawler import (
     CrawlCancelled,
     CrawlReport,
     catalog_listing_url,
+    format_entry_stamp,
     format_person_name,
     format_price,
     listing_url_key,
@@ -254,6 +256,16 @@ class BookCatalogApp(tk.Tk):
         self._scan_found = 0
         self._scan_checking = 0
         self._scan_total = 0
+        self._scan_phase = ""
+        self._scan_book = ""
+        self._activity = ActivityLog()
+        self._log_popup: tk.Toplevel | None = None
+        self._log_list: tk.Listbox | None = None
+        self._log_view: tk.Text | None = None
+        self._log_runs: list[dict[str, str]] = []
+        self._log_selected_id = ""
+        self._log_refresh_job: str | None = None
+        self._live_save_job: str | None = None
         self._ui_queue: queue.Queue = queue.Queue()
         self._clean_fingerprint = ""
         self._list_actions_ready = False
@@ -475,6 +487,12 @@ class BookCatalogApp(tk.Tk):
             self.search_btn,
             "Search every bookstore URL, merge unique titles into one list, then fill catalog and publisher pages.",
         )
+        self.log_btn = ttk.Button(buttons, text="Show log", command=self.show_activity_log)
+        self.log_btn.pack(side="left", padx=(0, 4))
+        self._callout(
+            self.log_btn,
+            "Open the log of this search and earlier searches. Progress lines such as checking 48 of 1,728 are updated in place.",
+        )
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self.stop_btn.pack(side="left")
         self._callout(self.stop_btn, "Stop the current search. Books found so far are kept.")
@@ -510,6 +528,7 @@ class BookCatalogApp(tk.Tk):
         ttk.Label(filter_bar, text="Filter").pack(side="left")
         self._filter_vars: dict[str, tk.BooleanVar] = {}
         filter_tips = {
+            "important": "Show books that still need attention: created and not passed to the database, updated after they were created, or updated after they were passed.",
             "checked": "Show only books you ticked in the ☑ column.",
             "approved": "Show only books you approved.",
             "failed": "Show only books that had an error.",
@@ -649,6 +668,12 @@ class BookCatalogApp(tk.Tk):
         select_all_btn = ttk.Button(action_row, text="Select all", command=self.table.select_all)
         select_all_btn.pack(side="left", pady=2)
         self._callout(select_all_btn, "Tick every book currently shown in the table.")
+        important_btn = ttk.Button(action_row, text="Important", command=self._select_important)
+        important_btn.pack(side="left", padx=6, pady=2)
+        self._callout(
+            important_btn,
+            "Tick books that need attention: created and not passed to the database, updated after they were created, or updated after they were passed.",
+        )
         clear_sel_btn = ttk.Button(action_row, text="Clear selection", command=self.table.clear_selection)
         clear_sel_btn.pack(side="left", padx=6, pady=2)
         self._callout(clear_sel_btn, "Clear the ☑ ticks. This does not delete books from the list.")
@@ -1866,19 +1891,30 @@ class BookCatalogApp(tk.Tk):
         self.unfinal_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._update_list_action_buttons()
-        self.books = []
-        self.table.set_books(self.books, keep_checks=False)
-        self._clear_selected_book()
+        self._cancel_live_save()
+        seed_books = list(self.books)
         self._follow_search = True
         self._scan_site = ""
-        self._scan_found = 0
+        self._scan_found = len(self.books)
         self._scan_checking = 0
         self._scan_total = 0
+        self._scan_phase = "Listing"
+        self._scan_book = ""
         self.scan_live.set("")
         self._set_pages_total(0)
         self._highlight_site_url("")
         self._begin_work("Working…")
-        self._set_status("Starting search. Listing books from every bookstore URL…")
+        self._set_status(
+            "Starting search. Each catalog URL is listed once, in order. "
+            "Duplicates merge into one row. Created and updated dates are kept."
+        )
+        pages = self._page_limit_setting()
+        self._activity.start_run(
+            "Search",
+            f"Year {year or 'any'}. {len(urls)} catalog URL(s). "
+            f"{'No page limit' if pages <= 0 else f'Max {pages} listing pages per site'}. "
+            f"{len(seed_books)} book(s) already on the list.",
+        )
         thread = threading.Thread(
             target=self._run_crawl,
             args=(
@@ -1892,6 +1928,7 @@ class BookCatalogApp(tk.Tk):
                 self._list_archived,
                 self._list_notes,
                 self._list_created_at,
+                seed_books,
             ),
             daemon=True,
         )
@@ -1900,6 +1937,156 @@ class BookCatalogApp(tk.Tk):
     def stop_search(self) -> None:
         self._cancel.set()
         self._set_status("Stopping…")
+
+    def _crawl_progress(self, msg: str) -> None:
+        try:
+            self._activity.log(msg)
+        except Exception:
+            pass
+        self._ui_queue.put(("status", msg))
+
+    def show_activity_log(self) -> None:
+        if self._log_popup is not None:
+            try:
+                self._log_popup.lift()
+                self._log_popup.focus_force()
+                self._reload_log_list(keep_selection=True)
+                return
+            except tk.TclError:
+                self._log_popup = None
+        win = tk.Toplevel(self)
+        win.title("Search log")
+        win.geometry("980x560")
+        win.minsize(720, 400)
+        self._log_popup = win
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="Each Search is a separate log. Progress lines such as listing book 48 are rewritten in place so the file stays small. The current search is saved every few seconds while it runs.",
+            wraplength=940,
+        ).pack(anchor="w", pady=(0, 8))
+        split = ttk.Panedwindow(body, orient="horizontal")
+        split.pack(fill="both", expand=True)
+        left = ttk.Frame(split)
+        right = ttk.Frame(split)
+        split.add(left, weight=1)
+        split.add(right, weight=3)
+        ttk.Label(left, text="Executions").pack(anchor="w")
+        listbox = tk.Listbox(left, font=("Segoe UI", 10), exportselection=False)
+        list_scroll = ttk.Scrollbar(left, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=list_scroll.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        list_scroll.pack(side="right", fill="y")
+        self._log_list = listbox
+        ttk.Label(right, text="Log").pack(anchor="w")
+        view = tk.Text(right, font=("Consolas", 10), wrap="word", state="disabled")
+        text_scroll = ttk.Scrollbar(right, orient="vertical", command=view.yview)
+        view.configure(yscrollcommand=text_scroll.set)
+        view.pack(side="left", fill="both", expand=True)
+        text_scroll.pack(side="right", fill="y")
+        self._log_view = view
+
+        def on_select(_event=None) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            index = int(selection[0])
+            if 0 <= index < len(self._log_runs):
+                self._log_selected_id = self._log_runs[index]["id"]
+                self._show_selected_log()
+
+        listbox.bind("<<ListboxSelect>>", on_select)
+
+        def close() -> None:
+            self._stop_log_refresh()
+            self._log_popup = None
+            self._log_list = None
+            self._log_view = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        ttk.Button(body, text="Close", command=close).pack(anchor="e", pady=(8, 0))
+        self._reload_log_list()
+        self._start_log_refresh()
+
+    def _reload_log_list(self, *, keep_selection: bool = False) -> None:
+        box = self._log_list
+        if box is None:
+            return
+        previous = self._log_selected_id if keep_selection else ""
+        self._log_runs = self._activity.list_runs()
+        box.delete(0, "end")
+        chosen = 0
+        for index, item in enumerate(self._log_runs):
+            box.insert("end", item["label"])
+            if item["id"] == previous or (not previous and index == 0):
+                chosen = index
+        if self._log_runs:
+            box.selection_clear(0, "end")
+            box.selection_set(chosen)
+            box.see(chosen)
+            self._log_selected_id = self._log_runs[chosen]["id"]
+            self._show_selected_log()
+        else:
+            self._set_log_view("No search logs yet. Run Search to create the first log.")
+
+    def _show_selected_log(self) -> None:
+        run_id = self._log_selected_id
+        if not run_id:
+            self._set_log_view("No search logs yet.")
+            return
+        at_end = False
+        view = self._log_view
+        if view is not None:
+            try:
+                at_end = float(view.yview()[1]) >= 0.98
+            except tk.TclError:
+                at_end = True
+        self._set_log_view(self._activity.render_run(run_id), stick_to_end=at_end or run_id == self._activity.current_id())
+
+    def _set_log_view(self, text: str, *, stick_to_end: bool = True) -> None:
+        view = self._log_view
+        if view is None:
+            return
+        view.configure(state="normal")
+        view.delete("1.0", "end")
+        view.insert("1.0", text)
+        view.configure(state="disabled")
+        if stick_to_end:
+            view.see("end")
+
+    def _start_log_refresh(self) -> None:
+        self._stop_log_refresh()
+        self._log_refresh_job = self.after(400, self._refresh_log_window)
+
+    def _stop_log_refresh(self) -> None:
+        job = self._log_refresh_job
+        self._log_refresh_job = None
+        if job:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def _refresh_log_window(self) -> None:
+        self._log_refresh_job = None
+        if self._log_popup is None:
+            return
+        try:
+            if not self._log_popup.winfo_exists():
+                self._log_popup = None
+                return
+        except tk.TclError:
+            self._log_popup = None
+            return
+        current = self._activity.current_id()
+        if self._log_selected_id == current or not self._log_selected_id:
+            if self._log_runs and self._log_runs[0]["id"] != current:
+                self._reload_log_list(keep_selection=True)
+            else:
+                self._show_selected_log()
+        self._log_refresh_job = self.after(400, self._refresh_log_window)
 
     def _run_crawl(
         self,
@@ -1913,19 +2100,21 @@ class BookCatalogApp(tk.Tk):
         archived: bool,
         notes: str,
         created_at: str,
+        seed_books: list[Book] | None = None,
     ) -> None:
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
-            progress=lambda msg: self._ui_queue.put(("status", msg)),
+            progress=self._crawl_progress,
             event=lambda kind, data: self._ui_queue.put(("event", (kind, data))),
         )
         try:
-            self._ui_queue.put(("status", f"Searching {len(urls)} bookstore and catalog URL(s)…"))
+            self._crawl_progress(f"Searching {len(urls)} bookstore and catalog URL(s)…")
             books = crawler.search_all_sites(
                 urls=urls,
                 year=year,
                 max_listing_pages=max_pages,
                 include_unknown_year=include_unknown,
+                seed_books=seed_books,
             )
             self._prepare_books(books)
             try:
@@ -1966,11 +2155,13 @@ class BookCatalogApp(tk.Tk):
                 pass
 
     def _drain_queue(self) -> None:
-        while True:
+        processed = 0
+        while processed < 8:
             try:
                 kind, payload = self._ui_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if kind == "status":
                 self._set_status(str(payload))
                 if self._lookup_popup is not None:
@@ -2002,7 +2193,7 @@ class BookCatalogApp(tk.Tk):
                 self._on_update_error(bool(silent), str(text))
             elif kind == "update_applied":
                 self._finish_self_update()
-        self.after(120, self._drain_queue)
+        self.after(20 if processed >= 8 else 80, self._drain_queue)
 
     def _finish_search(
         self,
@@ -2016,6 +2207,7 @@ class BookCatalogApp(tk.Tk):
         self.stop_btn.configure(state="disabled")
         self._follow_search = True
         self._highlight_site_url("")
+        self._cancel_live_save()
         if not failed:
             self.scan_live.set("")
         if books:
@@ -2050,6 +2242,8 @@ class BookCatalogApp(tk.Tk):
                 f"Search finished. {len(self.books)} book(s) from {year}. "
                 "The working list is kept until you save or clear it."
             )
+        outcome = "stopped" if cancelled else "failed" if list_failed else "done"
+        self._activity.finish(outcome, self.status.get())
         self.summary.set(report.summary())
         if self._selected_book:
             self.more_btn.configure(state="normal")
@@ -2060,6 +2254,16 @@ class BookCatalogApp(tk.Tk):
         if self._busy:
             return
         self._set_status(f"{len(self.table.checked)} selected")
+
+    def _select_important(self) -> None:
+        count = self.table.select_important()
+        if count:
+            self._set_status(
+                f"Selected {count} important book(s): created and not passed, "
+                "updated after created, or updated after the last database pass."
+            )
+        else:
+            self._set_status("No important books. Everything on this list is already passed to the database.")
 
     def show_book(self, book: Book) -> None:
         if self._busy and not self._programmatic_select:
@@ -2150,6 +2354,10 @@ class BookCatalogApp(tk.Tk):
         self._begin_work("Working…")
         label = books[0].publisher.strip() if books else "publisher"
         site = resolve_publisher_site(label) or ""
+        self._activity.start_run(
+            "More details",
+            f"Publisher lookup on {label} for {len(books)} book(s).",
+        )
         self._set_status(f"Looking up missing details on the publisher site for {len(books)} book(s)…")
         self._open_lookup_popup(publisher=label, site=site, total=len(books))
         thread = threading.Thread(
@@ -2385,7 +2593,7 @@ class BookCatalogApp(tk.Tk):
     def _run_publisher_lookup(self, books: list[Book], selected: Book | None, publisher: str) -> None:
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
-            progress=lambda msg: self._ui_queue.put(("status", msg)),
+            progress=self._crawl_progress,
         )
         remap: dict[str, str] = {}
         updated = 0
@@ -2568,6 +2776,8 @@ class BookCatalogApp(tk.Tk):
         else:
             self._end_work("done")
         self._set_status(summary)
+        outcome = "failed" if payload is None or failed else "stopped" if (payload or {}).get("cancelled") else "done"
+        self._activity.finish(outcome, summary)
         self._complete_lookup_popup(summary, failed=failed)
         if selected:
             self._show_found_fields_popup(selected)
@@ -2822,6 +3032,26 @@ class BookCatalogApp(tk.Tk):
         tone = book.display_tone()
         self._add_detail_row("Workflow", workflow, field_key="workflow", tone=tone)
         self._add_detail_row("Status", book.status_label() or "—", field_key="scan_status", tone=tone)
+        self._add_detail_row("Created", format_entry_stamp(book.created_at) or "—", field_key="created_at")
+        updated = format_entry_stamp(book.modified_at) or "—"
+        if book.database_needs_update():
+            updated = f"{updated} · new details since last database pass"
+        self._add_detail_row("Updated", updated, field_key="modified_at")
+        passed = format_entry_stamp(book.database_passed_at)
+        if book.database_needs_update():
+            passed = f"{passed} · pass again" if passed else "Pass again"
+        elif book.excel_passed and not passed:
+            passed = "On file"
+        elif not passed:
+            passed = "Not yet"
+        self._add_detail_row("Passed to database", passed, field_key="database_passed_at")
+        if book.is_important():
+            self._add_detail_row(
+                "Attention",
+                book.important_reason() or "Needs a database pass",
+                field_key="important",
+                is_new=True,
+            )
         self._add_detail_row("Message", book.scan_message or "—", field_key="scan_message", tone=tone)
         if note:
             self._add_detail_row(
@@ -2947,7 +3177,7 @@ class BookCatalogApp(tk.Tk):
         keep_vars: dict[str, tk.BooleanVar] = {}
         box = ttk.Frame(body)
         box.pack(anchor="w", pady=(10, 8))
-        defaults = {"checked", "approved", "final"}
+        defaults = {"important", "checked", "approved", "final"}
         for key, label in ROW_STATUSES:
             var = tk.BooleanVar(value=key in defaults)
             keep_vars[key] = var
@@ -3099,6 +3329,7 @@ class BookCatalogApp(tk.Tk):
                 )
         book.final = False
         book.excel_passed = False
+        book.database_passed_at = ""
         book.approved = True
         persist_book_state(book)
         self.table.refresh_book(book)
@@ -3216,9 +3447,15 @@ class BookCatalogApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Could not write Excel", str(exc))
             return 0, 0, None, ""
-        done = set(written_ids) | set(skipped_ids)
+        written_set = set(written_ids)
+        skipped_set = set(skipped_ids)
         for book in books:
-            if book.scanner_id in done:
+            if book.scanner_id in written_set:
+                book.approved = True
+                book.excel_passed = True
+                book.stamp_database_passed()
+                persist_book_state(book)
+            elif book.scanner_id in skipped_set:
                 book.approved = True
                 book.excel_passed = True
                 persist_book_state(book)
@@ -3285,29 +3522,54 @@ class BookCatalogApp(tk.Tk):
                 box.see(f"{index}.0")
                 return
 
-    def _refresh_scan_live(self, site: str = "", found: int | None = None, checking: int | None = None, total: int | None = None) -> None:
+    def _refresh_scan_live(
+        self,
+        site: str = "",
+        found: int | None = None,
+        checking: int | None = None,
+        total: int | None = None,
+        phase: str = "",
+        title: str = "",
+        author: str = "",
+        publisher: str = "",
+    ) -> None:
         if site:
             self._scan_site = site
         if found is not None:
             self._scan_found = found
         if checking is not None:
             self._scan_checking = checking
-        if total is not None:
+        if total is not None and total > 0:
             self._scan_total = total
+        if phase:
+            self._scan_phase = phase
+        if title:
+            who = title
+            if author:
+                who += f" · {author}"
+            if publisher:
+                who += f" · {publisher}"
+            self._scan_book = who
         site_name = self._scan_site
-        found_count = self._scan_found
+        found_count = len(self.books) if self.books else self._scan_found
         checking_count = self._scan_checking
         total_count = self._scan_total
         parts: list[str] = []
+        if self._scan_phase:
+            parts.append(self._scan_phase)
         if site_name:
             parts.append(site_name)
-        parts.append(f"{found_count} found")
-        if total_count:
-            parts.append(f"checking {checking_count} of {total_count}")
+        parts.append(f"{found_count:,} on the list")
+        if self._scan_phase == "Filling extra details" and total_count:
+            parts.append(f"checking {checking_count:,} of {total_count:,}")
+        elif checking_count:
+            parts.append(f"listing {checking_count:,}")
+        if self._scan_book:
+            parts.append(self._scan_book)
         self.scan_live.set("  ·  ".join(parts))
         if self._busy and total_count:
             self._set_progress_count(checking_count, total_count)
-            self.work_hint.set(f"{checking_count} / {total_count}")
+            self.work_hint.set(f"{checking_count:,} / {total_count:,}")
 
     def _prepare_one_book(self, book: Book) -> None:
         if book.author:
@@ -3319,7 +3581,7 @@ class BookCatalogApp(tk.Tk):
         if book.title:
             book.refresh_scan_status()
         try:
-            attach_books([book])
+            attach_books([book], save=False)
         except Exception:
             pass
 
@@ -3327,7 +3589,7 @@ class BookCatalogApp(tk.Tk):
         self._pending_detail = book
         if self._detail_job:
             return
-        self._detail_job = self.after(80, self._flush_detail)
+        self._detail_job = self.after(200, self._flush_detail)
 
     def _flush_detail(self) -> None:
         self._detail_job = None
@@ -3354,15 +3616,61 @@ class BookCatalogApp(tk.Tk):
             self._programmatic_select = False
 
     def _ingest_search_book(self, book: Book) -> None:
-        existing = next((item for item in self.books if item is book or item.key() == book.key()), None)
+        def same(item: Book) -> bool:
+            if item is book or item.key() == book.key():
+                return True
+            if book.scanner_id and item.scanner_id == book.scanner_id:
+                return True
+            left = (item.url or "").strip()
+            right = (book.url or "").strip()
+            return bool(left) and left == right
+
+        existing = next((item for item in self.books if same(item)), None)
         if existing is None:
             self._prepare_one_book(book)
             self.books.append(book)
             self.table.add_row(book)
             self._select_live_book(book)
+            self._schedule_live_save()
             return
         self.table.refresh_book(existing)
         self._select_live_book(existing)
+        self._schedule_live_save()
+
+    def _schedule_live_save(self) -> None:
+        if self._live_save_job:
+            return
+        self._live_save_job = self.after(1600, self._flush_live_save)
+
+    def _flush_live_save(self) -> None:
+        self._live_save_job = None
+        try:
+            from scanner_registry import save_registry
+
+            save_registry()
+        except Exception:
+            pass
+        if not self.books:
+            return
+        try:
+            save_working(self._current_payload())
+        except Exception:
+            pass
+
+    def _cancel_live_save(self) -> None:
+        job = self._live_save_job
+        self._live_save_job = None
+        if job:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
+        try:
+            from scanner_registry import save_registry
+
+            save_registry()
+        except Exception:
+            pass
 
     def _on_search_event(self, kind: str, data: dict) -> None:
         site = str(data.get("site") or "")
@@ -3372,39 +3680,47 @@ class BookCatalogApp(tk.Tk):
             current = int(data.get("current") or 0)
             if total:
                 self._set_pages_total(total)
-            self._refresh_scan_live(
-                site=site,
-                found=int(data.get("found") or self._scan_found),
-                checking=current,
-                total=total,
-            )
+            self._refresh_scan_live(site=site, found=len(self.books), phase="Listing")
             if site and total:
                 cap = " · no limit" if data.get("unlimited") else ""
-                self._set_status(f"{site}: catalog page {current} of {total}{cap}")
+                self._set_status(f"{site}: catalog page {current:,} of {total:,}{cap}")
             return
         if kind == "site":
             self._highlight_site_url(url)
-            self._refresh_scan_live(site=site, found=int(data.get("found") or self._scan_found))
+            phase = str(data.get("phase") or self._scan_phase or "Listing")
+            self._refresh_scan_live(site=site, found=len(self.books), phase=phase)
             if site:
-                self._set_status(f"Searching {site}…")
+                verb = "Filling extra details from" if phase == "fill" else "Listing"
+                self._set_status(f"{verb} {site}…")
             return
         if kind in {"check", "fill"}:
             self._highlight_site_url(url)
-            self._refresh_scan_live(
-                site=site,
-                found=int(data.get("found") or self._scan_found),
-                checking=int(data.get("index") or 0),
-                total=int(data.get("total") or 0),
-            )
             book = data.get("book")
+            title = str(data.get("title") or "")
+            author = str(data.get("author") or "")
+            publisher = str(data.get("publisher") or "")
             if isinstance(book, Book):
                 self._ingest_search_book(book)
+                title = title or book.display_title()
+                author = author or book.author
+                publisher = publisher or book.publisher
+            phase = "Filling extra details" if kind == "fill" else "Listing"
+            self._refresh_scan_live(
+                site=site,
+                found=len(self.books),
+                checking=int(data.get("index") or 0),
+                total=int(data.get("total") or 0),
+                phase=phase,
+                title=title,
+                author=author,
+                publisher=publisher,
+            )
             return
         if kind == "book":
             book = data.get("book")
             if isinstance(book, Book):
                 self._ingest_search_book(book)
-            self._refresh_scan_live(site=site, found=int(data.get("found") or len(self.books)))
+            self._refresh_scan_live(site=site, found=len(self.books))
 
     def _begin_work(self, hint: str = "Working…") -> None:
         self.work_hint.set(hint)
@@ -3545,20 +3861,30 @@ class BookCatalogApp(tk.Tk):
             self._set_status("A newer SISU version is available. Click Check for updates when you are ready.")
             return
         if info.dirty:
-            messagebox.showwarning(
-                "Cannot update automatically",
-                "A newer SISU version is available, but this copy has local file changes "
-                "so it cannot update itself.\n\nUpdate this folder by hand, or wait until local changes are cleared.",
+            listed = "\n".join(f"• {path}" for path in (info.code_files or [])[:8])
+            extra = "" if len(info.code_files) <= 8 else f"\n• … and {len(info.code_files) - 8} more"
+            message = (
+                "A newer SISU version is available, but this copy has local program-file changes, "
+                "so it cannot update itself.\n\n"
+                "Update this folder by hand (or stash those files, pull, then restore them).\n\n"
+                f"{listed}{extra}"
             )
+            if silent:
+                self._set_status("A newer SISU is available, but local program files have changes. Update by hand.")
+                return
+            messagebox.showwarning("Cannot update automatically", message)
             return
         if not messagebox.askokcancel(
             "Update SISU",
             "A newer version of SISU is available.\n\n"
             "If you continue, SISU will:\n"
+            "• stash local JSON cache files if they would block the download\n"
             "• download the update from GitHub\n"
+            "• put the JSON cache back\n"
             "• install any new libraries\n"
             "• close this window and start the new version\n\n"
-            "Finish any work you want to keep first.\n\n"
+            "Program files you edited yourself are not updated automatically — "
+            "those still need a manual update.\n\n"
             "Update and restart now?",
         ):
             self._update_declined_remote = info.remote

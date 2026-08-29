@@ -6,6 +6,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
@@ -29,6 +30,29 @@ def _choose_html_parser() -> str:
 
 
 HTML_PARSER = _choose_html_parser()
+
+
+def entry_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def format_entry_stamp(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        date, rest = text.split("T", 1)
+        return f"{date} {rest.replace('Z', '')[:5]}"
+    return text[:16]
+
+
+def entry_day(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        return text.split("T", 1)[0]
+    return text[:10]
 
 
 def _safe_flush_scan_files() -> None:
@@ -427,6 +451,9 @@ class Book:
     approved: bool = False
     excel_passed: bool = False
     final: bool = False
+    created_at: str = ""
+    modified_at: str = ""
+    database_passed_at: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Book":
@@ -440,6 +467,63 @@ class Book:
         if isinstance(extra, dict):
             book.extra = {str(key): str(value) for key, value in extra.items()}
         return book
+
+    def stamp_created(self) -> None:
+        if not (self.created_at or "").strip():
+            self.created_at = entry_now()
+        if not (self.modified_at or "").strip():
+            self.modified_at = self.created_at
+
+    def stamp_modified(self) -> None:
+        stamp = entry_now()
+        if not (self.created_at or "").strip():
+            self.created_at = stamp
+        self.modified_at = stamp
+
+    def stamp_database_passed(self) -> None:
+        self.database_passed_at = entry_now()
+        self.excel_passed = True
+
+    def database_needs_update(self) -> bool:
+        passed = (self.database_passed_at or "").strip()
+        modified = (self.modified_at or "").strip()
+        return bool(passed and modified and modified > passed)
+
+    def was_transferred(self) -> bool:
+        return bool((self.database_passed_at or "").strip() or self.excel_passed)
+
+    def updated_after_created(self) -> bool:
+        created = (self.created_at or "").strip()
+        modified = (self.modified_at or "").strip()
+        if not created or not modified:
+            return False
+        created_day = entry_day(created)
+        modified_day = entry_day(modified)
+        if created_day and modified_day and modified_day > created_day:
+            return True
+        return modified > created
+
+    def is_important(self) -> bool:
+        """Needs the owner's attention for a first pass or another database pass."""
+        if not (self.title or "").strip():
+            return False
+        if not self.was_transferred():
+            return True
+        if self.database_needs_update():
+            return True
+        if self.updated_after_created() and not self.was_transferred():
+            return True
+        return False
+
+    def important_reason(self) -> str:
+        reasons: list[str] = []
+        if not self.was_transferred():
+            reasons.append("created and not passed to the database")
+        if self.updated_after_created():
+            reasons.append("updated after it was created")
+        if self.database_needs_update():
+            reasons.append("updated after it was passed to the database")
+        return "; ".join(reasons)
 
     def key(self) -> str:
         return self.scanner_id or self.isbn or self.danacode or self.url or self.display_title()
@@ -623,7 +707,10 @@ class Book:
             self.extra["publisher_found"] = other.extra["found_fields"]
         if other.extra.get("page_fields"):
             self.extra["page_fields"] = other.extra["page_fields"]
-        return list(dict.fromkeys(filled))
+        filled = list(dict.fromkeys(filled))
+        if filled:
+            self.stamp_modified()
+        return filled
 
     def captured_fields(self) -> dict[str, str]:
         data = self._load_map("captured")
@@ -755,6 +842,9 @@ class Book:
             "ddc": clean(self.ddc),
             "scanner_id": clean(self.scanner_id),
             "url": self.url,
+            "created_at": clean(self.created_at),
+            "modified_at": clean(self.modified_at),
+            "database_passed_at": clean(self.database_passed_at),
         }
         if captured.get("author_en"):
             author_en = captured.get("author_en") or author_en
@@ -992,21 +1082,46 @@ def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
     """Merge extra into the list, or append it. Returns (canonical book, added?)."""
     extra_title = (extra.title or "").strip()
     extra_url = (extra.url or "").strip()
-    if extra_title:
-        for book in primary:
-            if books_match(book, extra):
-                book.merge_missing(extra)
-                return book, False
-        primary.append(extra)
-        return extra, True
     if extra_url:
         for book in primary:
             if (book.url or "").strip() == extra_url:
+                _keep_identity(book, extra)
                 book.merge_missing(extra)
                 return book, False
+    if extra_title:
+        for book in primary:
+            if books_match(book, extra):
+                _keep_identity(book, extra)
+                book.merge_missing(extra)
+                return book, False
+        extra.stamp_created()
+        primary.append(extra)
+        return extra, True
+    if extra_url:
+        extra.stamp_created()
         primary.append(extra)
         return extra, True
     return extra, False
+
+
+def _keep_identity(book: Book, extra: Book) -> None:
+    if extra.scanner_id and not book.scanner_id:
+        book.scanner_id = extra.scanner_id
+    extra_created = (extra.created_at or "").strip()
+    book_created = (book.created_at or "").strip()
+    if extra_created and (not book_created or extra_created < book_created):
+        book.created_at = extra.created_at
+    if not (book.modified_at or "").strip() and (extra.modified_at or "").strip():
+        book.modified_at = extra.modified_at
+    if extra.database_passed_at and not book.database_passed_at:
+        book.database_passed_at = extra.database_passed_at
+    if extra.excel_passed:
+        book.excel_passed = True
+    if extra.approved:
+        book.approved = True
+    if extra.final:
+        book.final = True
+    book.stamp_created()
 
 
 def union_catalog(primary: list[Book], extras: list[Book]) -> int:
@@ -1853,15 +1968,27 @@ def collect_matching_links(soup: BeautifulSoup, page_url: str, book: Book) -> li
     return found
 
 
-def collect_product_links(soup: BeautifulSoup, page_url: str) -> list[str]:
-    found: list[str] = []
+def collect_product_entries(soup: BeautifulSoup, page_url: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
 
-    def add(href: str | None) -> None:
+    def add(href: str | None, title: str = "") -> None:
         url = normalize_url(page_url, href or "")
-        if url and "/icons/" not in url and not is_asset_url(url) and url not in found:
-            path = urlparse(url).path.lower()
-            if any(hint in path for hint in PRODUCT_PATH_HINTS):
-                found.append(url)
+        if not url or "/icons/" in url or is_asset_url(url) or url in seen:
+            return
+        path = urlparse(url).path.lower()
+        if not any(hint in path for hint in PRODUCT_PATH_HINTS):
+            return
+        seen.add(url)
+        found.append((url, clean(title)))
+
+    def title_from(tag: Tag) -> str:
+        text = clean(tag.get_text(" ", strip=True))
+        if len(text) >= 2:
+            return text[:180]
+        img = tag.find("img") if isinstance(tag, Tag) else None
+        alt = clean(img.get("alt") if img else "")
+        return alt[:180]
 
     selectors = [
         ".book-item a[href*='/מוצרים/']",
@@ -1878,18 +2005,27 @@ def collect_product_links(soup: BeautifulSoup, page_url: str) -> list[str]:
     ]
     for selector in selectors:
         for tag in soup.select(selector):
-            add(tag.get("href", ""))
+            if isinstance(tag, Tag):
+                add(tag.get("href", ""), title_from(tag))
+    if found:
+        return found
     html = str(soup)
     for match in PRODUCT_HREF_RE.finditer(html):
-        add(match.group(1))
+        add(match.group(1), "")
     if found:
         return found
     for tag in soup.select("a[href]"):
+        if not isinstance(tag, Tag):
+            continue
         href = tag.get("href", "")
         path = urlparse(urljoin(page_url, href)).path
         if any(hint in path for hint in PRODUCT_PATH_HINTS) and "/קטגוריות/" not in path:
-            add(href)
+            add(href, title_from(tag))
     return found
+
+
+def collect_product_links(soup: BeautifulSoup, page_url: str) -> list[str]:
+    return [url for url, _title in collect_product_entries(soup, page_url)]
 
 
 def _url_key(url: str) -> str:
@@ -2315,7 +2451,8 @@ class BookCrawler:
             raise SiteError(failure, url=response.url or url)
         if response.status_code >= 400:
             raise SiteError(http_status_message(response.status_code, response.url or url), url=response.url or url)
-        time.sleep(self.delay_seconds)
+        if "/api/" not in urlparse(url).path.lower():
+            time.sleep(self.delay_seconds)
         return html, response.url
 
     def _book_and_html(self, product_url: str, remember: bool = True) -> tuple[Book | None, str, str]:
@@ -2343,6 +2480,8 @@ class BookCrawler:
         year: str,
         max_products: int,
         include_unknown_year: bool,
+        on_urls: Callable[[list[str]], None] | None = None,
+        on_listed: Callable[[Book], None] | None = None,
     ) -> list[str] | None:
         group_id = evrit_group_id(page_url)
         if not group_id:
@@ -2384,6 +2523,7 @@ class BookCrawler:
                         )
                 if not items:
                     break
+                batch: list[str] = []
                 for item in items:
                     if not isinstance(item, dict):
                         continue
@@ -2399,8 +2539,28 @@ class BookCrawler:
                         continue
                     seen.add(product_url)
                     urls.append(product_url)
+                    batch.append(product_url)
+                    name = ""
+                    author = ""
+                    for key in ("Name", "Title", "ProductName", "BookName", "DisplayName"):
+                        name = str(item.get(key) or "").strip()
+                        if name:
+                            break
+                    authors = item.get("Authors") or item.get("Author") or item.get("AuthorName")
+                    if isinstance(authors, list):
+                        author = ", ".join(str(part).strip() for part in authors if str(part).strip())
+                    else:
+                        author = str(authors or "").strip()
+                    if on_listed:
+                        listed = Book(url=product_url, title=name, author=author, year=item_year)
+                        if name:
+                            listed.append_scan_log("Found in the catalog listing.")
+                            listed.refresh_scan_status()
+                        on_listed(listed)
                     if len(urls) >= max_products:
                         break
+                if on_urls and batch:
+                    on_urls(batch)
                 host = site_display_name(page_url)
                 self.progress(
                     f"{host} catalog: {len(urls)} book(s) for {want_year or 'any year'} "
@@ -2437,10 +2597,11 @@ class BookCrawler:
         page_cap = listing_page_cap(max_listing_pages)
         known_total = 0
 
-        def keep(book: Book) -> None:
-            results.append(book)
+        def keep(book: Book) -> tuple[Book, bool]:
+            canonical, is_new = absorb_book(results, book)
             if on_book:
-                on_book(book)
+                on_book(canonical)
+            return canonical, is_new
 
         def note_pages(current: int, total: int) -> None:
             self._emit(
@@ -2455,17 +2616,58 @@ class BookCrawler:
                 },
             )
 
-        def checking(index: int, total: int) -> None:
-            self._emit(
-                "check",
-                {
-                    "index": index,
-                    "total": max(total, 1),
-                    "found": len(results),
-                    "site": site_name,
-                    "url": start_url,
-                },
+        def checking(index: int, total: int, book: Book | None = None) -> None:
+            payload: dict[str, Any] = {
+                "index": index,
+                "total": max(total, 1),
+                "found": len(results),
+                "site": site_name,
+                "url": start_url,
+            }
+            if book is not None:
+                payload["book"] = book
+                payload["title"] = book.display_title()
+                payload["author"] = book.author
+                payload["publisher"] = book.publisher
+            self._emit("check", payload)
+
+        def take_listed(product_url: str, listing: Book | None = None) -> Book | None:
+            from book_cache import get_page_book
+
+            if product_url in seen_products:
+                if listing:
+                    canonical, _is_new = keep(listing)
+                    return canonical
+                return None
+            seen_products.add(product_url)
+            cached = get_page_book(product_url)
+            incoming = listing or Book(url=product_url)
+            if cached and cached.title:
+                if year and not cached.matches_year(year, include_unknown_year):
+                    self.report.skipped_year += 1
+                    return None
+                incoming.merge_missing(cached)
+            elif year and incoming.year and not incoming.matches_year(year, include_unknown_year):
+                self.report.skipped_year += 1
+                return None
+            elif not (incoming.title or "").strip() and year and not include_unknown_year:
+                return None
+            canonical, is_new = keep(incoming)
+            if is_new and (canonical.title or "").strip():
+                self.report.matched += 1
+            titled = sum(1 for item in results if (item.title or "").strip())
+            checking(titled, 0, canonical)
+            self.progress(
+                f"Listing book {titled} — {canonical.display_title()}"
+                + (f" · {canonical.author}" if canonical.author else "")
+                + (f" · {canonical.publisher}" if canonical.publisher else "")
+                + f" — {site_name}"
             )
+            return canonical
+
+        def keep_listed(book: Book) -> None:
+            take_listed(book.url, book)
+
         try:
             html, final_url = self.fetch(start_url)
             self.report.listing_pages += 1
@@ -2492,18 +2694,15 @@ class BookCrawler:
                 book.append_scan_log("Opened a product page and read the book.")
                 book.refresh_scan_status()
                 if book.matches_year(year, include_unknown_year):
-                    results.append(book)
+                    keep(book)
                     self.report.matched += 1
                 else:
                     self.report.skipped_year += 1
                     book.append_scan_log(f"Skipped: publication year {book.year or 'unknown'} is not {year}.")
             else:
                 book.mark_scan_failed("Opened the product page but could not read a title.")
-                results.append(book)
+                keep(book)
                 self.report.product_failed += 1
-            for item in results:
-                if on_book:
-                    on_book(item)
             self.progress(f"Opened a book page. {len(results)} match(es) for this year.")
             _safe_flush_scan_files()
             return results
@@ -2511,19 +2710,26 @@ class BookCrawler:
         listing_pages = [final_url]
         product_urls: list[str] = []
         visited_listings: set[str] = set()
-        api_urls = self._evrit_group_product_urls(
-            final_url, year, max_products, include_unknown_year
-        )
-        used_api = api_urls is not None
-        if used_api:
-            product_urls = api_urls[:max_products]
+        used_api = False
+
+        def on_api_urls(batch: list[str]) -> None:
+            for url in batch:
+                if url not in product_urls:
+                    product_urls.append(url)
             self.report.product_links = len(product_urls)
-            self.progress(
-                f"Found {len(product_urls)} book pages from the e-vrit catalog. "
-                f"Opening each page to check the year {year}…"
-            )
 
         try:
+            api_urls = self._evrit_group_product_urls(
+                final_url,
+                year,
+                max_products,
+                include_unknown_year,
+                on_urls=on_api_urls,
+                on_listed=keep_listed,
+            )
+            used_api = api_urls is not None
+            if used_api:
+                self.report.product_links = len(product_urls)
             if not used_api:
                 for listing_url in listing_pages:
                     self._check_cancel()
@@ -2547,63 +2753,24 @@ class BookCrawler:
                     else:
                         self.progress(f"Reading catalog page {page_n}…")
                     note_pages(page_n, known_total)
-                    for product_url in collect_product_links(soup, listing_url):
-                        if (
-                            same_domain(start_url, product_url)
-                            and not is_asset_url(product_url)
-                            and product_url not in product_urls
-                        ):
+                    for product_url, listing_title in collect_product_entries(soup, listing_url):
+                        if not same_domain(start_url, product_url) or is_asset_url(product_url):
+                            continue
+                        if product_url not in product_urls:
                             product_urls.append(product_url)
+                        take_listed(product_url, Book(url=product_url, title=listing_title))
                     next_cap = min(page_cap, known_total) if known_total else page_cap
                     if len(visited_listings) < next_cap:
                         for page_url in collect_pagination_links(soup, listing_url, next_cap):
                             if same_domain(start_url, page_url) and page_url not in listing_pages:
                                 listing_pages.append(page_url)
+                    self.report.product_links = len(product_urls[:max_products])
+                    self.progress(
+                        f"Listed {self.report.product_links} book(s) from catalog pages. "
+                        "Product pages are not opened during Search."
+                    )
                     if len(product_urls) >= max_products:
                         break
-
-                product_urls = product_urls[:max_products]
-                self.report.product_links = len(product_urls)
-                self.progress(
-                    f"Found {len(product_urls)} book pages. Opening each one to check the year {year}…"
-                )
-
-            for index, product_url in enumerate(product_urls, start=1):
-                self._check_cancel()
-                checking(index, len(product_urls))
-                if product_url in seen_products:
-                    continue
-                seen_products.add(product_url)
-                try:
-                    book = self._book_from_url(product_url)
-                except (SiteError, requests.RequestException) as exc:
-                    self.report.product_failed += 1
-                    note = str(exc) if isinstance(exc, SiteError) else request_failure_message(exc, product_url)
-                    stub = Book(url=product_url)
-                    stub.mark_scan_failed(note)
-                    keep(stub)
-                    self.progress(f"{note} Continuing…")
-                    continue
-                if book is None:
-                    stub = Book(url=product_url)
-                    stub.mark_scan_failed("The book page returned no data.")
-                    keep(stub)
-                    self.report.product_failed += 1
-                elif not book.title:
-                    book.mark_scan_failed("Opened the page but could not read a title.")
-                    keep(book)
-                    self.report.product_failed += 1
-                elif book.matches_year(year, include_unknown_year):
-                    book.append_scan_log("Read the book page.")
-                    book.refresh_scan_status()
-                    keep(book)
-                    self.report.matched += 1
-                else:
-                    self.report.skipped_year += 1
-                self.progress(
-                    f"Checking book {index} of {len(product_urls)} — "
-                    f"{len(results)} kept for {year or 'any year'}"
-                )
         except CrawlCancelled:
             self.report.cancelled = True
             self.progress(f"Stopped. Keeping {len(results)} matching book(s) found so far.")
@@ -2919,30 +3086,28 @@ class BookCrawler:
         for extra_url in extra_urls:
             host = urlparse(extra_url).netloc
             site_name = site_display_name(extra_url)
-            self._emit("site", {"url": extra_url, "name": site_name, "index": 0, "total": 0})
+            self._emit("site", {"url": extra_url, "name": site_name, "index": 0, "total": 0, "phase": "fill"})
             extras = cached_books_for_host(host)
+            if not extras:
+                extras = [book for book in books if book.has_page_on(extra_url)]
             if extras:
-                self.progress(f"Filling missing fields from cached {host} pages…")
-            else:
-                self.progress(f"Filling missing fields from {host}…")
-                saved = self.report
-                self.report = CrawlReport()
-                extras = self.crawl(
-                    start_url=extra_url,
-                    year="",
-                    max_listing_pages=4,
-                    include_unknown_year=True,
+                self.progress(
+                    f"Filling missing fields from pages already read on {site_name} "
+                    f"({len(extras):,} page(s)). Not listing the catalog again."
                 )
-                extra_report = self.report
-                self.report = saved
-                self.report.listing_pages += extra_report.listing_pages
-                self.report.product_cached += extra_report.product_cached
-                self.report.product_fetched += extra_report.product_fetched
-            added = merge_catalog(books, extras)
+            elif max_searches > 0:
+                self.progress(f"No cached {site_name} pages. Searching for matching book pages…")
+            added = merge_catalog(books, extras) if extras else 0
             filled += added
             self.report.enriched += added
-            pending = [book for book in books if not book.has_page_on(extra_url)]
-            pending.sort(key=lambda book: (0 if book.missing_fields() else 1, book.display_title()))
+            if max_searches <= 0:
+                continue
+            pending = [
+                book
+                for book in books
+                if not book.has_page_on(extra_url) and book.missing_fields() and (book.title or "").strip()
+            ]
+            pending.sort(key=lambda book: book.display_title())
             searches = 0
             search_total = min(max_searches, len(pending))
             for book in pending:
@@ -2950,7 +3115,10 @@ class BookCrawler:
                     break
                 searches += 1
                 self.progress(
-                    f"Matching catalog pages {searches} of {search_total} on {host}: {book.display_title()}"
+                    f"Matching catalog pages {searches} of {search_total} on {site_name}: "
+                    f"{book.display_title()}"
+                    + (f" · {book.author}" if book.author else "")
+                    + (f" · {book.publisher}" if book.publisher else "")
                 )
                 self._emit(
                     "fill",
@@ -3044,8 +3212,9 @@ class BookCrawler:
         year: str,
         max_listing_pages: int = 5,
         include_unknown_year: bool = True,
+        seed_books: list[Book] | None = None,
     ) -> list[Book]:
-        books: list[Book] = []
+        books: list[Book] = list(seed_books or [])
         listing_urls = unique_catalog_urls(urls)
         requested = int(max_listing_pages or 0)
         page_limit = listing_page_cap(requested)
@@ -3090,12 +3259,12 @@ class BookCrawler:
                 self.progress(self.report.error)
                 return books
             self.progress(
-                f"Listed {len(books)} unique book(s) from {listed} site(s). "
+                f"Listed {len(books):,} unique book(s) from {listed} site(s). "
                 + " · ".join(notes)
-                + ". Filling catalog pages, then publisher pages…"
+                + ". Filling extra details from pages already in the cache. "
+                "Publisher websites are skipped during Search (use More on a book)."
             )
-            self.enrich_books(books, listing_urls, max_searches=max(len(books), 24))
-            self.enrich_from_publishers(books)
+            self.enrich_books(books, listing_urls, max_searches=0)
             self.report.matched = len(books)
             self.report.site_notes = notes
             return books

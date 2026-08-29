@@ -7,18 +7,26 @@ from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable
 
-from book_crawler import Book, format_price
+from book_crawler import Book, format_entry_stamp, format_price
 
 ROW_PAD = 6
 MARK_WIDTH = 36
+MIN_WIDTHS = {
+    "title": 200,
+    "author": 110,
+    "year": 56,
+    "status": 96,
+    "created": 138,
+    "modified": 138,
+    "database": 148,
+    "publisher": 110,
+    "code": 110,
+    "price": 72,
+}
 WEIGHTS = {
-    "title": 2.0,
+    "title": 2.2,
     "author": 0.9,
-    "year": 0.45,
-    "status": 0.8,
-    "publisher": 0.9,
-    "code": 0.8,
-    "price": 0.5,
+    "publisher": 0.8,
 }
 HEADINGS = {
     "mark": "☑",
@@ -26,11 +34,28 @@ HEADINGS = {
     "author": "Author",
     "year": "Year",
     "status": "Status",
+    "created": "Created",
+    "modified": "Updated",
+    "database": "To database",
     "publisher": "Publisher",
     "code": "ISBN / code",
     "price": "Price ₪",
 }
+COLUMNS = (
+    "mark",
+    "title",
+    "author",
+    "year",
+    "status",
+    "created",
+    "modified",
+    "database",
+    "publisher",
+    "code",
+    "price",
+)
 ROW_STATUSES = (
+    ("important", "Important"),
     ("checked", "Checked"),
     ("approved", "Approved"),
     ("failed", "Errors"),
@@ -67,7 +92,7 @@ class BookTable(ttk.Frame):
         self._row_font = tkfont.Font(self, family="Segoe UI", size=10)
         self._apply_rowheight()
 
-        columns = ("mark", "title", "author", "year", "status", "publisher", "code", "price")
+        columns = COLUMNS
         self.tree = ttk.Treeview(
             self,
             columns=columns,
@@ -79,23 +104,30 @@ class BookTable(ttk.Frame):
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
             if key == "price":
                 anchor = "e"
-            elif key in {"mark", "author", "year", "status", "publisher", "code"}:
+            elif key in {"mark", "author", "year", "status", "created", "modified", "database", "publisher", "code"}:
                 anchor = "center"
             else:
                 anchor = "w"
-            self.tree.column(key, anchor=anchor, stretch=key != "mark", width=80)
-        self.tree.column("mark", width=MARK_WIDTH, stretch=False, anchor="center")
-        self.tree.column("price", anchor="e")
+            stretch = key in WEIGHTS
+            width = MARK_WIDTH if key == "mark" else MIN_WIDTHS.get(key, 80)
+            self.tree.column(key, anchor=anchor, stretch=stretch, width=width, minwidth=width)
+        self.tree.column("mark", width=MARK_WIDTH, stretch=False, minwidth=MARK_WIDTH, anchor="center")
         self.tree.tag_configure("failed", background="#FDECEC", foreground="#B42318")
         self.tree.tag_configure("approved", background="#E4F7EA", foreground="#146C43")
         self.tree.tag_configure("final", background="#E8F0FE", foreground="#0B57D0")
-        scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.tag_configure("important", background="#FFF4D6", foreground="#8A5A00")
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Motion>", self._on_motion)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Shift-MouseWheel>", self._on_shift_wheel)
         self.bind("<Configure>", self._on_resize)
         self.after_idle(self._apply_rowheight)
 
@@ -106,7 +138,7 @@ class BookTable(ttk.Frame):
         ttk.Style(self).configure("Books.Treeview", rowheight=height)
 
     def _header_text(self, key: str, label: str) -> str:
-        if key not in {"mark", "title", "author", "publisher", "status"}:
+        if key not in {"mark", "title", "author", "publisher", "status", "created", "modified", "database"}:
             return label
         if self.sort_column != key:
             return f"{label}  ↕"
@@ -118,16 +150,24 @@ class BookTable(ttk.Frame):
         self._apply_column_widths(event.width)
 
     def _apply_column_widths(self, total_width: int) -> None:
-        usable = max(420, total_width - MARK_WIDTH - 22)
+        yscroll = 18
+        usable = max(640, total_width - MARK_WIDTH - yscroll)
+        flex_keys = tuple(WEIGHTS)
+        flex_min = sum(MIN_WIDTHS[key] for key in flex_keys)
+        fixed = sum(MIN_WIDTHS[key] for key in MIN_WIDTHS if key not in WEIGHTS)
+        leftover = max(flex_min, usable - fixed)
         weight_sum = sum(WEIGHTS.values())
-        widths = {key: int(usable * weight / weight_sum) for key, weight in WEIGHTS.items()}
-        other_max = max(width for key, width in widths.items() if key != "title")
-        cap = other_max * 2
-        if widths["title"] > cap:
-            widths["title"] = cap
-        self.tree.column("mark", width=MARK_WIDTH, stretch=False)
+        widths = {key: MIN_WIDTHS[key] for key in MIN_WIDTHS}
+        for key, weight in WEIGHTS.items():
+            widths[key] = max(MIN_WIDTHS[key], int(leftover * weight / weight_sum))
+        self.tree.column("mark", width=MARK_WIDTH, minwidth=MARK_WIDTH, stretch=False)
         for key, width in widths.items():
-            self.tree.column(key, width=max(48, width), stretch=True)
+            stretch = key in WEIGHTS
+            self.tree.column(key, width=width, minwidth=MIN_WIDTHS[key], stretch=stretch)
+
+    def _on_shift_wheel(self, event: tk.Event) -> str:
+        self.tree.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
 
     def set_books(
         self,
@@ -161,6 +201,7 @@ class BookTable(ttk.Frame):
             return
         self._by_iid[iid] = book
         self.tree.insert("", "end", iid=iid, values=self._row_values(book), tags=self._row_tags(book))
+        self.tree.see(iid)
 
     def set_filters(self, keys: set[str] | None) -> None:
         self.filter_keys = {key for key in (keys or set()) if key}
@@ -181,6 +222,8 @@ class BookTable(ttk.Frame):
             return (book.scan_status or "") == "successful"
         if key == "fully scanned":
             return (book.scan_status or "") == "fully scanned"
+        if key == "important":
+            return book.is_important()
         return False
 
     def _matches_filter(self, book: Book) -> bool:
@@ -196,7 +239,7 @@ class BookTable(ttk.Frame):
                 return
 
     def toggle_sort(self, column: str) -> None:
-        if column not in {"mark", "title", "author", "publisher", "status"}:
+        if column not in {"mark", "title", "author", "publisher", "status", "created", "modified", "database"}:
             return
         if self.sort_column == column:
             self.sort_reverse = not self.sort_reverse
@@ -220,6 +263,12 @@ class BookTable(ttk.Frame):
                 return book.publisher.casefold()
             if self.sort_column == "status":
                 return (book.status_label().casefold(), title)
+            if self.sort_column == "created":
+                return (book.created_at or "", title)
+            if self.sort_column == "modified":
+                return (book.modified_at or "", title)
+            if self.sort_column == "database":
+                return (book.database_passed_at or "", title)
             return title
 
         self.order.sort(key=value, reverse=self.sort_reverse)
@@ -233,6 +282,12 @@ class BookTable(ttk.Frame):
         if "checked" in self.filter_keys:
             self._reload()
 
+    def select_important(self) -> int:
+        self.checked = {book.key() for book in self.books if book.is_important()}
+        self._refresh_marks()
+        self._after_check_change()
+        return len(self.checked)
+
     def select_all(self) -> None:
         self.checked = {book.key() for book in self.books if self._matches_filter(book)}
         self._refresh_marks()
@@ -244,12 +299,20 @@ class BookTable(ttk.Frame):
         self._after_check_change()
 
     def _row_values(self, book: Book) -> tuple[str, ...]:
+        passed = format_entry_stamp(book.database_passed_at)
+        if book.database_needs_update():
+            passed = f"{passed} · update" if passed else "update"
+        elif book.excel_passed and not passed:
+            passed = "on file"
         return (
             "☑" if book.key() in self.checked else "☐",
             book.display_title(),
             book.author,
             book.year,
             book.status_label(),
+            format_entry_stamp(book.created_at) or "—",
+            format_entry_stamp(book.modified_at) or "—",
+            passed or "—",
             book.publisher,
             book.identity_code() or book.scanner_id,
             format_price(book.price_ils),
@@ -257,8 +320,12 @@ class BookTable(ttk.Frame):
 
     def _row_tags(self, book: Book) -> tuple[str, ...]:
         tone = book.display_tone()
+        if tone == "error" or (book.scan_status or "") == "failed":
+            return ("failed",)
+        if book.is_important():
+            return ("important",)
         if tone:
-            return ("failed" if tone == "error" else tone,)
+            return (tone,)
         return ()
 
     def _reload(self) -> None:
