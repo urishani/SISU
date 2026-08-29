@@ -143,6 +143,24 @@ class BookTable(ttk.Frame):
         self.order = list(range(len(books)))
         self._sort_order()
         self._reload()
+        self._after_check_change()
+
+    def add_row(self, book: Book) -> None:
+        try:
+            index = next(i for i, item in enumerate(self.books) if item is book)
+        except StopIteration:
+            self.books.append(book)
+            index = len(self.books) - 1
+        if index not in self.order:
+            self.order.append(index)
+        if not self._matches_filter(book):
+            return
+        iid = f"{index}:{book.key()}"
+        if iid in self._by_iid:
+            self.refresh_book(book)
+            return
+        self._by_iid[iid] = book
+        self.tree.insert("", "end", iid=iid, values=self._row_values(book), tags=self._row_tags(book))
 
     def set_filters(self, keys: set[str] | None) -> None:
         self.filter_keys = {key for key in (keys or set()) if key}

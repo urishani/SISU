@@ -29,7 +29,19 @@ from app_config import (
     normalize_site_url,
     save_config,
 )
-from book_crawler import Book, BookCrawler, CrawlCancelled, CrawlReport, format_person_name, format_price, parse_site_urls, site_display_name, site_host
+from book_crawler import (
+    Book,
+    BookCrawler,
+    CrawlCancelled,
+    CrawlReport,
+    catalog_listing_url,
+    format_person_name,
+    format_price,
+    listing_url_key,
+    parse_site_urls,
+    site_display_name,
+    site_host,
+)
 from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
 from field_map import ALIASES_PATH, EXCEL_TARGETS, reload_aliases, write_field_report
@@ -55,6 +67,7 @@ from scan_lists import (
     save_working,
     set_named_flags,
     stash_exists,
+    stash_has_data,
     stash_summary,
 )
 
@@ -185,10 +198,15 @@ class BookCatalogApp(tk.Tk):
         self.excel_path = tk.StringVar(value="")
         self._excel_dir = Path(str(load_config().get("excel_dir") or "").strip() or APP_DIR)
         self.year = tk.StringVar(value="2026")
-        self.max_pages = tk.IntVar(value=5)
+        self.max_pages = tk.IntVar(value=40)
+        self.no_page_limit = tk.BooleanVar(value=False)
+        self._pages_total = 0
         self.include_unknown = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Start a new list, or open a saved scan list.")
+        self.work_hint = tk.StringVar(value="")
+        self.scan_live = tk.StringVar(value="")
         self.summary = tk.StringVar(value="")
+        self._progress_determinate = True
         self.colored_info = tk.StringVar(value="")
         self.excel_columns: list[dict] = []
         self.excel_all_columns: list[dict] = []
@@ -228,12 +246,24 @@ class BookCatalogApp(tk.Tk):
         self._update_check_after: str | int | None = None
         self._cancel = threading.Event()
         self._busy = False
+        self._follow_search = True
+        self._programmatic_select = False
+        self._detail_job: str | None = None
+        self._pending_detail: Book | None = None
+        self._scan_site = ""
+        self._scan_found = 0
+        self._scan_checking = 0
+        self._scan_total = 0
         self._ui_queue: queue.Queue = queue.Queue()
+        self._clean_fingerprint = ""
+        self._list_actions_ready = False
 
         self._setup_style()
         self._build()
         self.refresh_excel_info()
         self._restore_working_list()
+        self._list_actions_ready = True
+        self._refresh_list_status()
         self._mtimes = _source_mtimes()
         self.after(120, self._drain_queue)
         self.after(900, self._watch_for_reload)
@@ -250,6 +280,13 @@ class BookCatalogApp(tk.Tk):
         style.configure("Header.TLabel", background=NAVY, foreground=WHITE, font=("Segoe UI", 16, "bold"))
         style.configure("Sub.TLabel", background=NAVY, foreground="#E8D5B5", font=("Segoe UI", 9))
         style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        try:
+            style.map(
+                "Accent.TButton",
+                foreground=[("disabled", "#8A8A8A"), ("!disabled", NAVY)],
+            )
+        except tk.TclError:
+            pass
 
     def _build(self) -> None:
         header = tk.Frame(self, bg=NAVY)
@@ -312,7 +349,7 @@ class BookCatalogApp(tk.Tk):
         body.pack(fill="both", expand=True, padx=12, pady=8)
         self._layout_body = body
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(4, weight=1)
+        body.rowconfigure(3, weight=1)
 
         lists = ttk.LabelFrame(body, text="Scan list", padding=(8, 4, 8, 6))
         lists.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -332,15 +369,24 @@ class BookCatalogApp(tk.Tk):
         new_btn = ttk.Button(list_btns, text="New", command=self.new_working_list)
         new_btn.pack(side="left", padx=(0, 4))
         self._callout(new_btn, "Start a fresh working list. The current unsaved list can be stashed first if you need it.")
-        stash_btn = ttk.Button(list_btns, text="Stash", command=self.stash_working_list)
-        stash_btn.pack(side="left", padx=(0, 4))
-        self._callout(stash_btn, "Put this working list aside so you can start another search.")
-        restore_btn = ttk.Button(list_btns, text="Restore stash", command=self.restore_stash)
-        restore_btn.pack(side="left", padx=(0, 4))
-        self._callout(restore_btn, "Bring back the list you stashed.")
-        save_btn = ttk.Button(list_btns, text="Save list", command=self.save_current_list)
-        save_btn.pack(side="left", padx=(0, 4))
-        self._callout(save_btn, "Save this scan list by name so you can open it later.")
+        self.stash_btn = ttk.Button(list_btns, text="Stash", command=self.stash_working_list)
+        self.stash_btn.pack(side="left", padx=(0, 4))
+        self._callout(
+            self.stash_btn,
+            "Put a nameless working list aside. Disabled when this list already has a name — save it instead.",
+        )
+        self.restore_btn = ttk.Button(list_btns, text="Restore stash", command=self.restore_stash)
+        self.restore_btn.pack(side="left", padx=(0, 4))
+        self._callout(
+            self.restore_btn,
+            "Bring back the stashed list. Disabled when the stash is empty.",
+        )
+        self.save_btn = ttk.Button(list_btns, text="Save list", command=self.save_current_list)
+        self.save_btn.pack(side="left", padx=(0, 4))
+        self._callout(
+            self.save_btn,
+            "Highlighted when this list has unsaved changes. Disabled when there is nothing new to save.",
+        )
         open_lists_btn = ttk.Button(list_btns, text="Open lists…", command=self.open_lists_manager)
         open_lists_btn.pack(side="left")
         self._callout(open_lists_btn, "Browse saved scan lists.")
@@ -384,10 +430,11 @@ class BookCatalogApp(tk.Tk):
         self.url_text.grid(row=0, column=0, sticky="nw")
         url_scroll_y.grid(row=0, column=1, sticky="ns")
         self.url_text.insert("1.0", DEFAULT_URLS)
+        self.url_text.tag_configure("searching", background="#FDE6C4", foreground="#9A3412")
         self.url_text.bind("<<Modified>>", self._on_url_text_modified)
         self._callout(
             self.url_text,
-            "One bookstore or catalog URL per line. Search reads all of them, not only the first.",
+            "One bookstore or catalog URL per line. Search reads all of them, merges unique titles, and does not stop at the first list.",
         )
         self.excel_path.trace_add("write", lambda *_args: self._fit_search_fields())
 
@@ -399,10 +446,22 @@ class BookCatalogApp(tk.Tk):
         self.year_entry = ttk.Entry(year_row, textvariable=self.year, width=8)
         self.year_entry.pack(side="left", padx=(6, 10))
         self._callout(self.year_entry, "Keep books with this publication year, for example 2026.")
-        ttk.Label(year_row, text="Max pages").pack(side="left")
-        self.pages_spin = ttk.Spinbox(year_row, from_=1, to=40, textvariable=self.max_pages, width=5)
-        self.pages_spin.pack(side="left", padx=(6, 0))
-        self._callout(self.pages_spin, "How many listing pages to read on each bookstore site.")
+        self.pages_label = ttk.Label(year_row, text="Max pages")
+        self.pages_label.pack(side="left")
+        self.pages_spin = ttk.Spinbox(year_row, from_=1, to=10000, textvariable=self.max_pages, width=5)
+        self.pages_spin.pack(side="left", padx=(6, 6))
+        self._callout(
+            self.pages_spin,
+            "How many catalog listing pages to read on each site. The number in parentheses is the site’s total pages once Search finds it.",
+        )
+        self.no_limit_check = ttk.Checkbutton(
+            year_row, text="No limit", variable=self.no_page_limit, command=self._on_page_limit_toggle
+        )
+        self.no_limit_check.pack(side="left")
+        self._callout(
+            self.no_limit_check,
+            "Read every catalog page on each site. Turn this off to cap Search at the Max pages number.",
+        )
         self.unknown_check = ttk.Checkbutton(
             search_side, text="Also keep books with no year listed", variable=self.include_unknown
         )
@@ -414,7 +473,7 @@ class BookCatalogApp(tk.Tk):
         self.search_btn.pack(side="left", padx=(0, 4))
         self._callout(
             self.search_btn,
-            "List every matching book from all bookstore URLs, then fill catalog links and publisher pages.",
+            "Search every bookstore URL, merge unique titles into one list, then fill catalog and publisher pages.",
         )
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self.stop_btn.pack(side="left")
@@ -423,13 +482,8 @@ class BookCatalogApp(tk.Tk):
         self.colored_info_label = ttk.Label(form, textvariable=self.colored_info, wraplength=1, justify="left")
         self.colored_info_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
-        meta = ttk.Frame(body)
-        meta.grid(row=2, column=0, sticky="ew", pady=(4, 4))
-        meta.columnconfigure(0, weight=1)
-        self.progress = ttk.Progressbar(meta, mode="indeterminate")
-        self.progress.grid(row=0, column=0, sticky="ew")
         self.summary_label = ttk.Label(body, textvariable=self.summary, wraplength=1, justify="left")
-        self.summary_label.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        self.summary_label.grid(row=2, column=0, sticky="ew", pady=(4, 4))
 
         split = ttk.Panedwindow(body, orient="horizontal")
         list_frame = ttk.Frame(split)
@@ -574,27 +628,56 @@ class BookCatalogApp(tk.Tk):
         self.desc_view.pack(fill="both", expand=True)
 
         footer = ttk.Frame(body)
-        select_all_btn = ttk.Button(footer, text="Select all", command=self.table.select_all)
+        work_row = ttk.Frame(footer)
+        work_row.pack(fill="x")
+        work_row.columnconfigure(1, weight=1)
+        self.work_label = ttk.Label(work_row, textvariable=self.work_hint, width=12)
+        self.work_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self._callout(self.work_label, "Working, Done, Stopped, or Failed, plus a count such as 12 / 150 while Search is running.")
+        self.progress = ttk.Progressbar(work_row, mode="determinate", maximum=100, value=0)
+        self.progress.grid(row=0, column=1, sticky="ew")
+        self._callout(self.progress, "Fills while Search or a publisher lookup is running. Empty when SISU is idle.")
+        self._progress_determinate = True
+        self.scan_live_label = ttk.Label(footer, textvariable=self.scan_live, wraplength=1, justify="left")
+        self.scan_live_label.pack(fill="x", pady=(4, 0))
+        self._callout(
+            self.scan_live_label,
+            "The site being searched, how many books are already found, and how many book pages are being checked.",
+        )
+        action_row = ttk.Frame(footer)
+        action_row.pack(fill="x", pady=(4, 0))
+        select_all_btn = ttk.Button(action_row, text="Select all", command=self.table.select_all)
         select_all_btn.pack(side="left", pady=2)
         self._callout(select_all_btn, "Tick every book currently shown in the table.")
-        clear_sel_btn = ttk.Button(footer, text="Clear selection", command=self.table.clear_selection)
+        clear_sel_btn = ttk.Button(action_row, text="Clear selection", command=self.table.clear_selection)
         clear_sel_btn.pack(side="left", padx=6, pady=2)
         self._callout(clear_sel_btn, "Clear the ☑ ticks. This does not delete books from the list.")
-        self.status_label = ttk.Label(footer, textvariable=self.status, wraplength=1, justify="left")
+        self.status_label = ttk.Label(action_row, textvariable=self.status, wraplength=1, justify="left")
         self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=2)
-        self._callout(self.status_label, "What SISU is doing right now.")
-        self._callout(self.progress, "Progress while Search or a publisher lookup is running.")
+        self._callout(self.status_label, "What SISU is doing right now, including progress, success, and errors.")
         self._callout(self.summary_label, "Summary of the last search: how many books were listed and filled.")
-        footer.grid(row=5, column=0, sticky="ew", pady=(6, 0))
-        split.grid(row=4, column=0, sticky="nsew")
+        footer.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        split.grid(row=3, column=0, sticky="nsew")
         self._bind_list_excel_path(rename_existing=False)
+        self.list_title.trace_add("write", lambda *_args: self._on_list_fields_changed())
+        self.year.trace_add("write", lambda *_args: self._on_list_fields_changed())
+        self.max_pages.trace_add("write", lambda *_args: self._on_list_fields_changed())
+        self.no_page_limit.trace_add("write", lambda *_args: self._on_list_fields_changed())
+        self.include_unknown.trace_add("write", lambda *_args: self._on_list_fields_changed())
         body.bind("<Configure>", self._sync_full_width_wraps, add="+")
         self.list_status_label.bind(
             "<Configure>",
             lambda event: self._set_label_wrap(self.list_status_label, max(80, event.width - 4)),
             add="+",
         )
-        footer.bind("<Configure>", lambda event: self._set_label_wrap(self.status_label, max(120, event.width - 220)), add="+")
+        footer.bind(
+            "<Configure>",
+            lambda event: (
+                self._set_label_wrap(self.status_label, max(120, event.width - 220)),
+                self._set_label_wrap(self.scan_live_label, max(120, event.width - 8)),
+            ),
+            add="+",
+        )
 
     def _callout(self, widget: tk.Misc, text: str) -> None:
         HoverTip(widget, text)
@@ -621,6 +704,7 @@ class BookCatalogApp(tk.Tk):
             return
         url_box.edit_modified(False)
         self._fit_search_fields()
+        self._on_list_fields_changed()
 
     def _fit_search_fields(self) -> None:
         url_box = getattr(self, "url_text", None)
@@ -1263,7 +1347,7 @@ class BookCatalogApp(tk.Tk):
             list_id=self._list_id,
             locked=self._list_locked,
             archived=self._list_archived,
-            max_pages=int(self.max_pages.get() or 5),
+            max_pages=self._page_limit_setting(),
             include_unknown=bool(self.include_unknown.get()),
             report=report if report is not None else self._list_report,
             notes=self._list_notes,
@@ -1278,11 +1362,76 @@ class BookCatalogApp(tk.Tk):
         save_working(self._current_payload())
         self._refresh_list_status()
 
+    @staticmethod
+    def _is_placeholder_title(title: str) -> bool:
+        return (title or "").strip().casefold() in {"", "new", "untitled"}
+
+    def _list_has_name(self) -> bool:
+        if str(self._list_id or "").strip():
+            return True
+        return not self._is_placeholder_title(self.list_title.get())
+
+    def _fingerprint_payload(self, data: dict | None) -> str:
+        payload = dict(data or {})
+        books = payload.get("books") or []
+        slim_books = []
+        for item in books:
+            if not isinstance(item, dict):
+                continue
+            slim_books.append(
+                {key: item.get(key) for key in sorted(item) if key not in {"extra"}}
+            )
+        body = {
+            "title": str(payload.get("title") or "").strip(),
+            "urls": list(payload.get("urls") or []),
+            "year": str(payload.get("year") or "").strip(),
+            "max_pages": int(payload.get("max_pages") or 0),
+            "include_unknown": bool(payload.get("include_unknown")),
+            "notes": str(payload.get("notes") or ""),
+            "locked": bool(payload.get("locked")),
+            "archived": bool(payload.get("archived")),
+            "books": slim_books,
+        }
+        return json.dumps(body, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _list_fingerprint(self) -> str:
+        try:
+            return self._fingerprint_payload(self._current_payload())
+        except tk.TclError:
+            return ""
+
+    def _mark_list_clean(self) -> None:
+        self._clean_fingerprint = self._list_fingerprint()
+
+    def _list_is_dirty(self) -> bool:
+        return self._list_fingerprint() != self._clean_fingerprint
+
+    def _on_list_fields_changed(self) -> None:
+        if not getattr(self, "_list_actions_ready", False):
+            return
+        self._refresh_list_status()
+
+    def _update_list_action_buttons(self) -> None:
+        if not getattr(self, "save_btn", None):
+            return
+        named = self._list_has_name()
+        dirty = self._list_is_dirty()
+        can_save = dirty and not self._list_locked and not self._busy
+        can_stash = (not named) and dirty and not self._list_locked and not self._busy
+        can_restore = stash_has_data() and not self._busy
+        self.save_btn.configure(
+            state="normal" if can_save else "disabled",
+            style="Accent.TButton" if can_save else "TButton",
+        )
+        self.stash_btn.configure(state="normal" if can_stash else "disabled")
+        self.restore_btn.configure(state="normal" if can_restore else "disabled")
+
     def _refresh_list_status(self) -> None:
+        dirty = self._list_is_dirty() if getattr(self, "_list_actions_ready", False) else False
         if self._list_locked:
             kind = "Locked list"
         elif self._list_id:
-            kind = "Saved list"
+            kind = "Saved list · unsaved changes" if dirty else "Saved list"
         elif self.books:
             kind = "Working list · unsaved"
         else:
@@ -1290,11 +1439,12 @@ class BookCatalogApp(tk.Tk):
         extra = []
         if self._list_archived:
             extra.append("archived")
-        if stash_exists():
+        if stash_has_data():
             extra.append("stash ready")
         suffix = f" · {', '.join(extra)}" if extra else ""
         self.list_status.set(f"{kind} · {len(self.books)} book(s){suffix}")
         self._apply_lock_state()
+        self._update_list_action_buttons()
 
     def _apply_lock_state(self) -> None:
         locked = self._list_locked and not self._busy
@@ -1306,8 +1456,9 @@ class BookCatalogApp(tk.Tk):
         except tk.TclError:
             pass
         self.year_entry.configure(state=edit_state)
-        self.pages_spin.configure(state=edit_state)
+        self.no_limit_check.configure(state=edit_state)
         self.unknown_check.configure(state=edit_state)
+        self._sync_page_limit_state()
         self.list_title_entry.configure(state=edit_state)
         folder_state = "disabled" if self._list_locked else "normal"
         self.excel_folder_btn.configure(state=folder_state)
@@ -1319,8 +1470,9 @@ class BookCatalogApp(tk.Tk):
         elif self._selected_book and not self._busy:
             self.more_btn.configure(state="normal")
             self._update_workflow_buttons(self._selected_book)
+        self._update_list_action_buttons()
 
-    def _apply_payload(self, data: dict, *, status: str = "") -> None:
+    def _apply_payload(self, data: dict, *, status: str = "", as_saved: bool | None = None) -> None:
         self._list_id = str(data.get("id") or "")
         self._list_locked = bool(data.get("locked"))
         self._list_archived = bool(data.get("archived"))
@@ -1335,11 +1487,18 @@ class BookCatalogApp(tk.Tk):
         self.url_text.insert("1.0", "\n".join(urls))
         if data.get("year") not in (None, ""):
             self.year.set(str(data.get("year")))
-        if data.get("max_pages"):
+        if "max_pages" in data and data.get("max_pages") is not None:
             try:
-                self.max_pages.set(int(data.get("max_pages")))
-            except (TypeError, ValueError, tk.TclError):
-                pass
+                value = int(data.get("max_pages"))
+            except (TypeError, ValueError):
+                value = 40
+            if value <= 0:
+                self.no_page_limit.set(True)
+            else:
+                self.no_page_limit.set(False)
+                self.max_pages.set(value)
+            self._set_pages_total(0)
+            self._sync_page_limit_state()
         if "include_unknown" in data:
             self.include_unknown.set(bool(data.get("include_unknown")))
         excel_dir = str(data.get("excel_dir") or "").strip()
@@ -1348,9 +1507,13 @@ class BookCatalogApp(tk.Tk):
         self.books = books_from_payload(data)
         self._prepare_books(self.books)
         self.table.set_books(self.books, keep_checks=False)
-        self._selected_book = None
+        self._clear_selected_book()
         self.refresh_excel_info()
         self._persist_working()
+        if as_saved is True:
+            self._mark_list_clean()
+        elif as_saved is False:
+            self._clean_fingerprint = ""
         report = self._list_report
         if report:
             try:
@@ -1373,6 +1536,14 @@ class BookCatalogApp(tk.Tk):
             data,
             status=f"Restored the last working list “{data.get('title') or 'New'}” with {len(data.get('books') or [])} book(s).",
         )
+        if self._list_id:
+            named = load_named(self._list_id)
+            self._clean_fingerprint = self._fingerprint_payload(named) if named else ""
+        elif self.books or not self._is_placeholder_title(self.list_title.get()):
+            self._clean_fingerprint = ""
+        else:
+            self._mark_list_clean()
+        self._refresh_list_status()
 
     def new_working_list(self) -> None:
         if self._busy:
@@ -1387,14 +1558,22 @@ class BookCatalogApp(tk.Tk):
             title="New",
             urls=urls,
             year=self.year.get().strip(),
-            max_pages=int(self.max_pages.get() or 5),
+            max_pages=self._page_limit_setting(),
             include_unknown=bool(self.include_unknown.get()),
         )
         payload["excel_dir"] = str(self._excel_dir or "")
-        self._apply_payload(payload, status="Started a new empty working list.")
+        self._apply_payload(payload, status="Started a new empty working list.", as_saved=True)
 
     def stash_working_list(self) -> None:
         if self._busy:
+            return
+        if self._list_has_name():
+            messagebox.showinfo(
+                "Stash",
+                "This list already has a name. Save it instead of stashing. Stash is only for nameless working lists.",
+            )
+            return
+        if not self._list_is_dirty() and not self.books:
             return
         if stash_exists() and not messagebox.askyesno(
             "Stash",
@@ -1407,17 +1586,21 @@ class BookCatalogApp(tk.Tk):
             title="New",
             urls=urls,
             year=self.year.get().strip(),
-            max_pages=int(self.max_pages.get() or 5),
+            max_pages=self._page_limit_setting(),
             include_unknown=bool(self.include_unknown.get()),
         )
         payload["excel_dir"] = str(self._excel_dir or "")
-        self._apply_payload(payload, status="Stashed the previous list. This working list is empty for a new search.")
+        self._apply_payload(
+            payload,
+            status="Stashed the previous list. This working list is empty for a new search.",
+            as_saved=True,
+        )
 
     def restore_stash(self) -> None:
         if self._busy:
             return
         data = load_stash()
-        if not data:
+        if not data or not stash_has_data():
             messagebox.showinfo("Stash", "There is no stashed list to restore.")
             return
         if self.books and not messagebox.askyesno(
@@ -1425,7 +1608,7 @@ class BookCatalogApp(tk.Tk):
             f"Replace the current working list with the stash?\n\n{stash_summary()}",
         ):
             return
-        self._apply_payload(data, status=f"Restored stash: {stash_summary()}.")
+        self._apply_payload(data, status=f"Restored stash: {stash_summary()}.", as_saved=False)
 
     def save_current_list(self) -> None:
         if self._list_locked:
@@ -1449,6 +1632,7 @@ class BookCatalogApp(tk.Tk):
         self._list_created_at = str(payload.get("created_at") or "")
         self._bind_list_excel_path(rename_existing=True)
         self._persist_working()
+        self._mark_list_clean()
         self._set_status(f"Saved list “{title}”.")
         if self._lists_popup is not None:
             self._reload_lists_table()
@@ -1578,7 +1762,7 @@ class BookCatalogApp(tk.Tk):
             "Replace the current working list with this saved list?\nStash first if you want to keep the unsaved books.",
         ):
             return
-        self._apply_payload(data)
+        self._apply_payload(data, as_saved=True)
         self._close_lists_popup()
 
     def _rename_selected_list(self) -> None:
@@ -1602,6 +1786,7 @@ class BookCatalogApp(tk.Tk):
             self.list_title.set(entered.strip())
             self._bind_list_excel_path(rename_existing=not self._list_locked)
             self._persist_working()
+            self._mark_list_clean()
         self._reload_lists_table()
 
     def _flag_selected_list(self, locked: bool | None = None, archived: bool | None = None) -> None:
@@ -1617,6 +1802,7 @@ class BookCatalogApp(tk.Tk):
             if archived is not None:
                 self._list_archived = bool(archived)
             self._persist_working()
+            self._mark_list_clean()
         self._reload_lists_table()
 
     def _delete_selected_list(self) -> None:
@@ -1652,6 +1838,8 @@ class BookCatalogApp(tk.Tk):
             self._list_locked = False
             self._list_archived = False
             self._persist_working()
+            self._clean_fingerprint = ""
+            self._refresh_list_status()
         self._reload_lists_table()
         self._set_status(f"Deleted list “{title}”.")
 
@@ -1677,14 +1865,26 @@ class BookCatalogApp(tk.Tk):
         self.final_btn.configure(state="disabled")
         self.unfinal_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.progress.start(12)
-        self._set_status("Starting crawl…")
+        self._update_list_action_buttons()
+        self.books = []
+        self.table.set_books(self.books, keep_checks=False)
+        self._clear_selected_book()
+        self._follow_search = True
+        self._scan_site = ""
+        self._scan_found = 0
+        self._scan_checking = 0
+        self._scan_total = 0
+        self.scan_live.set("")
+        self._set_pages_total(0)
+        self._highlight_site_url("")
+        self._begin_work("Working…")
+        self._set_status("Starting search. Listing books from every bookstore URL…")
         thread = threading.Thread(
             target=self._run_crawl,
             args=(
                 urls,
                 year,
-                int(self.max_pages.get() or 5),
+                self._page_limit_setting(),
                 bool(self.include_unknown.get()),
                 self.list_title.get().strip(),
                 self._list_id,
@@ -1717,6 +1917,7 @@ class BookCatalogApp(tk.Tk):
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
             progress=lambda msg: self._ui_queue.put(("status", msg)),
+            event=lambda kind, data: self._ui_queue.put(("event", (kind, data))),
         )
         try:
             self._ui_queue.put(("status", f"Searching {len(urls)} bookstore and catalog URL(s)…"))
@@ -1727,23 +1928,26 @@ class BookCatalogApp(tk.Tk):
                 include_unknown_year=include_unknown,
             )
             self._prepare_books(books)
-            save_working(
-                build_payload(
-                    books=books,
-                    urls=urls,
-                    year=year,
-                    title=title or default_scan_title(len(books), year),
-                    list_id=list_id,
-                    locked=locked,
-                    archived=archived,
-                    max_pages=max_pages,
-                    include_unknown=include_unknown,
-                    report=asdict(crawler.report),
-                    notes=notes,
-                    created_at=created_at,
-                    excel_dir=str(self._excel_dir or ""),
+            try:
+                save_working(
+                    build_payload(
+                        books=books,
+                        urls=urls,
+                        year=year,
+                        title=title or default_scan_title(len(books), year),
+                        list_id=list_id,
+                        locked=locked,
+                        archived=archived,
+                        max_pages=max_pages,
+                        include_unknown=include_unknown,
+                        report=asdict(crawler.report),
+                        notes=notes,
+                        created_at=created_at,
+                        excel_dir=str(self._excel_dir or ""),
+                    )
                 )
-            )
+            except OSError:
+                pass
             try:
                 write_field_report(self.excel_path.get().strip() or None)
             except Exception:
@@ -1753,6 +1957,13 @@ class BookCatalogApp(tk.Tk):
             self._ui_queue.put(("cancelled", None))
         except Exception as exc:
             self._ui_queue.put(("error", str(exc)))
+        finally:
+            try:
+                from book_cache import flush_page_cache
+
+                flush_page_cache()
+            except Exception:
+                pass
 
     def _drain_queue(self) -> None:
         while True:
@@ -1761,10 +1972,13 @@ class BookCatalogApp(tk.Tk):
             except queue.Empty:
                 break
             if kind == "status":
-                self.status.set(str(payload))
+                self._set_status(str(payload))
                 if self._lookup_popup is not None:
                     self._lookup_status.set(str(payload))
                     self._append_lookup_log(str(payload))
+            elif kind == "event":
+                event_kind, data = payload
+                self._on_search_event(str(event_kind), data or {})
             elif kind == "lookup_step":
                 self._set_lookup_step(payload)
             elif kind == "done":
@@ -1773,7 +1987,7 @@ class BookCatalogApp(tk.Tk):
             elif kind == "cancelled":
                 self._finish_search(self.books, cancelled=True)
             elif kind == "error":
-                self._finish_search([], cancelled=False)
+                self._finish_search(self.books, cancelled=False, failed=True, error=str(payload))
                 messagebox.showerror("Search failed", str(payload))
             elif kind == "more_done":
                 self._finish_more(payload)
@@ -1790,26 +2004,52 @@ class BookCatalogApp(tk.Tk):
                 self._finish_self_update()
         self.after(120, self._drain_queue)
 
-    def _finish_search(self, books: list[Book], cancelled: bool, report: CrawlReport | None = None) -> None:
+    def _finish_search(
+        self,
+        books: list[Book],
+        cancelled: bool,
+        report: CrawlReport | None = None,
+        failed: bool = False,
+        error: str = "",
+    ) -> None:
         self._busy = False
         self.stop_btn.configure(state="disabled")
-        self.progress.stop()
+        self._follow_search = True
+        self._highlight_site_url("")
+        if not failed:
+            self.scan_live.set("")
         if books:
             self.books = books
             self._prepare_books(self.books)
             self.table.set_books(self.books, keep_checks=False)
         if (not self.list_title.get().strip() or self.list_title.get().strip() == "New") and self.books:
             self.list_title.set(default_scan_title(len(self.books), self.year.get().strip()))
+        if self._selected_book not in self.books:
+            self._clear_selected_book()
+        elif self._selected_book:
+            self.show_book(self._selected_book)
         if report is None:
             report = CrawlReport(matched=len(self.books), cancelled=cancelled)
         report.error_books = sum(1 for book in self.books if (book.scan_status or "") == "failed")
         self._list_report = asdict(report)
         self._persist_working(self._list_report)
         year = self.year.get().strip() or "any year"
-        prefix = "Stopped. " if cancelled else ""
-        self.status.set(
-            f"{prefix}{len(self.books)} book(s) from {year}. The working list is kept until you save or clear it."
-        )
+        list_failed = failed or bool(report.error and not self.books and not cancelled)
+        if cancelled:
+            self._end_work("stopped")
+            self._set_status(
+                f"Stopped. {len(self.books)} book(s) from {year} are kept in the working list."
+            )
+        elif list_failed:
+            self._end_work("failed")
+            detail = (error or report.error or "See the error message.").strip()
+            self._set_status(f"Search failed. {detail}")
+        else:
+            self._end_work("done")
+            self._set_status(
+                f"Search finished. {len(self.books)} book(s) from {year}. "
+                "The working list is kept until you save or clear it."
+            )
         self.summary.set(report.summary())
         if self._selected_book:
             self.more_btn.configure(state="normal")
@@ -1817,9 +2057,13 @@ class BookCatalogApp(tk.Tk):
         self._refresh_list_status()
 
     def _on_check_change(self) -> None:
+        if self._busy:
+            return
         self._set_status(f"{len(self.table.checked)} selected")
 
     def show_book(self, book: Book) -> None:
+        if self._busy and not self._programmatic_select:
+            self._follow_search = False
         self._selected_book = book
         if not self._busy:
             self.more_btn.configure(state="normal")
@@ -1902,7 +2146,8 @@ class BookCatalogApp(tk.Tk):
         self.final_btn.configure(state="disabled")
         self.unfinal_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.progress.start(12)
+        self._update_list_action_buttons()
+        self._begin_work("Working…")
         label = books[0].publisher.strip() if books else "publisher"
         site = resolve_publisher_site(label) or ""
         self._set_status(f"Looking up missing details on the publisher site for {len(books)} book(s)…")
@@ -2271,7 +2516,7 @@ class BookCatalogApp(tk.Tk):
         self._busy = False
         self.search_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.progress.stop()
+        self._update_list_action_buttons()
         remap = (payload or {}).get("remap") or None
         selected = (payload or {}).get("selected") or self._selected_book
         self._prepare_books(self.books)
@@ -2316,6 +2561,12 @@ class BookCatalogApp(tk.Tk):
                 f"No matching book page was found on the publisher site for {publisher}. "
                 "No new fields were added."
             )
+        if payload is None or failed:
+            self._end_work("failed")
+        elif payload.get("cancelled"):
+            self._end_work("stopped")
+        else:
+            self._end_work("done")
         self._set_status(summary)
         self._complete_lookup_popup(summary, failed=failed)
         if selected:
@@ -2380,6 +2631,19 @@ class BookCatalogApp(tk.Tk):
             child.destroy()
         self._value_labels = []
         self._detail_row = 0
+
+    def _clear_selected_book(self) -> None:
+        self._selected_book = None
+        self._expanded_detail_keys.clear()
+        self._clear_detail_panel()
+        self._set_description("")
+        self.desc_new_label.pack_forget()
+        self.more_btn.configure(state="disabled")
+        self._update_workflow_buttons(None)
+        try:
+            self.table.tree.selection_remove(*self.table.tree.selection())
+        except tk.TclError:
+            pass
 
     def _detail_first_line(self, text: str) -> str:
         for line in str(text or "").splitlines():
@@ -2717,7 +2981,10 @@ class BookCatalogApp(tk.Tk):
             self._prepare_books(self.books)
             self.table.set_books(self.books, keep_checks=True)
             if selected not in self.books:
-                self._selected_book = None
+                self._clear_selected_book()
+            elif selected:
+                self.table.select_book(selected)
+                self.show_book(selected)
             self._skip_cache_restore = True
             self._persist_working()
             self._refresh_list_status()
@@ -2963,6 +3230,240 @@ class BookCatalogApp(tk.Tk):
 
     def _set_status(self, text: str) -> None:
         self.status.set(text)
+        self._sync_work_progress(text)
+
+    def _page_limit_setting(self) -> int:
+        if bool(self.no_page_limit.get()):
+            return 0
+        try:
+            return max(1, int(self.max_pages.get() or 40))
+        except (TypeError, ValueError, tk.TclError):
+            return 40
+
+    def _on_page_limit_toggle(self) -> None:
+        self._sync_page_limit_state()
+        self._on_list_fields_changed()
+
+    def _sync_page_limit_state(self) -> None:
+        locked = bool(self._list_locked)
+        try:
+            self.no_limit_check.configure(state="disabled" if locked else "normal")
+        except tk.TclError:
+            pass
+        if locked or bool(self.no_page_limit.get()):
+            self.pages_spin.configure(state="disabled")
+        else:
+            self.pages_spin.configure(state="normal")
+
+    def _set_pages_total(self, total: int) -> None:
+        try:
+            self._pages_total = max(0, int(total or 0))
+        except (TypeError, ValueError):
+            self._pages_total = 0
+        if self._pages_total:
+            self.pages_label.configure(text=f"Max pages ({self._pages_total})")
+        else:
+            self.pages_label.configure(text="Max pages")
+
+    def _highlight_site_url(self, url: str) -> None:
+        box = self.url_text
+        try:
+            box.tag_remove("searching", "1.0", "end")
+        except tk.TclError:
+            return
+        if not url:
+            return
+        target = listing_url_key(url)
+        host = site_host(url)
+        lines = box.get("1.0", "end-1c").splitlines()
+        for index, line in enumerate(lines, start=1):
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if listing_url_key(raw) == target or site_host(raw) == host:
+                box.tag_add("searching", f"{index}.0", f"{index}.end")
+                box.see(f"{index}.0")
+                return
+
+    def _refresh_scan_live(self, site: str = "", found: int | None = None, checking: int | None = None, total: int | None = None) -> None:
+        if site:
+            self._scan_site = site
+        if found is not None:
+            self._scan_found = found
+        if checking is not None:
+            self._scan_checking = checking
+        if total is not None:
+            self._scan_total = total
+        site_name = self._scan_site
+        found_count = self._scan_found
+        checking_count = self._scan_checking
+        total_count = self._scan_total
+        parts: list[str] = []
+        if site_name:
+            parts.append(site_name)
+        parts.append(f"{found_count} found")
+        if total_count:
+            parts.append(f"checking {checking_count} of {total_count}")
+        self.scan_live.set("  ·  ".join(parts))
+        if self._busy and total_count:
+            self._set_progress_count(checking_count, total_count)
+            self.work_hint.set(f"{checking_count} / {total_count}")
+
+    def _prepare_one_book(self, book: Book) -> None:
+        if book.author:
+            book.author = format_person_name(book.author) or book.author
+        if book.translator:
+            book.translator = format_person_name(book.translator) or book.translator
+        if book.illustrator:
+            book.illustrator = format_person_name(book.illustrator) or book.illustrator
+        if book.title:
+            book.refresh_scan_status()
+        try:
+            attach_books([book])
+        except Exception:
+            pass
+
+    def _queue_detail(self, book: Book) -> None:
+        self._pending_detail = book
+        if self._detail_job:
+            return
+        self._detail_job = self.after(80, self._flush_detail)
+
+    def _flush_detail(self) -> None:
+        self._detail_job = None
+        book = self._pending_detail
+        if book is None:
+            return
+        self._programmatic_select = True
+        try:
+            self.show_book(book)
+        finally:
+            self._programmatic_select = False
+
+    def _select_live_book(self, book: Book) -> None:
+        if not self._follow_search:
+            if book is self._selected_book:
+                self.table.refresh_book(book)
+                self._queue_detail(book)
+            return
+        self._programmatic_select = True
+        try:
+            self.table.select_book(book)
+            self._queue_detail(book)
+        finally:
+            self._programmatic_select = False
+
+    def _ingest_search_book(self, book: Book) -> None:
+        existing = next((item for item in self.books if item is book or item.key() == book.key()), None)
+        if existing is None:
+            self._prepare_one_book(book)
+            self.books.append(book)
+            self.table.add_row(book)
+            self._select_live_book(book)
+            return
+        self.table.refresh_book(existing)
+        self._select_live_book(existing)
+
+    def _on_search_event(self, kind: str, data: dict) -> None:
+        site = str(data.get("site") or "")
+        url = str(data.get("url") or "")
+        if kind == "pages":
+            total = int(data.get("total") or 0)
+            current = int(data.get("current") or 0)
+            if total:
+                self._set_pages_total(total)
+            self._refresh_scan_live(
+                site=site,
+                found=int(data.get("found") or self._scan_found),
+                checking=current,
+                total=total,
+            )
+            if site and total:
+                cap = " · no limit" if data.get("unlimited") else ""
+                self._set_status(f"{site}: catalog page {current} of {total}{cap}")
+            return
+        if kind == "site":
+            self._highlight_site_url(url)
+            self._refresh_scan_live(site=site, found=int(data.get("found") or self._scan_found))
+            if site:
+                self._set_status(f"Searching {site}…")
+            return
+        if kind in {"check", "fill"}:
+            self._highlight_site_url(url)
+            self._refresh_scan_live(
+                site=site,
+                found=int(data.get("found") or self._scan_found),
+                checking=int(data.get("index") or 0),
+                total=int(data.get("total") or 0),
+            )
+            book = data.get("book")
+            if isinstance(book, Book):
+                self._ingest_search_book(book)
+            return
+        if kind == "book":
+            book = data.get("book")
+            if isinstance(book, Book):
+                self._ingest_search_book(book)
+            self._refresh_scan_live(site=site, found=int(data.get("found") or len(self.books)))
+
+    def _begin_work(self, hint: str = "Working…") -> None:
+        self.work_hint.set(hint)
+        self._set_progress_busy()
+
+    def _end_work(self, outcome: str = "") -> None:
+        try:
+            self.progress.stop()
+        except tk.TclError:
+            pass
+        self._progress_determinate = True
+        if outcome == "done":
+            self.progress.configure(mode="determinate", maximum=100, value=100)
+            self.work_hint.set("Done")
+        elif outcome == "stopped":
+            self.progress.configure(mode="determinate", maximum=100, value=0)
+            self.work_hint.set("Stopped")
+        elif outcome == "failed":
+            self.progress.configure(mode="determinate", maximum=100, value=0)
+            self.work_hint.set("Failed")
+        else:
+            self.progress.configure(mode="determinate", maximum=100, value=0)
+            self.work_hint.set("")
+
+    def _set_progress_busy(self) -> None:
+        if (not self._progress_determinate) and str(self.progress.cget("mode")) == "indeterminate":
+            return
+        try:
+            self.progress.stop()
+        except tk.TclError:
+            pass
+        self.progress.configure(mode="indeterminate")
+        self._progress_determinate = False
+        self.progress.start(12)
+
+    def _set_progress_count(self, current: int, total: int) -> None:
+        total = max(int(total), 1)
+        current = max(0, min(int(current), total))
+        if not self._progress_determinate:
+            try:
+                self.progress.stop()
+            except tk.TclError:
+                pass
+            self.progress.configure(mode="determinate")
+            self._progress_determinate = True
+        self.progress.configure(maximum=total, value=current)
+
+    def _sync_work_progress(self, text: str) -> None:
+        if not self._busy:
+            return
+        match = re.search(r"(?<!\d)(\d+)\s*(?:/|of)\s*(\d+)(?!\d)", text, re.I)
+        if match:
+            current, total = int(match.group(1)), int(match.group(2))
+            if total > 0:
+                self._set_progress_count(current, total)
+                self.work_hint.set(f"{current} / {total}")
+                return
+        self._set_progress_busy()
+        self.work_hint.set("Working…")
 
     def _schedule_update_check(self, delay_ms: int) -> None:
         if self._updating:

@@ -545,12 +545,17 @@ def flush_candidates() -> None:
     global _dirty, _candidates
     if _candidates is None:
         return
-    CANDIDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CANDIDATES_PATH.write_text(
-        json.dumps({"labels": _candidates}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    _dirty = 0
+    try:
+        from book_cache import _write_text_atomic
+
+        CANDIDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _write_text_atomic(
+            CANDIDATES_PATH,
+            json.dumps({"labels": _candidates}, ensure_ascii=False, indent=2) + "\n",
+        )
+        _dirty = 0
+    except OSError:
+        return
 
 
 def _load_candidates() -> dict[str, dict[str, Any]]:

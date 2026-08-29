@@ -15,6 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 ProgressFn = Callable[[str], None]
+EventFn = Callable[[str, dict[str, Any]], None]
 
 
 def _choose_html_parser() -> str:
@@ -28,6 +29,21 @@ def _choose_html_parser() -> str:
 
 
 HTML_PARSER = _choose_html_parser()
+
+
+def _safe_flush_scan_files() -> None:
+    try:
+        from book_cache import flush_page_cache
+
+        flush_page_cache()
+    except Exception:
+        pass
+    try:
+        from field_map import flush_candidates
+
+        flush_candidates()
+    except Exception:
+        pass
 
 
 def parse_html(markup: str) -> BeautifulSoup:
@@ -305,7 +321,14 @@ SITE_DISPLAY_NAMES = {
     "babel.co.il": "Babel",
     "magnespress.co.il": "Magnes",
     "korenpub.com": "Koren",
+    "nli.org.il": "National Library",
 }
+
+CATALOG_MIN_LISTING_PAGES = 40
+UNLIMITED_LISTING_PAGES = 10_000
+PAGE_IN_URL_RE = re.compile(r"(?:[?&](?:page|p|pg)=|/page(?:/|-))(\d+)", re.I)
+EVRIT_GROUP_RE = re.compile(r"/group/(\d+)(?:/|$)", re.I)
+EVRIT_NEW_BOOKS_SLUG = "ספרים-חדשים"
 
 
 def site_host(url: str) -> str:
@@ -318,6 +341,59 @@ def site_host(url: str) -> str:
 def site_display_name(url: str) -> str:
     host = site_host(url)
     return SITE_DISPLAY_NAMES.get(host, host or "site")
+
+
+def is_evrit_host(url: str) -> bool:
+    host = site_host(url)
+    return "e-vrit" in host or host == "evrit.co.il" or host.endswith(".evrit.co.il")
+
+
+def catalog_listing_url(url: str) -> str:
+    """Turn a site homepage into the year catalog listing that Search should read."""
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    path = unquote(parsed.path).rstrip("/") or "/"
+    if is_evrit_host(raw) and path in {"", "/"}:
+        return urlunparse(
+            parsed._replace(path=f"/group/3/{quote(EVRIT_NEW_BOOKS_SLUG)}", query="", fragment="")
+        )
+    return raw
+
+
+def listing_url_key(url: str) -> str:
+    parsed = urlparse(catalog_listing_url(url))
+    host = parsed.netloc.casefold()
+    if host.startswith("www."):
+        host = host[4:]
+    path = unquote(parsed.path).rstrip("/") or "/"
+    return f"{host}{path}".casefold()
+
+
+def unique_catalog_urls(urls: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in urls:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        listing = catalog_listing_url(value)
+        key = listing_url_key(listing)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(listing)
+    return out
+
+
+def evrit_group_id(url: str) -> str:
+    if not is_evrit_host(url):
+        return ""
+    match = EVRIT_GROUP_RE.search(unquote(urlparse(url).path))
+    return match.group(1) if match else ""
 
 
 @dataclass
@@ -721,6 +797,7 @@ class CrawlReport:
     cancelled: bool = False
     error: str = ""
     error_books: int = 0
+    site_notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.error:
@@ -747,6 +824,8 @@ class CrawlReport:
             parts.append(f"filled from other sites: {self.enriched}")
         if self.cancelled:
             parts.append("stopped early")
+        if self.site_notes:
+            parts.append("sites: " + " · ".join(self.site_notes))
         return "Search summary — " + ", ".join(parts) + "."
 
 
@@ -909,20 +988,33 @@ def merge_catalog(primary: list[Book], extras: list[Book]) -> int:
     return filled
 
 
+def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
+    """Merge extra into the list, or append it. Returns (canonical book, added?)."""
+    extra_title = (extra.title or "").strip()
+    extra_url = (extra.url or "").strip()
+    if extra_title:
+        for book in primary:
+            if books_match(book, extra):
+                book.merge_missing(extra)
+                return book, False
+        primary.append(extra)
+        return extra, True
+    if extra_url:
+        for book in primary:
+            if (book.url or "").strip() == extra_url:
+                book.merge_missing(extra)
+                return book, False
+        primary.append(extra)
+        return extra, True
+    return extra, False
+
+
 def union_catalog(primary: list[Book], extras: list[Book]) -> int:
     """Merge matching books, and append titles that are not already in the list."""
     added = 0
     for extra in extras:
-        if not (extra.title or "").strip():
-            continue
-        matched = False
-        for book in primary:
-            if books_match(book, extra):
-                book.merge_missing(extra)
-                matched = True
-                break
-        if not matched:
-            primary.append(extra)
+        _canonical, is_new = absorb_book(primary, extra)
+        if is_new:
             added += 1
     return added
 
@@ -2029,10 +2121,88 @@ def fills_needed(candidate: Book, wanted: Book) -> int:
     return count
 
 
+def listed_page_number(url: str) -> int:
+    parsed = urlparse(url or "")
+    qs = parse_qs(parsed.query)
+    for key in ("page", "p", "pg", "pagenumber", "pageNumber"):
+        raw = (qs.get(key) or [""])[0]
+        if str(raw).isdigit():
+            return int(raw)
+    match = PAGE_IN_URL_RE.search(url or "")
+    if match:
+        return int(match.group(1))
+    return 0
+
+
 def page_number(url: str) -> int:
-    qs = parse_qs(urlparse(url).query)
-    raw = (qs.get("page") or qs.get("p") or ["1"])[0]
-    return int(raw) if str(raw).isdigit() else 1
+    return listed_page_number(url) or 1
+
+
+def listing_page_cap(max_listing_pages: int) -> int:
+    try:
+        value = int(max_listing_pages)
+    except (TypeError, ValueError):
+        value = CATALOG_MIN_LISTING_PAGES
+    if value <= 0:
+        return UNLIMITED_LISTING_PAGES
+    return max(1, value)
+
+
+def last_listing_page(soup: BeautifulSoup, page_url: str) -> int:
+    current = page_number(page_url)
+    last = 0
+
+    def consider(number: int) -> None:
+        nonlocal last
+        if number > last:
+            last = number
+
+    for tag in soup.select(
+        ".pagination a[href], .pages a[href], .pager a[href], nav.pagination a[href], "
+        "a[rel='last'], a[rel='next'], a.page-next, a.num, "
+        ".pagination option, .pages option, .pager option, select[name*='page'] option"
+    ):
+        href = str(tag.get("href") or tag.get("value") or "")
+        text = re.sub(r"[^\d]", "", tag.get_text(" ", strip=True) or "")
+        number = 0
+        if href:
+            if href.isdigit():
+                number = int(href)
+            else:
+                resolved = normalize_url(page_url, href)
+                if resolved:
+                    number = listed_page_number(resolved)
+        if not number and text.isdigit():
+            number = int(text)
+        consider(number)
+    for box in soup.select(".pagination, .pages, .pager, nav.pagination, .paging"):
+        text = box.get_text(" ", strip=True)
+        match = re.search(r"(?:מתוך|of|/)\s*(\d{1,5})\b", text, re.I)
+        if match:
+            consider(int(match.group(1)))
+    if last <= current:
+        return 0
+    return last
+
+
+def json_item_count(payload: dict[str, Any] | None) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("Total", "total", "TotalItems", "TotalCount", "Count", "count", "ItemsCount"):
+        raw = payload.get(key)
+        if isinstance(raw, int) and raw >= 0:
+            return raw
+        if isinstance(raw, str) and raw.strip().isdigit():
+            return int(raw.strip())
+    nested = payload.get("Paging") or payload.get("paging") or payload.get("Meta") or payload.get("meta")
+    if isinstance(nested, dict):
+        for key in ("Total", "total", "TotalItems", "TotalCount", "Count", "count"):
+            raw = nested.get(key)
+            if isinstance(raw, int) and raw >= 0:
+                return raw
+            if isinstance(raw, str) and raw.strip().isdigit():
+                return int(raw.strip())
+    return 0
 
 
 def sequential_listing_urls(page_url: str, max_pages: int) -> list[str]:
@@ -2055,7 +2225,7 @@ def sequential_listing_urls(page_url: str, max_pages: int) -> list[str]:
     return urls
 
 
-def collect_pagination_links(soup: BeautifulSoup, page_url: str) -> list[str]:
+def collect_pagination_links(soup: BeautifulSoup, page_url: str, max_pages: int = 40) -> list[str]:
     links: list[str] = []
     start = urlparse(page_url)
     for tag in soup.select(".pagination a[href], .pages a[href], a[rel='next'], a.page-next, a.num"):
@@ -2068,9 +2238,13 @@ def collect_pagination_links(soup: BeautifulSoup, page_url: str) -> list[str]:
             continue
         if url not in links:
             links.append(url)
-    if links:
-        return sequential_listing_urls(page_url, 40)
-    return links
+    if not links:
+        return links
+    last = last_listing_page(soup, page_url)
+    cap = listing_page_cap(max_pages)
+    if last > 1:
+        cap = min(cap, last)
+    return sequential_listing_urls(page_url, max(1, cap))
 
 
 class BookCrawler:
@@ -2080,12 +2254,15 @@ class BookCrawler:
         timeout: int = 25,
         cancelled: Callable[[], bool] | None = None,
         progress: ProgressFn | None = None,
+        event: EventFn | None = None,
     ) -> None:
         self.delay_seconds = delay_seconds
         self.timeout = timeout
         self.cancelled = cancelled or (lambda: False)
         self.progress = progress or (lambda _msg: None)
+        self.event = event or (lambda _kind, _data: None)
         self.report = CrawlReport()
+        self.last_site_error = ""
         self.session = requests.Session()
         retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
@@ -2104,6 +2281,26 @@ class BookCrawler:
     def _check_cancel(self) -> None:
         if self.cancelled():
             raise CrawlCancelled("Search cancelled")
+
+    def _emit(self, kind: str, data: dict[str, Any] | None = None) -> None:
+        try:
+            self.event(kind, data or {})
+        except Exception:
+            pass
+
+    def _take_book(self, books: list[Book], book: Book, site: str, url: str) -> None:
+        canonical, is_new = absorb_book(books, book)
+        titled = sum(1 for item in books if (item.title or "").strip())
+        self._emit(
+            "book",
+            {
+                "book": canonical,
+                "new": is_new,
+                "found": titled,
+                "site": site,
+                "url": url,
+            },
+        )
 
     def fetch(self, url: str) -> tuple[str, str]:
         self._check_cancel()
@@ -2140,6 +2337,84 @@ class BookCrawler:
         book, _html, _resolved = self._book_and_html(product_url, remember=remember)
         return book
 
+    def _evrit_group_product_urls(
+        self,
+        page_url: str,
+        year: str,
+        max_products: int,
+        include_unknown_year: bool,
+    ) -> list[str] | None:
+        group_id = evrit_group_id(page_url)
+        if not group_id:
+            return None
+        parsed = urlparse(page_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        skip = 0
+        take = 200
+        urls: list[str] = []
+        seen: set[str] = set()
+        want_year = str(year or "").strip()
+        try:
+            while len(urls) < max_products and skip < 20000:
+                self._check_cancel()
+                api_url = f"{origin}/api/group/{group_id}/products?skip={skip}&take={take}"
+                html, _final = self.fetch(api_url)
+                self.report.listing_pages += 1
+                try:
+                    payload = json.loads(html)
+                except json.JSONDecodeError:
+                    return None if skip == 0 else urls
+                items = payload.get("Items") if isinstance(payload, dict) else None
+                if not isinstance(items, list):
+                    return None if skip == 0 else urls
+                if skip == 0 and isinstance(payload, dict):
+                    total_items = json_item_count(payload)
+                    if total_items:
+                        total_pages = max(1, (total_items + take - 1) // take)
+                        self._emit(
+                            "pages",
+                            {
+                                "site": site_display_name(page_url),
+                                "url": page_url,
+                                "current": 1,
+                                "total": total_pages,
+                                "unlimited": max_products >= 50_000,
+                                "limit": 0,
+                            },
+                        )
+                if not items:
+                    break
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    product_id = item.get("ProductID")
+                    if not product_id:
+                        continue
+                    item_year = str(item.get("PublishYear") or "").strip()
+                    probe = Book(url=f"{origin}/product/{product_id}", year=item_year)
+                    if want_year and not probe.matches_year(want_year, include_unknown_year):
+                        continue
+                    product_url = f"{origin}/product/{product_id}"
+                    if product_url in seen:
+                        continue
+                    seen.add(product_url)
+                    urls.append(product_url)
+                    if len(urls) >= max_products:
+                        break
+                host = site_display_name(page_url)
+                self.progress(
+                    f"{host} catalog: {len(urls)} book(s) for {want_year or 'any year'} "
+                    f"after reading {skip + len(items)} listings…"
+                )
+                if len(items) < take or len(urls) >= max_products:
+                    break
+                skip += len(items)
+        except CrawlCancelled:
+            raise
+        except (SiteError, requests.RequestException):
+            return None if not urls else urls
+        return urls
+
     def crawl(
         self,
         start_url: str,
@@ -2148,24 +2423,60 @@ class BookCrawler:
         max_products: int = 150,
         include_unknown_year: bool = True,
         start_error: bool = True,
+        on_book: Callable[[Book], None] | None = None,
     ) -> list[Book]:
         start_url = start_url.strip()
         if not start_url.startswith(("http://", "https://")):
             start_url = "https://" + start_url
+        start_url = catalog_listing_url(start_url)
+        self.last_site_error = ""
         results: list[Book] = []
         seen_products: set[str] = set()
+        site_name = site_display_name(start_url)
+
+        page_cap = listing_page_cap(max_listing_pages)
+        known_total = 0
+
+        def keep(book: Book) -> None:
+            results.append(book)
+            if on_book:
+                on_book(book)
+
+        def note_pages(current: int, total: int) -> None:
+            self._emit(
+                "pages",
+                {
+                    "site": site_name,
+                    "url": start_url,
+                    "current": current,
+                    "total": total,
+                    "unlimited": int(max_listing_pages or 0) <= 0,
+                    "limit": 0 if int(max_listing_pages or 0) <= 0 else page_cap,
+                },
+            )
+
+        def checking(index: int, total: int) -> None:
+            self._emit(
+                "check",
+                {
+                    "index": index,
+                    "total": max(total, 1),
+                    "found": len(results),
+                    "site": site_name,
+                    "url": start_url,
+                },
+            )
         try:
             html, final_url = self.fetch(start_url)
             self.report.listing_pages += 1
         except (SiteError, requests.RequestException) as exc:
             self.report.listing_failed += 1
             message = str(exc) if isinstance(exc, SiteError) else "Could not open the start URL."
+            self.last_site_error = message
             if start_error:
                 self.report.error = message
             self.progress(message)
-            from field_map import flush_candidates
-
-            flush_candidates()
+            _safe_flush_scan_files()
             return results
         soup = parse_html(html)
 
@@ -2190,53 +2501,76 @@ class BookCrawler:
                 book.mark_scan_failed("Opened the product page but could not read a title.")
                 results.append(book)
                 self.report.product_failed += 1
-            self.progress(f"Opened a product page. Found {len(results)} matching book(s).")
-            from field_map import flush_candidates
-
-            flush_candidates()
+            for item in results:
+                if on_book:
+                    on_book(item)
+            self.progress(f"Opened a book page. {len(results)} match(es) for this year.")
+            _safe_flush_scan_files()
             return results
 
         listing_pages = [final_url]
         product_urls: list[str] = []
         visited_listings: set[str] = set()
+        api_urls = self._evrit_group_product_urls(
+            final_url, year, max_products, include_unknown_year
+        )
+        used_api = api_urls is not None
+        if used_api:
+            product_urls = api_urls[:max_products]
+            self.report.product_links = len(product_urls)
+            self.progress(
+                f"Found {len(product_urls)} book pages from the e-vrit catalog. "
+                f"Opening each page to check the year {year}…"
+            )
 
         try:
-            for listing_url in listing_pages:
-                self._check_cancel()
-                if listing_url in visited_listings or len(visited_listings) >= max_listing_pages:
-                    continue
-                visited_listings.add(listing_url)
-                self.progress(
-                    f"Reading listing page {len(visited_listings)}/{max_listing_pages}…"
-                )
-                if listing_url != final_url:
-                    try:
-                        html, listing_url = self.fetch(listing_url)
-                        self.report.listing_pages += 1
-                        soup = parse_html(html)
-                    except (SiteError, requests.RequestException):
-                        self.report.listing_failed += 1
+            if not used_api:
+                for listing_url in listing_pages:
+                    self._check_cancel()
+                    if listing_url in visited_listings or len(visited_listings) >= page_cap:
                         continue
-                for product_url in collect_product_links(soup, listing_url):
-                    if (
-                        same_domain(start_url, product_url)
-                        and not is_asset_url(product_url)
-                        and product_url not in product_urls
-                    ):
-                        product_urls.append(product_url)
-                if len(visited_listings) < max_listing_pages:
-                    for page_url in collect_pagination_links(soup, listing_url):
-                        if same_domain(start_url, page_url) and page_url not in listing_pages:
-                            listing_pages.append(page_url)
-                if len(product_urls) >= max_products:
-                    break
+                    visited_listings.add(listing_url)
+                    if listing_url != final_url:
+                        try:
+                            html, listing_url = self.fetch(listing_url)
+                            self.report.listing_pages += 1
+                            soup = parse_html(html)
+                        except (SiteError, requests.RequestException):
+                            self.report.listing_failed += 1
+                            continue
+                    discovered = last_listing_page(soup, listing_url)
+                    if discovered > known_total:
+                        known_total = discovered
+                    page_n = len(visited_listings)
+                    if known_total:
+                        self.progress(f"Reading catalog page {page_n} of {known_total}…")
+                    else:
+                        self.progress(f"Reading catalog page {page_n}…")
+                    note_pages(page_n, known_total)
+                    for product_url in collect_product_links(soup, listing_url):
+                        if (
+                            same_domain(start_url, product_url)
+                            and not is_asset_url(product_url)
+                            and product_url not in product_urls
+                        ):
+                            product_urls.append(product_url)
+                    next_cap = min(page_cap, known_total) if known_total else page_cap
+                    if len(visited_listings) < next_cap:
+                        for page_url in collect_pagination_links(soup, listing_url, next_cap):
+                            if same_domain(start_url, page_url) and page_url not in listing_pages:
+                                listing_pages.append(page_url)
+                    if len(product_urls) >= max_products:
+                        break
 
-            product_urls = product_urls[:max_products]
-            self.report.product_links = len(product_urls)
-            self.progress(f"Found {len(product_urls)} book pages. Checking publication year {year}…")
+                product_urls = product_urls[:max_products]
+                self.report.product_links = len(product_urls)
+                self.progress(
+                    f"Found {len(product_urls)} book pages. Opening each one to check the year {year}…"
+                )
 
             for index, product_url in enumerate(product_urls, start=1):
                 self._check_cancel()
+                checking(index, len(product_urls))
                 if product_url in seen_products:
                     continue
                 seen_products.add(product_url)
@@ -2247,34 +2581,33 @@ class BookCrawler:
                     note = str(exc) if isinstance(exc, SiteError) else request_failure_message(exc, product_url)
                     stub = Book(url=product_url)
                     stub.mark_scan_failed(note)
-                    results.append(stub)
+                    keep(stub)
                     self.progress(f"{note} Continuing…")
                     continue
                 if book is None:
                     stub = Book(url=product_url)
                     stub.mark_scan_failed("The book page returned no data.")
-                    results.append(stub)
+                    keep(stub)
                     self.report.product_failed += 1
                 elif not book.title:
                     book.mark_scan_failed("Opened the page but could not read a title.")
-                    results.append(book)
+                    keep(book)
                     self.report.product_failed += 1
                 elif book.matches_year(year, include_unknown_year):
                     book.append_scan_log("Read the book page.")
                     book.refresh_scan_status()
-                    results.append(book)
+                    keep(book)
                     self.report.matched += 1
                 else:
                     self.report.skipped_year += 1
                 self.progress(
-                    f"Checked {index}/{len(product_urls)} books — {len(results)} listed for {year or 'any year'}"
+                    f"Checking book {index} of {len(product_urls)} — "
+                    f"{len(results)} kept for {year or 'any year'}"
                 )
         except CrawlCancelled:
             self.report.cancelled = True
             self.progress(f"Stopped. Keeping {len(results)} matching book(s) found so far.")
-        from field_map import flush_candidates
-
-        flush_candidates()
+        _safe_flush_scan_files()
         return results
 
     def search_urls_for_query(self, site_url: str, query: str) -> list[str]:
@@ -2348,7 +2681,7 @@ class BookCrawler:
                 continue
             richer = self._better_book_page(best, found, wanted)
             if richer is not best:
-                self.progress(f"Opened the full book page: {richer.url}")
+                self.progress("Opened the full book page.")
                 best = richer
             needed = len(wanted.missing_fields())
             if needed and fills_needed(best, wanted) >= needed:
@@ -2389,7 +2722,7 @@ class BookCrawler:
             listing = listing or is_search_results_page(soup, resolved)
             if listing:
                 if depth == 0:
-                    self.progress("Search listed several books — opening a matching cover…")
+                    self.progress("The site listed several books. Opening the matching book page…")
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
             elif matched is None:
                 matched = self._follow_book_cover_links(soup, resolved, wanted, seen, depth, None)
@@ -2414,7 +2747,7 @@ class BookCrawler:
                 continue
             if is_query_listing_url(candidate.url):
                 continue
-            self.progress(f"Matched from cached {host} pages.")
+            self.progress(f"Reused a saved {host} book page.")
             if fills_needed(candidate, book) >= len(book.missing_fields()) and fillable_count(candidate) >= 5:
                 return candidate
             try:
@@ -2447,7 +2780,7 @@ class BookCrawler:
             for product_url in self._slug_urls_for_book(site_url, book):
                 found = consider(product_url, remember=False)
                 if found:
-                    self.progress(f"Found book page: {found.url}")
+                    self.progress("Opened the matching book page.")
                     return found
             if home_html:
                 soup = parse_html(home_html)
@@ -2457,7 +2790,7 @@ class BookCrawler:
                 for product_url in homepage_links[:8]:
                     found = consider(product_url, remember=False)
                     if found:
-                        self.progress(f"Found book page: {found.url}")
+                        self.progress("Opened the matching book page.")
                         return found
         queries = [value for value in (book.isbn, book.display_title(), f"{book.title} {book.author}") if value]
         for query in queries:
@@ -2472,7 +2805,7 @@ class BookCrawler:
                     continue
                 soup = parse_html(html)
                 if is_search_results_page(soup, final_url):
-                    self.progress("Search listed several books — opening a matching cover…")
+                    self.progress("The site listed several books. Opening the matching book page…")
                     product_urls = collect_search_result_links(soup, final_url, book)
                     if not product_urls:
                         product_urls = [url for url, _title in collect_cover_picture_links(soup, final_url)]
@@ -2481,7 +2814,7 @@ class BookCrawler:
                     for product_url in product_urls[:16]:
                         found = consider(product_url, remember=False)
                         if found:
-                            self.progress(f"Found book page: {found.url}")
+                            self.progress("Opened the matching book page.")
                             return found
                     continue
                 page_book = extract_book_from_html(html, final_url)
@@ -2491,11 +2824,11 @@ class BookCrawler:
                     save_page_cache()
                     richer = self._follow_book_cover_links(soup, final_url, book, seen, 0, matched)
                     if richer:
-                        self.progress(f"Found book page: {richer.url}")
+                        self.progress("Opened the matching book page.")
                         return richer
                     if is_query_listing_url(matched.url):
                         continue
-                    self.progress(f"Found book page: {matched.url}")
+                    self.progress("Opened the matching book page.")
                     return matched
                 product_urls = collect_detail_links(soup, final_url, book)
                 if not product_urls:
@@ -2506,7 +2839,7 @@ class BookCrawler:
                 for product_url in product_urls[:8]:
                     found = consider(product_url, remember=False)
                     if found:
-                        self.progress(f"Found book page: {found.url}")
+                        self.progress("Opened the matching book page.")
                         return found
         return None
 
@@ -2585,6 +2918,8 @@ class BookCrawler:
         filled = 0
         for extra_url in extra_urls:
             host = urlparse(extra_url).netloc
+            site_name = site_display_name(extra_url)
+            self._emit("site", {"url": extra_url, "name": site_name, "index": 0, "total": 0})
             extras = cached_books_for_host(host)
             if extras:
                 self.progress(f"Filling missing fields from cached {host} pages…")
@@ -2609,10 +2944,25 @@ class BookCrawler:
             pending = [book for book in books if not book.has_page_on(extra_url)]
             pending.sort(key=lambda book: (0 if book.missing_fields() else 1, book.display_title()))
             searches = 0
+            search_total = min(max_searches, len(pending))
             for book in pending:
                 if searches >= max_searches:
                     break
                 searches += 1
+                self.progress(
+                    f"Matching catalog pages {searches} of {search_total} on {host}: {book.display_title()}"
+                )
+                self._emit(
+                    "fill",
+                    {
+                        "book": book,
+                        "index": searches,
+                        "total": search_total,
+                        "found": len(books),
+                        "site": site_name,
+                        "url": extra_url,
+                    },
+                )
                 try:
                     match = self.find_matching_product(extra_url, book)
                 except CrawlCancelled:
@@ -2623,6 +2973,7 @@ class BookCrawler:
                 except requests.RequestException:
                     continue
                 if not match:
+                    self._emit("book", {"book": book, "new": False, "found": len(books), "site": site_name, "url": extra_url})
                     continue
                 added_fields = book.merge_missing(match)
                 if added_fields:
@@ -2631,9 +2982,8 @@ class BookCrawler:
                     self.progress(f"Filled extra details from {host} for {book.display_title()}")
                 else:
                     self.progress(f"Found {host} book page for {book.display_title()}")
-        from field_map import flush_candidates
-
-        flush_candidates()
+                self._emit("book", {"book": book, "new": False, "found": len(books), "site": site_name, "url": extra_url})
+        _safe_flush_scan_files()
         for book in books:
             if book.title:
                 book.refresh_scan_status()
@@ -2655,9 +3005,35 @@ class BookCrawler:
         total = len(pending)
         for index, book in enumerate(pending, start=1):
             self._check_cancel()
-            host = urlparse(resolve_publisher_site(book.publisher) or "").netloc
-            self.progress(f"Publisher page {index}/{total} on {host}: {book.display_title()}")
+            publisher_url = resolve_publisher_site(book.publisher) or ""
+            host = urlparse(publisher_url).netloc
+            site_name = site_display_name(publisher_url) if publisher_url else host
+            self.progress(
+                f"Filling publisher details {index} of {total} on {host}: {book.display_title()}"
+            )
+            self._emit("site", {"url": publisher_url, "name": site_name or host, "index": index, "total": total})
+            self._emit(
+                "fill",
+                {
+                    "book": book,
+                    "index": index,
+                    "total": total,
+                    "found": len(books),
+                    "site": site_name or host,
+                    "url": publisher_url,
+                },
+            )
             added = self.enrich_one_book(book)
+            self._emit(
+                "book",
+                {
+                    "book": book,
+                    "new": False,
+                    "found": len(books),
+                    "site": site_name or host,
+                    "url": publisher_url,
+                },
+            )
             if added:
                 filled += 1
         return filled
@@ -2670,40 +3046,66 @@ class BookCrawler:
         include_unknown_year: bool = True,
     ) -> list[Book]:
         books: list[Book] = []
-        max_products = max(1000, int(max_listing_pages or 5) * 100)
+        listing_urls = unique_catalog_urls(urls)
+        requested = int(max_listing_pages or 0)
+        page_limit = listing_page_cap(requested)
+        max_products = 50_000 if requested <= 0 else max(4000, page_limit * 100)
         listed = 0
-        for index, url in enumerate(urls, start=1):
-            self._check_cancel()
-            host = site_display_name(url)
-            self.progress(f"Listing books from site {index}/{len(urls)}: {host}")
-            found = self.crawl(
-                start_url=url,
-                year=year,
-                max_listing_pages=max_listing_pages,
-                max_products=max_products,
-                include_unknown_year=include_unknown_year,
-                start_error=False,
-            )
-            added = union_catalog(books, found)
-            listed += 1 if found else 0
+        notes: list[str] = []
+        try:
+            for index, url in enumerate(listing_urls, start=1):
+                self._check_cancel()
+                host = site_display_name(url)
+                self.progress(f"Site {index} of {len(listing_urls)}: listing books from {host}…")
+                self._emit("site", {"url": url, "name": host, "index": index, "total": len(listing_urls)})
+                self.last_site_error = ""
+                before = len(books)
+                found = self.crawl(
+                    start_url=url,
+                    year=year,
+                    max_listing_pages=0 if requested <= 0 else page_limit,
+                    max_products=max_products,
+                    include_unknown_year=include_unknown_year,
+                    start_error=False,
+                    on_book=lambda book, site=host, site_url=url: self._take_book(books, book, site, site_url),
+                )
+                added = len(books) - before
+                titled = len([book for book in found if book.title])
+                listed += 1 if titled else 0
+                if self.last_site_error:
+                    short = self.last_site_error.split(".")[0]
+                    notes.append(f"{host}: could not open ({short})")
+                else:
+                    notes.append(f"{host}: {titled} listed, {added} new")
+                self.progress(
+                    f"{host}: {titled} book(s) this year. "
+                    f"{added} new name(s). Combined list: {len(books)}."
+                )
+            self.report.site_notes = notes
+            self.report.error = ""
+            self.report.matched = len(books)
+            if not books:
+                detail = "; ".join(notes) if notes else "no catalog URLs"
+                self.report.error = f"Could not list books from the bookstore or catalog URLs. {detail}."
+                self.progress(self.report.error)
+                return books
             self.progress(
-                f"{host}: {len([book for book in found if book.title])} book(s) this year. "
-                f"{added} new name(s). Combined list: {len(books)}."
+                f"Listed {len(books)} unique book(s) from {listed} site(s). "
+                + " · ".join(notes)
+                + ". Filling catalog pages, then publisher pages…"
             )
-        self.report.error = ""
-        self.report.matched = len(books)
-        if not books:
-            self.report.error = "Could not list books from the bookstore or catalog URLs."
-            self.progress(self.report.error)
+            self.enrich_books(books, listing_urls, max_searches=max(len(books), 24))
+            self.enrich_from_publishers(books)
+            self.report.matched = len(books)
+            self.report.site_notes = notes
             return books
-        self.progress(
-            f"Listed {len(books)} book(s) from {listed} site(s). "
-            "Filling catalog pages, then publisher pages…"
-        )
-        self.enrich_books(books, urls, max_searches=max(len(books), 24))
-        self.enrich_from_publishers(books)
-        self.report.matched = len(books)
-        return books
+        finally:
+            try:
+                from book_cache import flush_page_cache
+
+                flush_page_cache()
+            except Exception:
+                pass
 
 
 def parse_site_urls(text: str) -> list[str]:

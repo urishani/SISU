@@ -20,7 +20,7 @@ INDEX_PATH = LISTS_DIR / "index.json"
 NAMED_DIR = LISTS_DIR / "named"
 DEFAULT_SEARCH_URLS = (
     "https://www.booknet.co.il/ספרים-חדשים",
-    "https://www.e-vrit.co.il/",
+    "https://www.e-vrit.co.il/group/3/ספרים-חדשים",
     "https://www.nli.org.il/he/search?materialType=books",
 )
 PLACEHOLDER_URL_MARKERS = ("example.com", "example.org", "a.example")
@@ -55,9 +55,18 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> Path:
+    from book_cache import _write_text_atomic
+
     _ensure_dirs()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    try:
+        _write_text_atomic(path, text)
+    except OSError:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
     return path
 
 
@@ -77,7 +86,7 @@ def empty_payload(
     title: str = "New",
     urls: list[str] | None = None,
     year: str = "",
-    max_pages: int = 5,
+    max_pages: int = 40,
     include_unknown: bool = True,
 ) -> dict[str, Any]:
     stamp = now_stamp()
@@ -109,7 +118,7 @@ def build_payload(
     list_id: str = "",
     locked: bool = False,
     archived: bool = False,
-    max_pages: int = 5,
+    max_pages: int = 40,
     include_unknown: bool = True,
     report: dict[str, Any] | None = None,
     notes: str = "",
@@ -118,6 +127,12 @@ def build_payload(
     excel_dir: str = "",
 ) -> dict[str, Any]:
     stamp = now_stamp()
+    try:
+        pages = int(max_pages)
+    except (TypeError, ValueError):
+        pages = 40
+    if pages < 0:
+        pages = 40
     return {
         "id": list_id or "",
         "title": (title or "").strip() or default_scan_title(len(books), year),
@@ -127,7 +142,7 @@ def build_payload(
         "archived": bool(archived),
         "year": year,
         "urls": merge_search_urls(list(urls or [])),
-        "max_pages": int(max_pages or 5),
+        "max_pages": pages,
         "include_unknown": bool(include_unknown),
         "books": [asdict(book) for book in books],
         "report": report or {},
@@ -284,6 +299,16 @@ def _is_placeholder_payload(data: dict[str, Any] | None) -> bool:
     )
 
 
+def _legacy_max_pages(raw: Any) -> int:
+    if raw is None or raw == "":
+        return 40
+    try:
+        pages = int(raw)
+    except (TypeError, ValueError):
+        return 40
+    return pages if pages >= 0 else 40
+
+
 def payload_from_legacy(legacy: dict[str, Any]) -> dict[str, Any]:
     books = legacy.get("books") or []
     year = str(legacy.get("year") or "")
@@ -291,7 +316,7 @@ def payload_from_legacy(legacy: dict[str, Any]) -> dict[str, Any]:
         title=str(legacy.get("title") or "") or default_scan_title(len(books), year),
         urls=merge_search_urls(list(legacy.get("urls") or [])),
         year=year,
-        max_pages=int(legacy.get("max_pages") or 5),
+        max_pages=_legacy_max_pages(legacy.get("max_pages")),
         include_unknown=bool(legacy.get("include_unknown", True)),
     )
     migrated["books"] = books
@@ -366,6 +391,17 @@ def load_working() -> dict[str, Any] | None:
 
 def stash_exists() -> bool:
     return STASH_PATH.exists()
+
+
+def stash_has_data() -> bool:
+    """True when the stash file holds a real list, not an empty placeholder."""
+    data = load_stash()
+    if not data or _is_placeholder_payload(data):
+        return False
+    if _book_count(data) > 0:
+        return True
+    title = str(data.get("title") or "").strip()
+    return bool(title) and title.casefold() not in {"new", "untitled"}
 
 
 def save_stash(payload: dict[str, Any]) -> Path:
