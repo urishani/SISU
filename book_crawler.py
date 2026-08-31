@@ -883,6 +883,7 @@ class CrawlReport:
     matched: int = 0
     skipped_year: int = 0
     enriched: int = 0
+    new_names: int = 0
     from_cache: bool = False
     cancelled: bool = False
     error: str = ""
@@ -890,33 +891,35 @@ class CrawlReport:
     site_notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        if self.error:
+        if self.error and not self.matched:
             return f"Search failed: {self.error}"
         if self.from_cache:
             return f"From cache: {self.matched} book(s) loaded. No pages fetched."
-        parts = [
-            f"Listing pages: {self.listing_pages}",
-            f"book links: {self.product_links}",
-            f"from cache: {self.product_cached}",
-            f"downloaded: {self.product_fetched}",
-            f"matched: {self.matched}",
-        ]
+        parts = [f"{self.matched:,} book(s) on the list"]
+        if self.new_names:
+            parts.append(f"{self.new_names:,} new this search")
+        if self.product_links:
+            parts.append(f"{self.product_links:,} listed from catalogs")
+        if self.listing_pages:
+            parts.append(f"{self.listing_pages} catalog page(s) read")
+        if self.product_cached:
+            parts.append(f"{self.product_cached} filled from cache")
+        if self.product_fetched:
+            parts.append(f"{self.product_fetched} product pages opened")
         if self.error_books:
-            parts.append(f"error books in the list: {self.error_books} (Filter: Errors)")
+            parts.append(f"{self.error_books} error books (Filter: Errors)")
         page_failed = self.listing_failed + self.product_failed
         if page_failed:
-            parts.append(
-                f"catalog or book pages that did not open: {page_failed} (not added as books)"
-            )
+            parts.append(f"{page_failed} catalog pages that did not open")
         if self.skipped_year:
-            parts.append(f"wrong year: {self.skipped_year}")
+            parts.append(f"{self.skipped_year} wrong year")
         if self.enriched:
-            parts.append(f"filled from other sites: {self.enriched}")
+            parts.append(f"{self.enriched} filled from other sites")
         if self.cancelled:
             parts.append("stopped early")
         if self.site_notes:
-            parts.append("sites: " + " · ".join(self.site_notes))
-        return "Search summary — " + ", ".join(parts) + "."
+            parts.append(" · ".join(self.site_notes))
+        return "Search summary — " + ". ".join(parts) + "."
 
 
 def has_hebrew(text: str | None) -> bool:
@@ -2656,6 +2659,7 @@ class BookCrawler:
             if is_new and (canonical.title or "").strip():
                 self.report.matched += 1
             titled = sum(1 for item in results if (item.title or "").strip())
+            self.report.product_links = max(self.report.product_links, len(seen_products))
             checking(titled, 0, canonical)
             self.progress(
                 f"Listing book {titled} — {canonical.display_title()}"
@@ -3215,6 +3219,7 @@ class BookCrawler:
         seed_books: list[Book] | None = None,
     ) -> list[Book]:
         books: list[Book] = list(seed_books or [])
+        started_with = len(books)
         listing_urls = unique_catalog_urls(urls)
         requested = int(max_listing_pages or 0)
         page_limit = listing_page_cap(requested)
@@ -3253,6 +3258,7 @@ class BookCrawler:
             self.report.site_notes = notes
             self.report.error = ""
             self.report.matched = len(books)
+            self.report.new_names = max(0, len(books) - started_with)
             if not books:
                 detail = "; ".join(notes) if notes else "no catalog URLs"
                 self.report.error = f"Could not list books from the bookstore or catalog URLs. {detail}."
@@ -3266,6 +3272,7 @@ class BookCrawler:
             )
             self.enrich_books(books, listing_urls, max_searches=0)
             self.report.matched = len(books)
+            self.report.new_names = max(0, len(books) - started_with)
             self.report.site_notes = notes
             return books
         finally:

@@ -12,31 +12,26 @@ from book_crawler import Book, format_entry_stamp, format_price
 ROW_PAD = 6
 MARK_WIDTH = 36
 MIN_WIDTHS = {
-    "title": 200,
+    "title": 180,
+    "created": 128,
+    "modified": 128,
+    "database": 138,
     "author": 110,
     "year": 56,
     "status": 96,
-    "created": 138,
-    "modified": 138,
-    "database": 148,
     "publisher": 110,
     "code": 110,
     "price": 72,
 }
-WEIGHTS = {
-    "title": 2.2,
-    "author": 0.9,
-    "publisher": 0.8,
-}
 HEADINGS = {
     "mark": "☑",
     "title": "Title",
-    "author": "Author",
-    "year": "Year",
-    "status": "Status",
     "created": "Created",
     "modified": "Updated",
     "database": "To database",
+    "author": "Author",
+    "year": "Year",
+    "status": "Status",
     "publisher": "Publisher",
     "code": "ISBN / code",
     "price": "Price ₪",
@@ -44,16 +39,27 @@ HEADINGS = {
 COLUMNS = (
     "mark",
     "title",
-    "author",
-    "year",
-    "status",
     "created",
     "modified",
     "database",
+    "author",
+    "year",
+    "status",
     "publisher",
     "code",
     "price",
 )
+SORTABLE = {
+    "mark",
+    "title",
+    "created",
+    "modified",
+    "database",
+    "author",
+    "year",
+    "status",
+    "publisher",
+}
 ROW_STATUSES = (
     ("important", "Important"),
     ("checked", "Checked"),
@@ -104,13 +110,12 @@ class BookTable(ttk.Frame):
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
             if key == "price":
                 anchor = "e"
-            elif key in {"mark", "author", "year", "status", "created", "modified", "database", "publisher", "code"}:
+            elif key in {"mark", "created", "modified", "database", "author", "year", "status", "publisher", "code"}:
                 anchor = "center"
             else:
                 anchor = "w"
-            stretch = key in WEIGHTS
             width = MARK_WIDTH if key == "mark" else MIN_WIDTHS.get(key, 80)
-            self.tree.column(key, anchor=anchor, stretch=stretch, width=width, minwidth=width)
+            self.tree.column(key, anchor=anchor, stretch=False, width=width, minwidth=width)
         self.tree.column("mark", width=MARK_WIDTH, stretch=False, minwidth=MARK_WIDTH, anchor="center")
         self.tree.tag_configure("failed", background="#FDECEC", foreground="#B42318")
         self.tree.tag_configure("approved", background="#E4F7EA", foreground="#146C43")
@@ -138,7 +143,7 @@ class BookTable(ttk.Frame):
         ttk.Style(self).configure("Books.Treeview", rowheight=height)
 
     def _header_text(self, key: str, label: str) -> str:
-        if key not in {"mark", "title", "author", "publisher", "status", "created", "modified", "database"}:
+        if key not in SORTABLE:
             return label
         if self.sort_column != key:
             return f"{label}  ↕"
@@ -151,19 +156,15 @@ class BookTable(ttk.Frame):
 
     def _apply_column_widths(self, total_width: int) -> None:
         yscroll = 18
-        usable = max(640, total_width - MARK_WIDTH - yscroll)
-        flex_keys = tuple(WEIGHTS)
-        flex_min = sum(MIN_WIDTHS[key] for key in flex_keys)
-        fixed = sum(MIN_WIDTHS[key] for key in MIN_WIDTHS if key not in WEIGHTS)
-        leftover = max(flex_min, usable - fixed)
-        weight_sum = sum(WEIGHTS.values())
+        inner = max(1, int(total_width) - yscroll)
         widths = {key: MIN_WIDTHS[key] for key in MIN_WIDTHS}
-        for key, weight in WEIGHTS.items():
-            widths[key] = max(MIN_WIDTHS[key], int(leftover * weight / weight_sum))
+        needed = MARK_WIDTH + sum(widths.values())
+        extra = max(0, inner - needed)
+        if extra:
+            widths["title"] += extra
         self.tree.column("mark", width=MARK_WIDTH, minwidth=MARK_WIDTH, stretch=False)
         for key, width in widths.items():
-            stretch = key in WEIGHTS
-            self.tree.column(key, width=width, minwidth=MIN_WIDTHS[key], stretch=stretch)
+            self.tree.column(key, width=width, minwidth=MIN_WIDTHS[key], stretch=False)
 
     def _on_shift_wheel(self, event: tk.Event) -> str:
         self.tree.xview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -239,17 +240,23 @@ class BookTable(ttk.Frame):
                 return
 
     def toggle_sort(self, column: str) -> None:
-        if column not in {"mark", "title", "author", "publisher", "status", "created", "modified", "database"}:
+        if column not in SORTABLE:
             return
         if self.sort_column == column:
             self.sort_reverse = not self.sort_reverse
         else:
             self.sort_column = column
-            self.sort_reverse = False
+            self.sort_reverse = column in {"created", "modified", "database"}
         for key, label in HEADINGS.items():
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
         self._sort_order()
         self._reload()
+
+    def _date_sort_value(self, stamp: str) -> str:
+        text = (stamp or "").strip()
+        if self.sort_reverse:
+            return text
+        return text or "\uffff"
 
     def _sort_order(self) -> None:
         def value(index: int):
@@ -259,19 +266,36 @@ class BookTable(ttk.Frame):
                 return (0 if book.key() in self.checked else 1, title)
             if self.sort_column == "author":
                 return book.author.casefold()
+            if self.sort_column == "year":
+                return (book.year or "", title)
             if self.sort_column == "publisher":
                 return book.publisher.casefold()
             if self.sort_column == "status":
                 return (book.status_label().casefold(), title)
             if self.sort_column == "created":
-                return (book.created_at or "", title)
+                return (self._date_sort_value(book.created_at), title)
             if self.sort_column == "modified":
-                return (book.modified_at or "", title)
+                return (self._date_sort_value(book.modified_at), title)
             if self.sort_column == "database":
-                return (book.database_passed_at or "", title)
+                return (self._date_sort_value(book.database_passed_at), title)
             return title
 
         self.order.sort(key=value, reverse=self.sort_reverse)
+
+    def view_counts(self) -> tuple[int, int, int, int]:
+        total = len(self.books)
+        shown = 0
+        selected = 0
+        selected_shown = 0
+        for book in self.books:
+            visible = self._matches_filter(book)
+            if visible:
+                shown += 1
+            if book.key() in self.checked:
+                selected += 1
+                if visible:
+                    selected_shown += 1
+        return total, shown, selected, selected_shown
 
     def selected_books(self) -> list[Book]:
         return [book for book in self.books if book.key() in self.checked]
@@ -307,12 +331,12 @@ class BookTable(ttk.Frame):
         return (
             "☑" if book.key() in self.checked else "☐",
             book.display_title(),
-            book.author,
-            book.year,
-            book.status_label(),
             format_entry_stamp(book.created_at) or "—",
             format_entry_stamp(book.modified_at) or "—",
             passed or "—",
+            book.author,
+            book.year,
+            book.status_label(),
             book.publisher,
             book.identity_code() or book.scanner_id,
             format_price(book.price_ils),

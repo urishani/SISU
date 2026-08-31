@@ -208,6 +208,7 @@ class BookCatalogApp(tk.Tk):
         self.work_hint = tk.StringVar(value="")
         self.scan_live = tk.StringVar(value="")
         self.summary = tk.StringVar(value="")
+        self.table_counts = tk.StringVar(value="0 selected · 0 shown · 0 total")
         self._progress_determinate = True
         self.colored_info = tk.StringVar(value="")
         self.excel_columns: list[dict] = []
@@ -276,6 +277,7 @@ class BookCatalogApp(tk.Tk):
         self._restore_working_list()
         self._list_actions_ready = True
         self._refresh_list_status()
+        self._refresh_selection_label()
         self._mtimes = _source_mtimes()
         self.after(120, self._drain_queue)
         self.after(900, self._watch_for_reload)
@@ -546,6 +548,18 @@ class BookCatalogApp(tk.Tk):
         clear_btn = ttk.Button(filter_bar, text="Clear books…", command=self.clear_books_with_keep)
         clear_btn.pack(side="right")
         self._callout(clear_btn, "Remove books from this list, while keeping chosen statuses.")
+        counts_label = ttk.Label(filter_bar, textvariable=self.table_counts)
+        counts_label.pack(side="right", padx=(10, 8))
+        self._callout(
+            counts_label,
+            "How many books are ticked, how many are visible with the current filters, and how many are on the whole list.",
+        )
+        clear_sel_btn = ttk.Button(filter_bar, text="Clear selection", command=self.table.clear_selection)
+        clear_sel_btn.pack(side="right", padx=(6, 0))
+        self._callout(clear_sel_btn, "Clear the ☑ ticks. This does not delete books from the list.")
+        select_all_btn = ttk.Button(filter_bar, text="Select all", command=self.table.select_all)
+        select_all_btn.pack(side="right", padx=(8, 0))
+        self._callout(select_all_btn, "Tick every book currently shown in the table (after filters).")
         self.table.pack(fill="both", expand=True)
         self._callout(self.table, "The book table. Click a title to open it on the right.")
         self._callout(self.table.tree, "Click a book row to see its fields. Click ☑ to select it. Click the publisher to look it up.")
@@ -661,26 +675,20 @@ class BookCatalogApp(tk.Tk):
         self.scan_live_label.pack(fill="x", pady=(4, 0))
         self._callout(
             self.scan_live_label,
-            "The site being searched, how many books are already found, and how many book pages are being checked.",
+            "The site being searched and how many books are already on the list.",
         )
         action_row = ttk.Frame(footer)
         action_row.pack(fill="x", pady=(4, 0))
-        select_all_btn = ttk.Button(action_row, text="Select all", command=self.table.select_all)
-        select_all_btn.pack(side="left", pady=2)
-        self._callout(select_all_btn, "Tick every book currently shown in the table.")
         important_btn = ttk.Button(action_row, text="Important", command=self._select_important)
-        important_btn.pack(side="left", padx=6, pady=2)
+        important_btn.pack(side="left", pady=2)
         self._callout(
             important_btn,
             "Tick books that need attention: created and not passed to the database, updated after they were created, or updated after they were passed.",
         )
-        clear_sel_btn = ttk.Button(action_row, text="Clear selection", command=self.table.clear_selection)
-        clear_sel_btn.pack(side="left", padx=6, pady=2)
-        self._callout(clear_sel_btn, "Clear the ☑ ticks. This does not delete books from the list.")
         self.status_label = ttk.Label(action_row, textvariable=self.status, wraplength=1, justify="left")
         self.status_label.pack(side="left", fill="x", expand=True, padx=16, pady=2)
         self._callout(self.status_label, "What SISU is doing right now, including progress, success, and errors.")
-        self._callout(self.summary_label, "Summary of the last search: how many books were listed and filled.")
+        self._callout(self.summary_label, "Summary of the last search: how many books are on the list, how many were new, and how many catalog pages were read.")
         footer.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         split.grid(row=3, column=0, sticky="nsew")
         self._bind_list_excel_path(rename_existing=False)
@@ -698,7 +706,7 @@ class BookCatalogApp(tk.Tk):
         footer.bind(
             "<Configure>",
             lambda event: (
-                self._set_label_wrap(self.status_label, max(120, event.width - 220)),
+                self._set_label_wrap(self.status_label, max(120, event.width - 120)),
                 self._set_label_wrap(self.scan_live_label, max(120, event.width - 8)),
             ),
             add="+",
@@ -1908,6 +1916,7 @@ class BookCatalogApp(tk.Tk):
             "Starting search. Each catalog URL is listed once, in order. "
             "Duplicates merge into one row. Created and updated dates are kept."
         )
+        self.summary.set("Search running — listing each catalog once. Product pages are not opened.")
         pages = self._page_limit_setting()
         self._activity.start_run(
             "Search",
@@ -2223,6 +2232,7 @@ class BookCatalogApp(tk.Tk):
         if report is None:
             report = CrawlReport(matched=len(self.books), cancelled=cancelled)
         report.error_books = sum(1 for book in self.books if (book.scan_status or "") == "failed")
+        report.matched = max(int(report.matched or 0), len(self.books))
         self._list_report = asdict(report)
         self._persist_working(self._list_report)
         year = self.year.get().strip() or "any year"
@@ -2249,11 +2259,36 @@ class BookCatalogApp(tk.Tk):
             self.more_btn.configure(state="normal")
             self._update_workflow_buttons(self._selected_book)
         self._refresh_list_status()
+        self._refresh_selection_label()
 
     def _on_check_change(self) -> None:
+        self._refresh_selection_label()
         if self._busy:
             return
-        self._set_status(f"{len(self.table.checked)} selected")
+        total, shown, selected, selected_shown = self.table.view_counts()
+        if self.table.filter_keys:
+            self._set_status(
+                f"{selected:,} selected · {shown:,} shown of {total:,}"
+                + (f" · {selected_shown:,} selected in this view" if selected and selected_shown != selected else "")
+            )
+        else:
+            self._set_status(f"{selected:,} selected of {total:,}")
+
+    def _refresh_selection_label(self) -> None:
+        total, shown, selected, selected_shown = self.table.view_counts()
+        text = f"{selected:,} selected · {shown:,} shown · {total:,} total"
+        if self.table.filter_keys and selected and selected_shown != selected:
+            text = f"{selected:,} selected ({selected_shown:,} in this view) · {shown:,} shown · {total:,} total"
+        self.table_counts.set(text)
+
+    def _set_running_summary(self) -> None:
+        if not self._busy:
+            return
+        total = len(self.books)
+        self.summary.set(
+            f"Search running — {total:,} book(s) on the list. "
+            "Each catalog is listed once; duplicates merge into one row."
+        )
 
     def _select_important(self) -> None:
         count = self.table.select_important()
@@ -3147,6 +3182,7 @@ class BookCatalogApp(tk.Tk):
     def _on_filter_change(self, _event=None) -> None:
         keys = {key for key, var in self._filter_vars.items() if var.get()}
         self.table.set_filters(keys)
+        self._refresh_selection_label()
         if not keys:
             self._set_status("Showing all books.")
             return
@@ -3231,6 +3267,7 @@ class BookCatalogApp(tk.Tk):
 
     def _prepare_books(self, books: list[Book]) -> None:
         for book in books:
+            book.stamp_created()
             if book.author:
                 book.author = format_person_name(book.author) or book.author
             if book.translator:
@@ -3572,6 +3609,7 @@ class BookCatalogApp(tk.Tk):
             self.work_hint.set(f"{checking_count:,} / {total_count:,}")
 
     def _prepare_one_book(self, book: Book) -> None:
+        book.stamp_created()
         if book.author:
             book.author = format_person_name(book.author) or book.author
         if book.translator:
@@ -3632,10 +3670,14 @@ class BookCatalogApp(tk.Tk):
             self.table.add_row(book)
             self._select_live_book(book)
             self._schedule_live_save()
+            self._refresh_selection_label()
+            self._set_running_summary()
             return
         self.table.refresh_book(existing)
         self._select_live_book(existing)
         self._schedule_live_save()
+        self._refresh_selection_label()
+        self._set_running_summary()
 
     def _schedule_live_save(self) -> None:
         if self._live_save_job:
@@ -3715,12 +3757,14 @@ class BookCatalogApp(tk.Tk):
                 author=author,
                 publisher=publisher,
             )
+            self._set_running_summary()
             return
         if kind == "book":
             book = data.get("book")
             if isinstance(book, Book):
                 self._ingest_search_book(book)
             self._refresh_scan_live(site=site, found=len(self.books))
+            self._set_running_summary()
 
     def _begin_work(self, hint: str = "Working…") -> None:
         self.work_hint.set(hint)
