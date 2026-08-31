@@ -381,6 +381,7 @@ CATALOG_MIN_LISTING_PAGES = 40
 UNLIMITED_LISTING_PAGES = 10_000
 PAGE_IN_URL_RE = re.compile(r"(?:[?&](?:page|p|pg)=|/page(?:/|-))(\d+)", re.I)
 EVRIT_GROUP_RE = re.compile(r"/group/(\d+)(?:/|$)", re.I)
+EVRIT_PRODUCT_RE = re.compile(r"/product/(\d+)(?:/|$)", re.I)
 EVRIT_NEW_BOOKS_SLUG = "ספרים-חדשים"
 
 
@@ -447,6 +448,183 @@ def evrit_group_id(url: str) -> str:
         return ""
     match = EVRIT_GROUP_RE.search(unquote(urlparse(url).path))
     return match.group(1) if match else ""
+
+
+def evrit_product_id(url: str) -> str:
+    if not is_evrit_host(url):
+        return ""
+    match = EVRIT_PRODUCT_RE.search(unquote(urlparse(url).path))
+    return match.group(1) if match else ""
+
+
+def _plain_markup_text(raw: Any) -> str:
+    text = str(raw or "")
+    if not text.strip():
+        return ""
+    if "<" in text:
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+        text = re.sub(r"</p>", "\n", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+    return clean(text)
+
+
+def _evrit_people(value: Any) -> str:
+    if isinstance(value, dict):
+        return _plain_markup_text(value.get("Name") or value.get("name") or "")
+    if isinstance(value, list):
+        names = [_evrit_people(item) for item in value]
+        return ", ".join(part for part in names if part)
+    return _plain_markup_text(value)
+
+
+def _evrit_pricing_amount(block: Any) -> str:
+    if not isinstance(block, dict):
+        return ""
+    for key in ("priceFinal", "unitPrice", "priceBefore", "Price", "price"):
+        raw = block.get(key)
+        if raw in (None, ""):
+            continue
+        amount = format_price(str(raw))
+        if amount and float(amount) > 0:
+            return amount
+    return ""
+
+
+def _evrit_pricing_block(item: dict[str, Any]) -> dict[str, Any]:
+    for key in ("ProductPricing", "ProductFormatPricing"):
+        block = item.get(key)
+        if isinstance(block, dict):
+            return block
+    return item
+
+
+def evrit_preferred_price(pricing: Any) -> tuple[str, str]:
+    """Return (price, kind). The printed / cover price is the catalog price, not digital."""
+    if not isinstance(pricing, dict):
+        return "", ""
+    block = _evrit_pricing_block(pricing) if "PrintedPricing" not in pricing and "DigitalPricing" not in pricing else pricing
+    if "PrintedPricing" not in block and "DigitalPricing" not in block:
+        block = _evrit_pricing_block(block)
+    printed = _evrit_pricing_amount(block.get("PrintedPricing"))
+    if printed:
+        return printed, "print"
+    retail = block.get("RetailPrice")
+    if retail not in (None, ""):
+        amount = format_price(str(retail))
+        if amount and float(amount) > 0:
+            return amount, "print"
+    digital = _evrit_pricing_amount(block.get("DigitalPricing"))
+    if digital:
+        return digital, "digital"
+    return "", ""
+
+
+def evrit_image_url(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        return value
+    return "https://images.e-vrit.co.il/" + value.lstrip("/")
+
+
+def _evrit_page_count(*values: Any) -> str:
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        digits = text if text.isdigit() else (parse_pages(text) or re.sub(r"\D", "", text))
+        if digits and digits.isdigit() and int(digits) > 0:
+            return digits
+    return ""
+
+
+def _evrit_catalog_year(item: dict[str, Any]) -> str:
+    """Publication year from e-vrit catalog fields, not from the book description."""
+    for key in ("PublishYear", "PublishDate", "DatePublished", "PublishedDate"):
+        year = extract_year(str(item.get(key) or ""))
+        if year:
+            return year
+    month = str(item.get("PublishMonth") or "").strip()
+    year = extract_year(str(item.get("PublishYear") or ""))
+    if year:
+        return year
+    if month:
+        return extract_year(month)
+    return ""
+
+
+def fill_from_evrit_payload(book: Book, item: dict[str, Any]) -> None:
+    """Map e-vrit catalog JSON (listing, product, or extra-details) onto a book.
+
+    On a product such as https://www.e-vrit.co.il/product/39436 the site splits data:
+    listing/product JSON has printed vs digital prices; extra/1 has PublishDate
+    (e.g. מרץ 2026); extra/2 has NumOfPrintedPages. Schema.org offers the digital price.
+    """
+    if not isinstance(item, dict):
+        return
+    for key in ("ProductName", "Name", "Title", "BookName", "DisplayName"):
+        name = _plain_markup_text(item.get(key))
+        if name:
+            book.title = book.title or name
+            break
+    authors = _evrit_people(item.get("Authors") or item.get("Author") or item.get("AuthorName"))
+    if authors:
+        book.author = book.author or authors
+    publishers = _evrit_people(item.get("Publishers") or item.get("Publisher"))
+    if publishers:
+        book.publisher = book.publisher or publishers
+    year = _evrit_catalog_year(item)
+    if year:
+        book.year = year
+        publish_date = str(item.get("PublishDate") or "").strip()
+        if publish_date:
+            book.set_captured("year", publish_date)
+    printed_pages = _evrit_page_count(item.get("NumOfPrintedPages"))
+    listing_pages = _evrit_page_count(item.get("NumOfPages"), item.get("Pages"))
+    pages = printed_pages or listing_pages
+    if pages:
+        book.pages = pages
+    price, kind = evrit_preferred_price(_evrit_pricing_block(item))
+    if price and (kind == "print" or not book.price_ils):
+        book.price_ils = price
+    if not book.description:
+        book.description = _plain_markup_text(item.get("ShortDescription") or item.get("LongDescription") or "")
+    image = evrit_image_url(item.get("ProductImage") or item.get("Image"))
+    if image and not book.cover_image_url:
+        book.cover_image_url = image
+    for key in ("Isbn", "ISBN", "ISBN13", "Barcode", "DanaCode", "Danacode"):
+        apply_identifier(book, str(item.get(key) or ""))
+
+
+def fill_from_evrit_html(book: Book, soup: BeautifulSoup, url: str) -> None:
+    """e-vrit HTML shows digital first; the printed edition is the catalog price we want."""
+    if not is_evrit_host(url):
+        return
+    printed_price = ""
+    for tag in soup.select("[aria-label]"):
+        label = str(tag.get("aria-label") or "")
+        if "מודפס" not in label:
+            continue
+        printed_price = parse_price(label)
+        if printed_price:
+            break
+    if not printed_price:
+        icon = soup.select_one('[data-icon-type="print"]')
+        if icon:
+            box = icon.find_parent(attrs={"role": "button"}) or icon.parent
+            if box:
+                printed_price = parse_price(box.get_text(" ", strip=True))
+    if not printed_price:
+        for node in soup.find_all(string=re.compile(r"גב\s*הספר")):
+            parent = getattr(node, "parent", None)
+            if parent is None:
+                continue
+            printed_price = parse_price(parent.get_text(" ", strip=True))
+            if printed_price:
+                break
+    if printed_price:
+        book.price_ils = printed_price
 
 
 @dataclass
@@ -1240,6 +1418,7 @@ def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
             if (book.url or "").strip() == extra_url:
                 _keep_identity(book, extra)
                 book.merge_missing(extra)
+                overlay_evrit_catalog(book, extra)
                 book.refresh_text_fields()
                 return book, False
     if extra_title:
@@ -1247,6 +1426,7 @@ def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
             if books_match(book, extra):
                 _keep_identity(book, extra)
                 book.merge_missing(extra)
+                overlay_evrit_catalog(book, extra)
                 book.refresh_text_fields()
                 return book, False
         extra.stamp_created()
@@ -1257,6 +1437,26 @@ def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
         primary.append(extra)
         return extra, True
     return extra, False
+
+
+def overlay_evrit_catalog(book: Book, extra: Book) -> None:
+    """e-vrit catalog year, printed pages, and printed price replace weaker guesses."""
+    if not is_evrit_host(extra.url):
+        return
+    if extra.year:
+        book.year = extra.year
+    if extra.pages:
+        book.pages = extra.pages
+    extra_price = format_price(extra.price_ils)
+    if not extra_price:
+        return
+    current = format_price(book.price_ils)
+    try:
+        better = not current or float(extra_price) >= float(current or 0)
+    except ValueError:
+        better = not current
+    if better:
+        book.price_ils = extra.price_ils
 
 
 def fill_missing_entry_dates(books: list[Book], when: str = "") -> int:
@@ -1461,6 +1661,8 @@ def format_price(text: str | None) -> str:
 
 def prefer_catalog_price(book: Book, soup: BeautifulSoup) -> None:
     """Use the list/catalog price when a sale price is shown struck through."""
+    if is_evrit_host(book.url):
+        return
     catalog = ""
     for block in soup.select(".price--on-sale .price__sale, .price__sale"):
         struck = block.select_one("s, del, strike")
@@ -1558,7 +1760,7 @@ def schema_name(value: Any) -> str:
     return clean(value)
 
 
-def fill_from_schema(book: Book, item: dict) -> None:
+def fill_from_schema(book: Book, item: dict, url: str = "") -> None:
     types = schema_types(item)
     if not types.intersection({"book", "product", "offer"}):
         return
@@ -1580,7 +1782,7 @@ def fill_from_schema(book: Book, item: dict) -> None:
     offers = item.get("offers")
     if isinstance(offers, list) and offers:
         offers = offers[0]
-    if isinstance(offers, dict):
+    if isinstance(offers, dict) and not is_evrit_host(url):
         currency = str(offers.get("priceCurrency") or "").upper()
         if currency in {"ILS", "IL", "NIS", ""}:
             book.price_ils = book.price_ils or clean(offers.get("price"))
@@ -1775,7 +1977,7 @@ def extract_book_from_html(html: str, url: str) -> Book:
     soup = parse_html(html)
     book = Book(url=url)
     for item in json_ld_objects(html):
-        fill_from_schema(book, item)
+        fill_from_schema(book, item, url)
     fill_from_booknet(book, soup, url)
     fill_from_magento(book, soup)
     from field_map import attach_page_fields, collect_extra_pairs, remember_candidates
@@ -1786,6 +1988,7 @@ def extract_book_from_html(html: str, url: str) -> Book:
     attach_page_fields(book, pairs)
     remember_candidates(pairs, url)
     fill_from_nli(book, soup, url)
+    fill_from_evrit_html(book, soup, url)
     if not book.title:
         og = soup.select_one("meta[property='og:title']")
         h1 = soup.find("h1")
@@ -2656,15 +2859,48 @@ class BookCrawler:
             time.sleep(self.delay_seconds)
         return html, response.url
 
+    def _evrit_json(self, url: str) -> dict[str, Any] | None:
+        try:
+            raw, _final = self.fetch(url)
+        except (SiteError, requests.RequestException):
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def apply_evrit_product_apis(self, book: Book, page_url: str) -> None:
+        """Fill year, printed pages, and printed price from e-vrit JSON APIs."""
+        product_id = evrit_product_id(page_url or book.url)
+        if not product_id:
+            return
+        parsed = urlparse(page_url if "://" in (page_url or "") else "https://" + (page_url or book.url))
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        for path in (
+            f"/api/product/{product_id}",
+            f"/api/product/extra/{product_id}",
+            f"/api/product/extra/{product_id}/2",
+        ):
+            payload = self._evrit_json(origin + path)
+            if payload:
+                fill_from_evrit_payload(book, payload)
+        book.refresh_text_fields()
+        book.mark_origin_fields()
+
     def _book_and_html(self, product_url: str, remember: bool = True) -> tuple[Book | None, str, str]:
         from book_cache import get_page_book, remember_page_book, save_page_cache
 
         cached = get_page_book(product_url)
         if cached and cached.title:
+            if is_evrit_host(product_url):
+                self.apply_evrit_product_apis(cached, cached.url or product_url)
+                remember_page_book(cached)
             self.report.product_cached += 1
             return cached, "", cached.url
         html, resolved = self.fetch(product_url)
         book = extract_book_from_html(html, resolved)
+        self.apply_evrit_product_apis(book, resolved or product_url)
         self.report.product_fetched += 1
         if remember and book.title and not is_query_listing_url(resolved):
             remember_page_book(book)
@@ -2741,19 +2977,9 @@ class BookCrawler:
                     seen.add(product_url)
                     urls.append(product_url)
                     batch.append(product_url)
-                    name = ""
-                    author = ""
-                    for key in ("Name", "Title", "ProductName", "BookName", "DisplayName"):
-                        name = str(item.get(key) or "").strip()
-                        if name:
-                            break
-                    authors = item.get("Authors") or item.get("Author") or item.get("AuthorName")
-                    if isinstance(authors, list):
-                        author = ", ".join(str(part).strip() for part in authors if str(part).strip())
-                    else:
-                        author = str(authors or "").strip()
                     if on_listed:
-                        listed = Book(url=product_url, title=name, author=author, year=item_year)
+                        listed = Book(url=product_url)
+                        fill_from_evrit_payload(listed, item)
                         listed.refresh_text_fields()
                         if listed.title:
                             listed.append_scan_log("Found in the catalog listing.")
@@ -2887,6 +3113,7 @@ class BookCrawler:
 
         if is_product_page(soup, final_url):
             book = extract_book_from_html(html, final_url)
+            self.apply_evrit_product_apis(book, final_url)
             self.report.product_fetched += 1
             self.report.product_links = 1
             if book.title:
