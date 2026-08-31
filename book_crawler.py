@@ -581,7 +581,7 @@ class Book:
     def display_title(self) -> str:
         return self.title or self.title_en or self.title_phonetic or self.url
 
-    def refresh_text_fields(self) -> bool:
+    def refresh_text_fields(self, *, allow_llm: bool = False) -> bool:
         """Fix garbled encodings and fill official English plus phonetic titles.
 
         Generating a phonetic title does not change the updated date.
@@ -616,23 +616,39 @@ class Book:
             if captured_ph and not has_hebrew(captured_ph):
                 phonetic = captured_ph
         self.title_phonetic = phonetic
-        return self.ensure_phonetic()
+        return self.ensure_phonetic(allow_llm=allow_llm)
 
-    def ensure_phonetic(self) -> bool:
+    def ensure_phonetic(self, *, allow_llm: bool = False) -> bool:
         """Fill a missing phonetic title from Hebrew. Does not change the updated date."""
         from hebrew_text import hebrew_phonetic, split_hebrew_latin
 
         current = (self.title_phonetic or "").strip()
-        if current and not has_hebrew(current):
+        if current and not has_hebrew(current) and not allow_llm:
+            return False
+        if current and not has_hebrew(current) and (self.extra.get("phonetic_source") or "") == "llm":
             return False
         hebrew, _latin = split_hebrew_latin(self.title)
         source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
         if not source:
             return False
-        generated = hebrew_phonetic(source)
+        if allow_llm:
+            import llm_client
+
+            generated = llm_client.phonetic_title(source, allow_llm=True)
+            if generated and not has_hebrew(generated) and generated != current:
+                self.title_phonetic = generated
+                self.extra["phonetic_source"] = (
+                    "llm" if llm_client.last_phonetic_report.succeeded else "algorithm"
+                )
+                return True
+            generated = generated or hebrew_phonetic(source)
+        else:
+            generated = hebrew_phonetic(source)
         if not generated or generated == current:
             return False
         self.title_phonetic = generated
+        if not (self.extra.get("phonetic_source") or "").strip():
+            self.extra["phonetic_source"] = "algorithm"
         return True
 
     def identity_code(self) -> str:
@@ -1253,12 +1269,39 @@ def fill_missing_entry_dates(books: list[Book], when: str = "") -> int:
     return filled
 
 
-def fill_missing_phonetics(books: list[Book]) -> int:
+def fill_missing_phonetics(books: list[Book], *, use_llm: bool = True) -> int:
     """Generate phonetic titles for Hebrew books that lack one. Does not change updated dates."""
+    from hebrew_text import has_hebrew as title_has_hebrew, split_hebrew_latin
+    from llm_client import PhoneticLlmReport, llm_allowed, phonetic_titles
+    import llm_client
+
+    llm_client.last_phonetic_report = PhoneticLlmReport()
     filled = 0
+    pending: list[Book] = []
+    sources: list[str] = []
     for book in books:
-        if book.refresh_text_fields():
+        if book.refresh_text_fields(allow_llm=False):
             filled += 1
+        hebrew, _latin = split_hebrew_latin(book.title)
+        source = hebrew if title_has_hebrew(hebrew) else (book.title if title_has_hebrew(book.title) else "")
+        if source and (book.extra.get("phonetic_source") or "") != "llm":
+            pending.append(book)
+            sources.append(source)
+    if pending and use_llm and llm_allowed():
+        results = phonetic_titles(sources, allow_llm=True)
+        llm_set = set(llm_client.last_phonetic_report.llm_indexes)
+        for offset, book in enumerate(pending):
+            text = results[offset] if offset < len(results) else ""
+            if not text or title_has_hebrew(text):
+                continue
+            was_missing = not (book.title_phonetic or "").strip() or title_has_hebrew(book.title_phonetic)
+            book.title_phonetic = text
+            if offset in llm_set:
+                book.extra["phonetic_source"] = "llm"
+            elif was_missing and not (book.extra.get("phonetic_source") or "").strip():
+                book.extra["phonetic_source"] = "algorithm"
+            if was_missing:
+                filled += 1
     return filled
 
 

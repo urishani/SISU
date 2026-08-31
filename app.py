@@ -23,6 +23,9 @@ from dataclasses import asdict
 from activity_log import ActivityLog
 from app_config import (
     BROWSERS,
+    LLM_DEFAULT_BASE_URLS,
+    LLM_DEFAULT_MODELS,
+    LLM_SERVICES,
     browser_executable,
     browser_label,
     load_config,
@@ -359,7 +362,7 @@ class BookCatalogApp(tk.Tk):
             self.open_lists_manager,
             "Open, rename, or delete saved scan lists.",
         )
-        header_button("Settings", self.open_settings, "Publisher websites, field aliases, and the browser to open.")
+        header_button("Settings", self.open_settings, "Publisher websites, field aliases, the browser to open, and LLM.")
         self.after_idle(self._fit_search_fields)
 
         body = ttk.Frame(self)
@@ -850,10 +853,12 @@ class BookCatalogApp(tk.Tk):
         browser_tab = ttk.Frame(body, padding=12)
         publisher_tab = ttk.Frame(body, padding=12)
         aliases_tab = ttk.Frame(body, padding=12)
+        llm_tab = ttk.Frame(body, padding=12)
         tab_frames = {
             "browser": browser_tab,
             "publishers": publisher_tab,
             "aliases": aliases_tab,
+            "llm": llm_tab,
         }
         tab_buttons: dict[str, tk.Button] = {}
 
@@ -885,6 +890,7 @@ class BookCatalogApp(tk.Tk):
         make_tab("browser", "Browser")
         make_tab("publishers", "Publisher sites")
         make_tab("aliases", "Field aliases")
+        make_tab("llm", "LLM")
 
         browser_var = tk.StringVar(value=data.get("browser") or "chrome")
         custom_path = tk.StringVar(value=data.get("browser_path") or "")
@@ -1130,6 +1136,220 @@ class BookCatalogApp(tk.Tk):
         _fill_cover_rows(cover_items)
         ttk.Button(aliases_tab, text="Add cover word", command=lambda: _append_cover_row("", "")).pack(anchor="w")
 
+        llm = data.get("llm") if isinstance(data.get("llm"), dict) else {}
+        llm_enabled = tk.BooleanVar(value=bool(llm.get("enabled")))
+        service_var = tk.StringVar(value=str(llm.get("service") or "openai"))
+        model_var = tk.StringVar(value=str(llm.get("model") or LLM_DEFAULT_MODELS.get("openai") or ""))
+        api_key_var = tk.StringVar(value=str(llm.get("api_key") or ""))
+        base_url_var = tk.StringVar(value=str(llm.get("base_url") or ""))
+        show_key = tk.BooleanVar(value=False)
+        no_token_limit = tk.BooleanVar(value=int(llm.get("token_limit") or 0) <= 0)
+        token_limit_var = tk.StringVar(
+            value="" if int(llm.get("token_limit") or 0) <= 0 else str(int(llm.get("token_limit") or 0))
+        )
+        usage_tokens = [max(0, int(llm.get("tokens_used") or 0))]
+        usage_text = tk.StringVar(value="")
+
+        ttk.Label(
+            llm_tab,
+            text="Allow an LLM only to generate phonetic English spellings of Hebrew titles — not translations. The key stays on this computer.",
+            wraplength=740,
+        ).pack(anchor="w")
+        ttk.Checkbutton(llm_tab, text="Allow LLM", variable=llm_enabled).pack(anchor="w", pady=(10, 8))
+
+        llm_form = ttk.Frame(llm_tab)
+        llm_form.pack(fill="x")
+        llm_form.columnconfigure(1, weight=1)
+        service_labels = [label for _key, label in LLM_SERVICES]
+        service_by_label = {label: key for key, label in LLM_SERVICES}
+        label_by_service = {key: label for key, label in LLM_SERVICES}
+        service_choice = tk.StringVar(value=label_by_service.get(service_var.get(), "OpenAI"))
+
+        ttk.Label(llm_form, text="Service").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+        service_combo = ttk.Combobox(
+            llm_form,
+            textvariable=service_choice,
+            values=service_labels,
+            state="readonly",
+            width=28,
+        )
+        service_combo.grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(llm_form, text="Model").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
+        model_entry = ttk.Entry(llm_form, textvariable=model_var)
+        model_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        model_hint = ttk.Label(llm_form, text="")
+        model_hint.grid(row=2, column=1, sticky="w", pady=(0, 4))
+
+        ttk.Label(llm_form, text="API key").grid(row=3, column=0, sticky="e", padx=(0, 8), pady=4)
+        key_row = ttk.Frame(llm_form)
+        key_row.grid(row=3, column=1, sticky="ew", pady=4)
+        key_row.columnconfigure(0, weight=1)
+        key_entry = ttk.Entry(key_row, textvariable=api_key_var, show="*")
+        key_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(key_row, text="Show", variable=show_key).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(llm_form, text="API base URL").grid(row=4, column=0, sticky="e", padx=(0, 8), pady=4)
+        base_entry = ttk.Entry(llm_form, textvariable=base_url_var)
+        base_entry.grid(row=4, column=1, sticky="ew", pady=4)
+        ttk.Label(
+            llm_form,
+            text="Leave blank for the service default. Required for Custom (OpenAI-compatible) services.",
+            wraplength=560,
+        ).grid(row=5, column=1, sticky="w", pady=(0, 8))
+
+        ttk.Label(llm_form, text="Token budget").grid(row=6, column=0, sticky="ne", padx=(0, 8), pady=4)
+        budget = ttk.Frame(llm_form)
+        budget.grid(row=6, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(budget, text="No limit (the service may still cap usage)", variable=no_token_limit).pack(
+            anchor="w"
+        )
+        limit_row = ttk.Frame(budget)
+        limit_row.pack(anchor="w", pady=(4, 0))
+        ttk.Label(limit_row, text="Stop after").pack(side="left")
+        token_limit_entry = ttk.Entry(limit_row, textvariable=token_limit_var, width=12)
+        token_limit_entry.pack(side="left", padx=6)
+        ttk.Label(limit_row, text="tokens (prompt + reply, counted from each response).").pack(side="left")
+        _bind_entry_clipboard(model_entry)
+        _bind_entry_clipboard(key_entry)
+        _bind_entry_clipboard(base_entry)
+        _bind_entry_clipboard(token_limit_entry)
+
+        usage_label = ttk.Label(llm_tab, textvariable=usage_text, wraplength=740)
+        usage_label.pack(anchor="w", pady=(12, 4))
+        llm_buttons = ttk.Frame(llm_tab)
+        llm_buttons.pack(anchor="w", pady=(4, 0))
+
+        def _service_key() -> str:
+            return service_by_label.get(service_choice.get(), "openai")
+
+        def _refresh_usage_label() -> None:
+            from llm_client import usage_sentence
+
+            limit = 0 if no_token_limit.get() else _parse_token_limit(token_limit_var.get())
+            preview = {
+                "tokens_used": usage_tokens[0],
+                "token_limit": limit,
+                "last_total_tokens": int(llm.get("last_total_tokens") or 0),
+                "last_error": str(llm.get("last_error") or ""),
+            }
+            usage_text.set(usage_sentence(preview))
+
+        def _parse_token_limit(raw: str) -> int:
+            text = (raw or "").strip().replace(",", "")
+            if not text:
+                return 0
+            try:
+                return max(0, int(text))
+            except ValueError:
+                return -1
+
+        def _sync_key_show(*_args: object) -> None:
+            key_entry.configure(show="" if show_key.get() else "*")
+
+        def _sync_limit_state(*_args: object) -> None:
+            token_limit_entry.configure(
+                state="disabled" if (not llm_enabled.get() or no_token_limit.get()) else "normal"
+            )
+            _refresh_usage_label()
+
+        def _sync_service(*_args: object) -> None:
+            key = _service_key()
+            previous = service_var.get()
+            service_var.set(key)
+            if key != previous:
+                model_var.set(LLM_DEFAULT_MODELS.get(key, ""))
+            default_model = LLM_DEFAULT_MODELS.get(key) or "set a model name"
+            default_base = LLM_DEFAULT_BASE_URLS.get(key) or "your OpenAI-compatible URL"
+            model_hint.configure(text=f"Default for this service: {default_model}. Base: {default_base}")
+
+        def _llm_fields() -> dict:
+            key = _service_key()
+            limit = 0 if no_token_limit.get() else _parse_token_limit(token_limit_var.get())
+            if limit < 0:
+                raise ValueError("Token limit must be a whole number, or turn on No limit.")
+            if llm_enabled.get() and not api_key_var.get().strip():
+                raise ValueError("Paste an API key, or turn off Allow LLM.")
+            if llm_enabled.get() and not model_var.get().strip():
+                raise ValueError("Choose a model, or turn off Allow LLM.")
+            if llm_enabled.get() and key == "custom" and not base_url_var.get().strip():
+                raise ValueError("Custom LLM needs an API base URL.")
+            return {
+                "enabled": bool(llm_enabled.get()),
+                "service": key,
+                "api_key": api_key_var.get().strip(),
+                "model": model_var.get().strip(),
+                "base_url": base_url_var.get().strip().rstrip("/"),
+                "token_limit": limit,
+                "tokens_used": usage_tokens[0],
+            }
+
+        def _persist_llm_fields() -> dict:
+            from app_config import update_llm_config
+
+            fields = _llm_fields()
+            return update_llm_config(**fields)
+
+        def check_llm() -> None:
+            try:
+                _persist_llm_fields()
+            except ValueError as exc:
+                messagebox.showerror("LLM", str(exc))
+                return
+            win.configure(cursor="watch")
+            win.update_idletasks()
+            try:
+                from llm_client import test_connection
+
+                ok, message = test_connection()
+            finally:
+                win.configure(cursor="")
+            latest = load_config().get("llm") or {}
+            usage_tokens[0] = max(0, int(latest.get("tokens_used") or 0))
+            llm["last_total_tokens"] = int(latest.get("last_total_tokens") or 0)
+            llm["last_error"] = str(latest.get("last_error") or "")
+            _refresh_usage_label()
+            if ok:
+                messagebox.showinfo("LLM", message)
+            else:
+                messagebox.showerror("LLM", message)
+
+        def reset_usage() -> None:
+            from app_config import update_llm_config
+
+            usage_tokens[0] = 0
+            update_llm_config(tokens_used=0, last_prompt_tokens=0, last_completion_tokens=0, last_total_tokens=0, warned_ratio=0)
+            llm["last_total_tokens"] = 0
+            llm["last_error"] = ""
+            _refresh_usage_label()
+
+        check_btn = ttk.Button(llm_buttons, text="Check connection", command=check_llm)
+        check_btn.pack(side="left")
+        reset_btn = ttk.Button(llm_buttons, text="Reset usage count", command=reset_usage)
+        reset_btn.pack(side="left", padx=(8, 0))
+
+        def _sync_llm_enabled(*_args: object) -> None:
+            on = bool(llm_enabled.get())
+            state = "normal" if on else "disabled"
+            combo_state = "readonly" if on else "disabled"
+            service_combo.configure(state=combo_state)
+            for widget in (model_entry, key_entry, base_entry):
+                widget.configure(state=state)
+            token_limit_entry.configure(
+                state="disabled" if (not on or no_token_limit.get()) else "normal"
+            )
+            check_btn.configure(state=state)
+            reset_btn.configure(state=state)
+
+        show_key.trace_add("write", _sync_key_show)
+        no_token_limit.trace_add("write", _sync_limit_state)
+        llm_enabled.trace_add("write", _sync_llm_enabled)
+        service_combo.bind("<<ComboboxSelected>>", lambda _e: _sync_service())
+        _sync_service()
+        _sync_key_show()
+        _sync_limit_state()
+        _sync_llm_enabled()
+
         def save_aliases() -> bool:
             aliases: dict[str, str] = {}
             for label_var, field_var in alias_rows:
@@ -1177,24 +1397,46 @@ class BookCatalogApp(tk.Tk):
                 if not name:
                     continue
                 publishers[name] = normalize_site_url(url_var.get())
+            try:
+                llm_fields = _llm_fields()
+            except ValueError as exc:
+                show_tab("llm")
+                messagebox.showerror("LLM", str(exc))
+                return
+            current = load_config()
+            current_llm = dict(current.get("llm") or {})
+            current_llm.update(llm_fields)
             save_config(
                 {
                     "browser": browser_var.get().strip() or "chrome",
                     "browser_path": custom_path.get().strip(),
                     "publishers": publishers,
+                    "excel_dir": current.get("excel_dir") or "",
+                    "llm": current_llm,
                 }
             )
             if not save_aliases():
                 show_tab("aliases")
                 return
             close()
-            self._set_status("Settings saved.")
+            extra = ""
+            if llm_fields.get("enabled") and self.books:
+                extra = self._refill_phonetics_with_llm()
+            self._set_status(("Settings saved." + (" " + extra if extra else "")).strip())
             if self._selected_book:
                 self.show_book(self._selected_book)
 
         ttk.Button(buttons, text="Cancel", command=close).pack(side="right")
         ttk.Button(buttons, text="Save", command=save, style="Accent.TButton").pack(side="right", padx=(0, 8))
-        start_tab = "aliases" if focus_tab == "aliases" else "publishers" if focus_publisher.strip() else "browser"
+        start_tab = (
+            "llm"
+            if focus_tab == "llm"
+            else "aliases"
+            if focus_tab == "aliases"
+            else "publishers"
+            if focus_publisher.strip()
+            else "browser"
+        )
         show_tab(start_tab)
         win.lift()
         win.focus_force()
@@ -1591,11 +1833,9 @@ class BookCatalogApp(tk.Tk):
         else:
             self.summary.set(f"{len(self.books)} book(s) in this list.")
         message = status or f"Opened “{self.list_title.get()}” with {len(self.books)} book(s)."
-        if phonetic_filled:
-            message = (
-                f"{message} Filled phonetic titles for {phonetic_filled:,} "
-                "Hebrew book(s) without marking them updated."
-            )
+        extra = self._phonetic_fill_message(phonetic_filled)
+        if extra:
+            message = f"{message} {extra}"
         self._set_status(message)
         self._refresh_list_status()
 
@@ -1942,7 +2182,7 @@ class BookCatalogApp(tk.Tk):
         seed_books = list(self.books)
         scan_started = entry_now()
         fill_missing_entry_dates(self.books, scan_started)
-        fill_missing_phonetics(self.books)
+        fill_missing_phonetics(self.books, use_llm=False)
         if self.books:
             self.table.set_books(self.books, keep_checks=True)
         self._follow_search = True
@@ -2266,9 +2506,11 @@ class BookCatalogApp(tk.Tk):
         self._cancel_live_save()
         if not failed:
             self.scan_live.set("")
+        phonetic_note = ""
         if books:
             self.books = books
-            self._prepare_books(self.books)
+            filled = self._prepare_books(self.books)
+            phonetic_note = self._phonetic_fill_message(filled)
             self.table.set_books(self.books, keep_checks=False)
         if (not self.list_title.get().strip() or self.list_title.get().strip() == "New") and self.books:
             self.list_title.set(default_scan_title(len(self.books), self.year.get().strip()))
@@ -2284,18 +2526,20 @@ class BookCatalogApp(tk.Tk):
         self._persist_working(self._list_report)
         year = self.year.get().strip() or "any year"
         list_failed = failed or bool(report.error and not self.books and not cancelled)
+
+        def _status(text: str) -> None:
+            self._set_status((text + (" " + phonetic_note if phonetic_note else "")).strip())
+
         if cancelled:
             self._end_work("stopped")
-            self._set_status(
-                f"Stopped. {len(self.books)} book(s) from {year} are kept in the working list."
-            )
+            _status(f"Stopped. {len(self.books)} book(s) from {year} are kept in the working list.")
         elif list_failed:
             self._end_work("failed")
             detail = (error or report.error or "See the error message.").strip()
-            self._set_status(f"Search failed. {detail}")
+            _status(f"Search failed. {detail}")
         else:
             self._end_work("done")
-            self._set_status(
+            _status(
                 f"Search finished. {len(self.books)} book(s) from {year}. "
                 "The working list is kept until you save or clear it."
             )
@@ -3352,6 +3596,46 @@ class BookCatalogApp(tk.Tk):
         attach_books(books)
         self._sync_books_from_list_excel(books)
         return phonetic_filled
+
+    def _phonetic_fill_message(self, filled: int) -> str:
+        import llm_client
+        from llm_client import phonetic_status_note
+
+        report = llm_client.last_phonetic_report
+        note = phonetic_status_note()
+        parts: list[str] = []
+        if filled:
+            parts.append(
+                f"Filled phonetic titles for {filled:,} Hebrew book(s) without marking them updated."
+            )
+        elif report.succeeded:
+            parts.append(
+                f"Updated {report.succeeded:,} phonetic titles with the LLM without marking books updated."
+            )
+        if note:
+            if parts:
+                parts[-1] = parts[-1].rstrip(".") + f" ({note})."
+            else:
+                parts.append(note[0].upper() + note[1:] if note else "")
+        warning = (report.warning or "").strip()
+        if report.skipped_limit and not warning:
+            warning = report.error
+        if warning:
+            parts.append(warning)
+            self.after(10, lambda text=warning: messagebox.showwarning("LLM usage", text))
+        elif report.error and report.attempted and not report.succeeded:
+            parts.append(report.error)
+        return " ".join(part for part in parts if part)
+
+    def _refill_phonetics_with_llm(self) -> str:
+        if not self.books:
+            return ""
+        filled = fill_missing_phonetics(self.books)
+        self._persist_working()
+        self.table.set_books(self.books, keep_checks=True)
+        if self._selected_book:
+            self.table.select_book(self._selected_book)
+        return self._phonetic_fill_message(filled)
 
     def _book_excel_keys(self, book: Book) -> set[str]:
         keys: set[str] = set()
