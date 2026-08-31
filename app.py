@@ -36,6 +36,8 @@ from book_crawler import (
     CrawlCancelled,
     CrawlReport,
     catalog_listing_url,
+    entry_now,
+    fill_missing_entry_dates,
     format_entry_stamp,
     format_person_name,
     format_price,
@@ -1901,6 +1903,12 @@ class BookCatalogApp(tk.Tk):
         self._update_list_action_buttons()
         self._cancel_live_save()
         seed_books = list(self.books)
+        scan_started = entry_now()
+        fill_missing_entry_dates(self.books, scan_started)
+        for book in self.books:
+            book.refresh_text_fields()
+        if self.books:
+            self.table.set_books(self.books, keep_checks=True)
         self._follow_search = True
         self._scan_site = ""
         self._scan_found = len(self.books)
@@ -1938,6 +1946,7 @@ class BookCatalogApp(tk.Tk):
                 self._list_notes,
                 self._list_created_at,
                 seed_books,
+                scan_started,
             ),
             daemon=True,
         )
@@ -2110,6 +2119,7 @@ class BookCatalogApp(tk.Tk):
         notes: str,
         created_at: str,
         seed_books: list[Book] | None = None,
+        seed_stamp: str = "",
     ) -> None:
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
@@ -2124,6 +2134,7 @@ class BookCatalogApp(tk.Tk):
                 max_listing_pages=max_pages,
                 include_unknown_year=include_unknown,
                 seed_books=seed_books,
+                seed_stamp=seed_stamp,
             )
             self._prepare_books(books)
             try:
@@ -3127,13 +3138,25 @@ class BookCatalogApp(tk.Tk):
                 if field:
                     shown.add(field)
         else:
-            add_field("title", "Title (Hebrew)", fields.get("title_he", ""))
+            add_field("title", "Title (Hebrew)", fields.get("title_he", "") or book.title)
+            add_field("title_en", "Title in English", fields.get("title_en", "") or book.title_en)
+            add_field("title_phonetic", "Title (phonetics)", fields.get("title_phonetic", "") or book.title_phonetic)
             add_field("publisher", "Publisher", fields.get("publisher", ""))
             add_field("isbn", "ISBN", fields.get("isbn", ""))
             add_field("year", "Copyright year", fields.get("year", ""))
             add_field("pages", "Number of pages", fields.get("pages", ""))
             add_field("price_ils", "Israeli price (Shekel)", format_price(fields.get("price_ils", "")))
 
+        for key, label in (
+            ("title_en", "Title in English"),
+            ("title_phonetic", "Title (phonetics)"),
+        ):
+            if key in shown:
+                continue
+            value = fields.get(key) or getattr(book, key, "") or ""
+            if value:
+                add_field(key, label, value)
+                shown.add(key)
         extra_rows: list[tuple[str, str, str]] = []
         for col in self.excel_all_columns:
             field = col.get("field") or ""
@@ -3266,8 +3289,10 @@ class BookCatalogApp(tk.Tk):
         win.focus_force()
 
     def _prepare_books(self, books: list[Book]) -> None:
+        shared = entry_now()
         for book in books:
-            book.stamp_created()
+            book.refresh_text_fields()
+            book.fill_missing_dates(shared)
             if book.author:
                 book.author = format_person_name(book.author) or book.author
             if book.translator:
@@ -3609,6 +3634,7 @@ class BookCatalogApp(tk.Tk):
             self.work_hint.set(f"{checking_count:,} / {total_count:,}")
 
     def _prepare_one_book(self, book: Book) -> None:
+        book.refresh_text_fields()
         book.stamp_created()
         if book.author:
             book.author = format_person_name(book.author) or book.author

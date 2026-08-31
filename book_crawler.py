@@ -151,6 +151,35 @@ def request_failure_message(exc: BaseException, url: str) -> str:
         return http_status_message(int(status), url)
     return f"Could not open {host}: {exc.__class__.__name__}."
 
+
+def decode_http_text(response: requests.Response) -> str:
+    """Decode catalog pages as UTF-8 when possible so Hebrew titles stay readable."""
+    raw = response.content or b""
+    if not raw:
+        return ""
+    ctype = (response.headers.get("Content-Type") or "").lower()
+    path = urlparse(response.url or "").path.lower()
+    charset = ""
+    match = re.search(r"charset\s*=\s*[\"']?([\w-]+)", ctype)
+    if match:
+        charset = match.group(1).lower().replace("utf8", "utf-8")
+    json_body = "json" in ctype or "/api/" in path
+    if json_body or charset in {"", "utf-8"}:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    for encoding in (charset, "utf-8", "cp1255", "iso-8859-8", response.apparent_encoding or ""):
+        name = (encoding or "").replace("utf8", "utf-8")
+        if not name:
+            continue
+        try:
+            return raw.decode(name)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 ISBN_RE = re.compile(r"(?:97[89][-\s]?)?(?:\d[-\s]?){9,12}[\dXx]")
@@ -424,6 +453,8 @@ def evrit_group_id(url: str) -> str:
 class Book:
     url: str
     title: str = ""
+    title_en: str = ""
+    title_phonetic: str = ""
     author: str = ""
     publisher: str = ""
     year: str = ""
@@ -468,11 +499,30 @@ class Book:
             book.extra = {str(key): str(value) for key, value in extra.items()}
         return book
 
-    def stamp_created(self) -> None:
+    def stamp_created(self, when: str = "") -> None:
+        stamp = (when or "").strip() or entry_now()
         if not (self.created_at or "").strip():
-            self.created_at = entry_now()
+            self.created_at = stamp
         if not (self.modified_at or "").strip():
             self.modified_at = self.created_at
+
+    def fill_missing_dates(self, when: str = "") -> bool:
+        """Give created and updated the same timestamp when either is missing."""
+        stamp = (when or "").strip() or entry_now()
+        created = (self.created_at or "").strip()
+        modified = (self.modified_at or "").strip()
+        changed = False
+        if not created and not modified:
+            self.created_at = stamp
+            self.modified_at = stamp
+            return True
+        if not created:
+            self.created_at = modified or stamp
+            changed = True
+        if not (self.modified_at or "").strip():
+            self.modified_at = self.created_at or stamp
+            changed = True
+        return changed
 
     def stamp_modified(self) -> None:
         stamp = entry_now()
@@ -529,7 +579,44 @@ class Book:
         return self.scanner_id or self.isbn or self.danacode or self.url or self.display_title()
 
     def display_title(self) -> str:
-        return self.title or self.url
+        return self.title or self.title_en or self.title_phonetic or self.url
+
+    def refresh_text_fields(self) -> None:
+        """Fix garbled encodings and fill official English plus phonetic titles."""
+        from hebrew_text import hebrew_phonetic, repair_text, split_hebrew_latin
+
+        self.title = repair_text(self.title)
+        self.title_en = repair_text(self.title_en)
+        self.title_phonetic = repair_text(self.title_phonetic)
+        self.author = repair_text(self.author)
+        self.publisher = repair_text(self.publisher)
+        self.description = repair_text(self.description)
+        self.translator = repair_text(self.translator)
+        self.illustrator = repair_text(self.illustrator)
+        hebrew, latin = split_hebrew_latin(self.title)
+        if hebrew and latin:
+            self.title = hebrew
+            if not (self.title_en or "").strip():
+                self.title_en = latin
+        elif latin and not has_hebrew(self.title) and not (self.title_en or "").strip():
+            self.title_en = latin
+        captured = self.captured_fields()
+        if not (self.title_en or "").strip():
+            incoming = repair_text(captured.get("title_en") or "")
+            if incoming and not has_hebrew(incoming):
+                self.title_en = incoming
+        hebrew_source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
+        phonetic = (self.title_phonetic or "").strip()
+        if phonetic and has_hebrew(phonetic):
+            phonetic = ""
+        if not phonetic:
+            captured_ph = repair_text(captured.get("title_phonetic") or "")
+            if captured_ph and not has_hebrew(captured_ph):
+                phonetic = captured_ph
+        if not phonetic and hebrew_source:
+            phonetic = hebrew_phonetic(hebrew_source)
+        if phonetic:
+            self.title_phonetic = phonetic
 
     def identity_code(self) -> str:
         return self.isbn or self.danacode or self.upc or ""
@@ -688,6 +775,12 @@ class Book:
                 setattr(self, name, incoming)
                 filled.append(name)
                 self.record_field_source(name, other.field_source_url(name) or other.url)
+        for name in ("title_en", "title_phonetic"):
+            current = str(getattr(self, name, "") or "").strip()
+            incoming = str(getattr(other, name, "") or "").strip()
+            if not current and incoming:
+                setattr(self, name, incoming)
+                filled.append(name)
         if other.url:
             self.record_site_page(other.url)
         other_captured = other.captured_fields()
@@ -814,11 +907,23 @@ class Book:
         captured = self.captured_fields()
         if captured.get("description_en"):
             desc_en = captured.get("description_en") or desc_en
+        if (self.title_en or "").strip():
+            title_en = self.title_en
+        elif captured.get("title_en"):
+            title_en = captured.get("title_en") or title_en
+        if has_hebrew(self.title):
+            title_he = self.title
+        phonetic = (self.title_phonetic or "").strip() or captured.get("title_phonetic") or ""
+        if has_hebrew(phonetic):
+            from hebrew_text import hebrew_phonetic as to_phonetic
+
+            phonetic = to_phonetic(title_he or self.title)
         fields = {
             "publisher": clean(self.publisher),
             "author_en": author_en,
             "title_en": title_en,
             "title_he": title_he,
+            "title_phonetic": phonetic,
             "author_he": author_he,
             "upc": clean(self.upc),
             "danacode": clean(self.danacode),
@@ -930,7 +1035,11 @@ def clean(value: Any) -> str:
     if value is None:
         return ""
     text = re.sub(r"\s+", " ", str(value)).strip()
-    return text
+    if not text:
+        return ""
+    from hebrew_text import repair_text
+
+    return repair_text(text)
 
 
 def split_lang(text: str | None) -> tuple[str, str]:
@@ -1083,6 +1192,7 @@ def merge_catalog(primary: list[Book], extras: list[Book]) -> int:
 
 def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
     """Merge extra into the list, or append it. Returns (canonical book, added?)."""
+    extra.refresh_text_fields()
     extra_title = (extra.title or "").strip()
     extra_url = (extra.url or "").strip()
     if extra_url:
@@ -1090,12 +1200,14 @@ def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
             if (book.url or "").strip() == extra_url:
                 _keep_identity(book, extra)
                 book.merge_missing(extra)
+                book.refresh_text_fields()
                 return book, False
     if extra_title:
         for book in primary:
             if books_match(book, extra):
                 _keep_identity(book, extra)
                 book.merge_missing(extra)
+                book.refresh_text_fields()
                 return book, False
         extra.stamp_created()
         primary.append(extra)
@@ -1105,6 +1217,16 @@ def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
         primary.append(extra)
         return extra, True
     return extra, False
+
+
+def fill_missing_entry_dates(books: list[Book], when: str = "") -> int:
+    """Stamp every book that is missing created or updated, all with the same time."""
+    stamp = (when or "").strip() or entry_now()
+    filled = 0
+    for book in books:
+        if book.fill_missing_dates(stamp):
+            filled += 1
+    return filled
 
 
 def _keep_identity(book: Book, extra: Book) -> None:
@@ -1608,6 +1730,7 @@ def extract_book_from_html(html: str, url: str) -> Book:
     book.publisher = clean(book.publisher)
     book.description = clean(book.description)
     fill_book_images(book, soup, url, html)
+    book.refresh_text_fields()
     book.mark_origin_fields()
     return book
 
@@ -2447,8 +2570,7 @@ class BookCrawler:
             response = self.session.get(url, timeout=self.timeout)
         except requests.RequestException as exc:
             raise SiteError(request_failure_message(exc, url), url=url) from exc
-        response.encoding = response.apparent_encoding or response.encoding
-        html = response.text or ""
+        html = decode_http_text(response)
         failure = site_error_message(html, response.status_code, response.url or url)
         if failure:
             raise SiteError(failure, url=response.url or url)
@@ -2556,7 +2678,8 @@ class BookCrawler:
                         author = str(authors or "").strip()
                     if on_listed:
                         listed = Book(url=product_url, title=name, author=author, year=item_year)
-                        if name:
+                        listed.refresh_text_fields()
+                        if listed.title:
                             listed.append_scan_log("Found in the catalog listing.")
                             listed.refresh_scan_status()
                         on_listed(listed)
@@ -3217,9 +3340,13 @@ class BookCrawler:
         max_listing_pages: int = 5,
         include_unknown_year: bool = True,
         seed_books: list[Book] | None = None,
+        seed_stamp: str = "",
     ) -> list[Book]:
         books: list[Book] = list(seed_books or [])
         started_with = len(books)
+        fill_missing_entry_dates(books, seed_stamp)
+        for book in books:
+            book.refresh_text_fields()
         listing_urls = unique_catalog_urls(urls)
         requested = int(max_listing_pages or 0)
         page_limit = listing_page_cap(requested)
