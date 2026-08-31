@@ -581,9 +581,12 @@ class Book:
     def display_title(self) -> str:
         return self.title or self.title_en or self.title_phonetic or self.url
 
-    def refresh_text_fields(self) -> None:
-        """Fix garbled encodings and fill official English plus phonetic titles."""
-        from hebrew_text import hebrew_phonetic, repair_text, split_hebrew_latin
+    def refresh_text_fields(self) -> bool:
+        """Fix garbled encodings and fill official English plus phonetic titles.
+
+        Generating a phonetic title does not change the updated date.
+        """
+        from hebrew_text import repair_text, split_hebrew_latin
 
         self.title = repair_text(self.title)
         self.title_en = repair_text(self.title_en)
@@ -605,7 +608,6 @@ class Book:
             incoming = repair_text(captured.get("title_en") or "")
             if incoming and not has_hebrew(incoming):
                 self.title_en = incoming
-        hebrew_source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
         phonetic = (self.title_phonetic or "").strip()
         if phonetic and has_hebrew(phonetic):
             phonetic = ""
@@ -613,10 +615,25 @@ class Book:
             captured_ph = repair_text(captured.get("title_phonetic") or "")
             if captured_ph and not has_hebrew(captured_ph):
                 phonetic = captured_ph
-        if not phonetic and hebrew_source:
-            phonetic = hebrew_phonetic(hebrew_source)
-        if phonetic:
-            self.title_phonetic = phonetic
+        self.title_phonetic = phonetic
+        return self.ensure_phonetic()
+
+    def ensure_phonetic(self) -> bool:
+        """Fill a missing phonetic title from Hebrew. Does not change the updated date."""
+        from hebrew_text import hebrew_phonetic, split_hebrew_latin
+
+        current = (self.title_phonetic or "").strip()
+        if current and not has_hebrew(current):
+            return False
+        hebrew, _latin = split_hebrew_latin(self.title)
+        source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
+        if not source:
+            return False
+        generated = hebrew_phonetic(source)
+        if not generated or generated == current:
+            return False
+        self.title_phonetic = generated
+        return True
 
     def identity_code(self) -> str:
         return self.isbn or self.danacode or self.upc or ""
@@ -775,12 +792,15 @@ class Book:
                 setattr(self, name, incoming)
                 filled.append(name)
                 self.record_field_source(name, other.field_source_url(name) or other.url)
-        for name in ("title_en", "title_phonetic"):
-            current = str(getattr(self, name, "") or "").strip()
-            incoming = str(getattr(other, name, "") or "").strip()
-            if not current and incoming:
-                setattr(self, name, incoming)
-                filled.append(name)
+        current_en = str(self.title_en or "").strip()
+        incoming_en = str(other.title_en or "").strip()
+        if not current_en and incoming_en:
+            self.title_en = incoming_en
+            filled.append("title_en")
+        current_ph = str(self.title_phonetic or "").strip()
+        incoming_ph = str(other.title_phonetic or "").strip()
+        if (not current_ph or has_hebrew(current_ph)) and incoming_ph and not has_hebrew(incoming_ph):
+            self.title_phonetic = incoming_ph
         if other.url:
             self.record_site_page(other.url)
         other_captured = other.captured_fields()
@@ -792,10 +812,17 @@ class Book:
                 incoming = isolate_language(incoming)
             if incoming and not captured.get(name):
                 captured[name] = incoming
+                if name == "title_phonetic":
+                    continue
                 filled.append(name)
                 self.record_field_source(name, other.field_source_url(name) or other.url)
         if captured:
             self._save_map("captured", captured)
+        captured_ph = str(captured.get("title_phonetic") or "").strip()
+        current_ph = str(self.title_phonetic or "").strip()
+        if (not current_ph or has_hebrew(current_ph)) and captured_ph and not has_hebrew(captured_ph):
+            self.title_phonetic = captured_ph
+        self.ensure_phonetic()
         if other.extra.get("found_fields"):
             self.extra["publisher_found"] = other.extra["found_fields"]
         if other.extra.get("page_fields"):
@@ -913,11 +940,8 @@ class Book:
             title_en = captured.get("title_en") or title_en
         if has_hebrew(self.title):
             title_he = self.title
-        phonetic = (self.title_phonetic or "").strip() or captured.get("title_phonetic") or ""
-        if has_hebrew(phonetic):
-            from hebrew_text import hebrew_phonetic as to_phonetic
-
-            phonetic = to_phonetic(title_he or self.title)
+        self.ensure_phonetic()
+        phonetic = (self.title_phonetic or "").strip()
         fields = {
             "publisher": clean(self.publisher),
             "author_en": author_en,
@@ -1225,6 +1249,15 @@ def fill_missing_entry_dates(books: list[Book], when: str = "") -> int:
     filled = 0
     for book in books:
         if book.fill_missing_dates(stamp):
+            filled += 1
+    return filled
+
+
+def fill_missing_phonetics(books: list[Book]) -> int:
+    """Generate phonetic titles for Hebrew books that lack one. Does not change updated dates."""
+    filled = 0
+    for book in books:
+        if book.refresh_text_fields():
             filled += 1
     return filled
 

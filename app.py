@@ -38,6 +38,7 @@ from book_crawler import (
     catalog_listing_url,
     entry_now,
     fill_missing_entry_dates,
+    fill_missing_phonetics,
     format_entry_stamp,
     format_person_name,
     format_price,
@@ -1570,7 +1571,7 @@ class BookCatalogApp(tk.Tk):
         self._excel_dir = Path(excel_dir) if excel_dir else self._default_excel_dir()
         self._bind_list_excel_path(rename_existing=False)
         self.books = books_from_payload(data)
-        self._prepare_books(self.books)
+        phonetic_filled = self._prepare_books(self.books)
         self.table.set_books(self.books, keep_checks=False)
         self._clear_selected_book()
         self.refresh_excel_info()
@@ -1589,7 +1590,13 @@ class BookCatalogApp(tk.Tk):
                 self.summary.set(f"{len(self.books)} book(s) in this list.")
         else:
             self.summary.set(f"{len(self.books)} book(s) in this list.")
-        self._set_status(status or f"Opened “{self.list_title.get()}” with {len(self.books)} book(s).")
+        message = status or f"Opened “{self.list_title.get()}” with {len(self.books)} book(s)."
+        if phonetic_filled:
+            message = (
+                f"{message} Filled phonetic titles for {phonetic_filled:,} "
+                "Hebrew book(s) without marking them updated."
+            )
+        self._set_status(message)
         self._refresh_list_status()
 
     def _restore_working_list(self) -> None:
@@ -1935,8 +1942,7 @@ class BookCatalogApp(tk.Tk):
         seed_books = list(self.books)
         scan_started = entry_now()
         fill_missing_entry_dates(self.books, scan_started)
-        for book in self.books:
-            book.refresh_text_fields()
+        fill_missing_phonetics(self.books)
         if self.books:
             self.table.set_books(self.books, keep_checks=True)
         self._follow_search = True
@@ -3326,10 +3332,10 @@ class BookCatalogApp(tk.Tk):
         win.lift()
         win.focus_force()
 
-    def _prepare_books(self, books: list[Book]) -> None:
+    def _prepare_books(self, books: list[Book]) -> int:
         shared = entry_now()
+        phonetic_filled = fill_missing_phonetics(books)
         for book in books:
-            book.refresh_text_fields()
             book.fill_missing_dates(shared)
             if book.author:
                 book.author = format_person_name(book.author) or book.author
@@ -3345,6 +3351,7 @@ class BookCatalogApp(tk.Tk):
                     book.scan_message = "Scan did not complete."
         attach_books(books)
         self._sync_books_from_list_excel(books)
+        return phonetic_filled
 
     def _book_excel_keys(self, book: Book) -> set[str]:
         keys: set[str] = set()
