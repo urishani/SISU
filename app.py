@@ -2348,6 +2348,7 @@ class BookCatalogApp(tk.Tk):
         if not self._busy:
             self.more_btn.configure(state="normal")
         self._update_workflow_buttons(book)
+        book.refresh_text_fields()
         fields = book.to_excel_fields()
         self._set_details(book, fields)
         self._set_links(_book_link_items(book))
@@ -2974,6 +2975,7 @@ class BookCatalogApp(tk.Tk):
         is_error: bool = False,
         field_key: str = "",
         tone: str = "",
+        rtl: bool = False,
     ) -> None:
         del source
         row = self._detail_row
@@ -3021,6 +3023,10 @@ class BookCatalogApp(tk.Tk):
         shown = str(display)
         if expandable and not expanded:
             shown = self._detail_preview(str(value))
+        if rtl and not empty:
+            from bidi_text import rtl_left_aligned
+
+            shown = rtl_left_aligned(shown)
         val = tk.Label(
             self.detail_inner,
             text=shown,
@@ -3040,14 +3046,17 @@ class BookCatalogApp(tk.Tk):
         if expandable:
             full = str(value)
 
-            def toggle(_key=key, _val=val, _full=full) -> None:
+            def toggle(_key=key, _val=val, _full=full, _rtl=rtl) -> None:
+                from bidi_text import rtl_left_aligned
+
                 if _key in self._expanded_detail_keys:
                     self._expanded_detail_keys.discard(_key)
-                    _val.configure(text=self._detail_preview(_full))
+                    text = self._detail_preview(_full)
+                    _val.configure(text=rtl_left_aligned(text) if _rtl else text)
                     more_btn.configure(text="More")
                 else:
                     self._expanded_detail_keys.add(_key)
-                    _val.configure(text=_full)
+                    _val.configure(text=rtl_left_aligned(_full) if _rtl else _full)
                     more_btn.configure(text="Less")
 
             more_btn = tk.Button(
@@ -3142,17 +3151,30 @@ class BookCatalogApp(tk.Tk):
         def add_field(key: str, label: str, value: str) -> None:
             is_new = key in new_fields or book.is_external_source(_source_field_key(key))
             link = value if key in {"cover_image_url", "back_image_url"} and str(value or "").startswith("http") else ""
-            self._add_detail_row(label, value, is_new=is_new, link=link, field_key=key)
+            hebrew_title = key in {"title", "title_he"}
+            self._add_detail_row(
+                label,
+                value,
+                is_new=is_new,
+                link=link,
+                field_key=key,
+                rtl=hebrew_title,
+            )
+
+        title_he = fields.get("title_he") or book.title or ""
+        title_en = fields.get("title_en") or book.title_en or ""
+        title_phonetic = fields.get("title_phonetic") or book.title_phonetic or ""
+        add_field("title", "Title (Hebrew)", title_he)
+        add_field("title_en", "Title in English", title_en)
+        add_field("title_phonetic", "Title (phonetics)", title_phonetic)
+        shown.update({"title", "title_he", "title_en", "title_phonetic"})
 
         columns = self.excel_columns or []
         if columns:
             for col in columns:
                 field = col.get("field") or ""
                 header = str(col.get("header") or "")
-                if field == "description_he":
-                    shown.add(field)
-                    continue
-                if field == "scanner_id":
+                if field in {"description_he", "scanner_id", "title", "title_he", "title_en", "title_phonetic"}:
                     shown.add(field)
                     continue
                 value = fields.get(field, "") if field else ""
@@ -3168,25 +3190,11 @@ class BookCatalogApp(tk.Tk):
                 if field:
                     shown.add(field)
         else:
-            add_field("title", "Title (Hebrew)", fields.get("title_he", "") or book.title)
-            add_field("title_en", "Title in English", fields.get("title_en", "") or book.title_en)
-            add_field("title_phonetic", "Title (phonetics)", fields.get("title_phonetic", "") or book.title_phonetic)
             add_field("publisher", "Publisher", fields.get("publisher", ""))
             add_field("isbn", "ISBN", fields.get("isbn", ""))
             add_field("year", "Copyright year", fields.get("year", ""))
             add_field("pages", "Number of pages", fields.get("pages", ""))
             add_field("price_ils", "Israeli price (Shekel)", format_price(fields.get("price_ils", "")))
-
-        for key, label in (
-            ("title_en", "Title in English"),
-            ("title_phonetic", "Title (phonetics)"),
-        ):
-            if key in shown:
-                continue
-            value = fields.get(key) or getattr(book, key, "") or ""
-            if value:
-                add_field(key, label, value)
-                shown.add(key)
         extra_rows: list[tuple[str, str, str]] = []
         for col in self.excel_all_columns:
             field = col.get("field") or ""

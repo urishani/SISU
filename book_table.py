@@ -8,9 +8,18 @@ from tkinter import ttk
 from typing import Callable
 
 from book_crawler import Book, format_entry_stamp, format_price
+from bidi_text import rtl_left_aligned
 
 ROW_PAD = 6
 MARK_WIDTH = 36
+COLLAPSED_WIDTH = 48
+COLLAPSIBLE = ("created", "modified", "database")
+SHORT_HEADINGS = {
+    "created": "CR",
+    "modified": "UP",
+    "database": "DB",
+}
+WEDGE_PX = 18
 MIN_WIDTHS = {
     "title": 180,
     "created": 128,
@@ -91,6 +100,8 @@ class BookTable(ttk.Frame):
         self.filter_keys: set[str] = set()
         self._by_iid: dict[str, Book] = {}
         self._window_job: str | None = None
+        self._collapsed: set[str] = set()
+        self._skip_sort = False
         self.window_label = tk.StringVar(value="Rows 0–0 of 0")
 
         style = ttk.Style(self)
@@ -100,9 +111,9 @@ class BookTable(ttk.Frame):
         self._apply_rowheight()
 
         nav = ttk.Frame(self)
-        self.top_btn = ttk.Button(nav, text="⇈", width=3, command=self.go_top)
+        self.top_btn = ttk.Button(nav, text="Top", width=8, command=self.go_top)
         self.top_btn.pack(side="left")
-        self.bottom_btn = ttk.Button(nav, text="⇊", width=3, command=self.go_bottom)
+        self.bottom_btn = ttk.Button(nav, text="Bottom", width=8, command=self.go_bottom)
         self.bottom_btn.pack(side="left", padx=(4, 8))
         self.window_caption = ttk.Label(nav, textvariable=self.window_label)
         self.window_caption.pack(side="left")
@@ -160,11 +171,19 @@ class BookTable(ttk.Frame):
         ttk.Style(self).configure("Books.Treeview", rowheight=height)
 
     def _header_text(self, key: str, label: str) -> str:
+        if key in COLLAPSIBLE and key in self._collapsed:
+            return f"{SHORT_HEADINGS.get(key, key[:2].upper())}…"
+        extra = ""
+        if key in SORTABLE:
+            if self.sort_column != key:
+                extra = "  ↕"
+            else:
+                extra = f"  {'↓' if self.sort_reverse else '↑'}"
+        if key in COLLAPSIBLE:
+            return f"< {label}{extra}"
         if key not in SORTABLE:
             return label
-        if self.sort_column != key:
-            return f"{label}  ↕"
-        return f"{label}  {'↓' if self.sort_reverse else '↑'}"
+        return f"{label}{extra}"
 
     def _on_resize(self, event: tk.Event) -> None:
         if event.widget is not self:
@@ -176,13 +195,17 @@ class BookTable(ttk.Frame):
         yscroll = 18
         inner = max(1, int(total_width) - yscroll)
         widths = {key: MIN_WIDTHS[key] for key in MIN_WIDTHS}
+        for key in COLLAPSIBLE:
+            if key in self._collapsed:
+                widths[key] = COLLAPSED_WIDTH
         needed = MARK_WIDTH + sum(widths.values())
         extra = max(0, inner - needed)
         if extra:
             widths["title"] += extra
         self.tree.column("mark", width=MARK_WIDTH, minwidth=MARK_WIDTH, stretch=False)
         for key, width in widths.items():
-            self.tree.column(key, width=width, minwidth=MIN_WIDTHS[key], stretch=False)
+            minw = COLLAPSED_WIDTH if key in self._collapsed else MIN_WIDTHS[key]
+            self.tree.column(key, width=width, minwidth=minw, stretch=False)
 
     def _on_shift_wheel(self, event: tk.Event) -> str:
         self.tree.xview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -346,7 +369,20 @@ class BookTable(ttk.Frame):
                 self.tree.see(iid)
                 return
 
+    def _refresh_headings(self) -> None:
+        for key, label in HEADINGS.items():
+            if key == "mark":
+                continue
+            self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
+        self._sync_mark_heading()
+
     def toggle_sort(self, column: str) -> None:
+        if self._skip_sort:
+            self._skip_sort = False
+            return
+        if column in COLLAPSIBLE and column in self._collapsed:
+            self._set_collapsed(column, False)
+            return
         if column not in SORTABLE:
             return
         if self.sort_column == column:
@@ -354,13 +390,37 @@ class BookTable(ttk.Frame):
         else:
             self.sort_column = column
             self.sort_reverse = column in {"created", "modified", "database"}
-        for key, label in HEADINGS.items():
-            if key == "mark":
-                continue
-            self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
-        self._sync_mark_heading()
+        self._refresh_headings()
         self._sort_order()
         self._reload()
+
+    def _set_collapsed(self, column: str, collapsed: bool) -> None:
+        if column not in COLLAPSIBLE:
+            return
+        if collapsed:
+            self._collapsed.add(column)
+        else:
+            self._collapsed.discard(column)
+        self._refresh_headings()
+        self._apply_column_widths(self.winfo_width() or 800)
+
+    def _scroll_x(self) -> int:
+        try:
+            first, _last = self.tree.xview()
+        except tk.TclError:
+            return 0
+        total = sum(int(self.tree.column(key, "width") or 0) for key in COLUMNS)
+        visible = max(1, int(self.tree.winfo_width() or 1))
+        return int(float(first) * max(0, total - visible))
+
+    def _heading_rel_x(self, event: tk.Event, column: str) -> int | None:
+        left = -self._scroll_x()
+        for key in COLUMNS:
+            width = int(self.tree.column(key, "width") or 0)
+            if key == column:
+                return int(event.x) - left
+            left += width
+        return None
 
     def _date_sort_value(self, stamp: str) -> str:
         text = (stamp or "").strip()
@@ -441,7 +501,7 @@ class BookTable(ttk.Frame):
             passed = "on file"
         return (
             "☑" if book.key() in self.checked else "☐",
-            book.display_title(),
+            rtl_left_aligned(book.display_title()) or book.display_title(),
             format_entry_stamp(book.created_at) or "—",
             format_entry_stamp(book.modified_at) or "—",
             passed or "—",
@@ -505,16 +565,30 @@ class BookTable(ttk.Frame):
         return None
 
     def _on_motion(self, event: tk.Event) -> None:
-        if self.tree.identify("region", event.x, event.y) != "cell":
+        region = self.tree.identify("region", event.x, event.y)
+        column = self._column_at(event)
+        if region == "heading" and column in COLLAPSIBLE:
+            self.tree.configure(cursor="hand2")
+            return
+        if region != "cell":
             self.tree.configure(cursor="")
             return
-        column = self._column_at(event)
         self.tree.configure(cursor="hand2" if column == "publisher" else "")
 
-    def _on_click(self, event: tk.Event) -> None:
-        if self.tree.identify("region", event.x, event.y) != "cell":
-            return
+    def _on_click(self, event: tk.Event) -> str | None:
+        region = self.tree.identify("region", event.x, event.y)
         column = self._column_at(event)
+        if region == "heading" and column in COLLAPSIBLE:
+            if column in self._collapsed:
+                return None
+            rel = self._heading_rel_x(event, column)
+            if rel is not None and 0 <= rel <= WEDGE_PX:
+                self._skip_sort = True
+                self._set_collapsed(column, True)
+                return "break"
+            return None
+        if region != "cell":
+            return None
         row = self.tree.identify_row(event.y)
         book = self._by_iid.get(row)
         if not book:
