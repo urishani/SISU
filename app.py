@@ -564,7 +564,15 @@ class BookCatalogApp(tk.Tk):
         self._callout(select_all_btn, "Tick every book currently shown in the table (after filters).")
         self.table.pack(fill="both", expand=True)
         self._callout(self.table, "The book table. Click a title to open it on the right.")
-        self._callout(self.table.tree, "Click a book row to see its fields. Click ☑ to select it. Click the publisher to look it up.")
+        self._callout(self.table.tree, "Click a book row to see its fields. Click ☑ to select it. Click the header ☑ to select all or clear. Click the publisher to look it up.")
+        self._callout(self.table.top_btn, "Jump to the first book in the list. Ctrl+Home does the same.")
+        self._callout(self.table.bottom_btn, "Jump to the last book in the list. Ctrl+End does the same.")
+        self._callout(
+            self.table.window_caption,
+            "Which rows are in view: first row, last row, and how many rows fit on screen.",
+        )
+        self.bind_all("<Control-Home>", self._on_list_ctrl_home, add="+")
+        self.bind_all("<Control-End>", self._on_list_ctrl_end, add="+")
 
         detail_header = ttk.Frame(detail_frame, style="Card.TFrame")
         detail_header.pack(fill="x", padx=12, pady=(10, 6))
@@ -716,6 +724,28 @@ class BookCatalogApp(tk.Tk):
 
     def _callout(self, widget: tk.Misc, text: str) -> None:
         HoverTip(widget, text)
+
+    def _focus_is_text_field(self) -> bool:
+        widget = self.focus_get()
+        if widget is None:
+            return False
+        try:
+            kind = str(widget.winfo_class())
+        except tk.TclError:
+            return False
+        return kind in {"Entry", "TEntry", "Text", "TCombobox", "Combobox"}
+
+    def _on_list_ctrl_home(self, _event=None) -> str | None:
+        if self._focus_is_text_field():
+            return None
+        self.table.go_top()
+        return "break"
+
+    def _on_list_ctrl_end(self, _event=None) -> str | None:
+        if self._focus_is_text_field():
+            return None
+        self.table.go_bottom()
+        return "break"
 
     def _set_label_wrap(self, label: ttk.Label, width: int) -> None:
         width = max(40, int(width))

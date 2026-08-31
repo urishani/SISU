@@ -50,7 +50,6 @@ COLUMNS = (
     "price",
 )
 SORTABLE = {
-    "mark",
     "title",
     "created",
     "modified",
@@ -91,12 +90,22 @@ class BookTable(ttk.Frame):
         self.sort_reverse = False
         self.filter_keys: set[str] = set()
         self._by_iid: dict[str, Book] = {}
+        self._window_job: str | None = None
+        self.window_label = tk.StringVar(value="Rows 0–0 of 0")
 
         style = ttk.Style(self)
         style.configure("Books.Treeview", font=("Segoe UI", 10), padding=0)
         style.configure("Books.Treeview.Heading", font=("Segoe UI", 9, "bold"))
         self._row_font = tkfont.Font(self, family="Segoe UI", size=10)
         self._apply_rowheight()
+
+        nav = ttk.Frame(self)
+        self.top_btn = ttk.Button(nav, text="⇈", width=3, command=self.go_top)
+        self.top_btn.pack(side="left")
+        self.bottom_btn = ttk.Button(nav, text="⇊", width=3, command=self.go_bottom)
+        self.bottom_btn.pack(side="left", padx=(4, 8))
+        self.window_caption = ttk.Label(nav, textvariable=self.window_label)
+        self.window_caption.pack(side="left")
 
         columns = COLUMNS
         self.tree = ttk.Treeview(
@@ -107,7 +116,10 @@ class BookTable(ttk.Frame):
             style="Books.Treeview",
         )
         for key, label in HEADINGS.items():
-            self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
+            if key == "mark":
+                self.tree.heading(key, text="☐", command=self.toggle_header_selection)
+            else:
+                self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
             if key == "price":
                 anchor = "e"
             elif key in {"mark", "created", "modified", "database", "author", "year", "status", "publisher", "code"}:
@@ -121,18 +133,23 @@ class BookTable(ttk.Frame):
         self.tree.tag_configure("approved", background="#E4F7EA", foreground="#146C43")
         self.tree.tag_configure("final", background="#E8F0FE", foreground="#0B57D0")
         self.tree.tag_configure("important", background="#FFF4D6", foreground="#8A5A00")
-        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self._yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.configure(yscrollcommand=self._on_yview, xscrollcommand=xscroll.set)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
+        self.rowconfigure(1, weight=1)
+        nav.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self._yscroll.grid(row=1, column=1, sticky="ns")
+        xscroll.grid(row=2, column=0, sticky="ew")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Motion>", self._on_motion)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Shift-MouseWheel>", self._on_shift_wheel)
+        self.tree.bind("<Control-Home>", self._on_ctrl_home)
+        self.tree.bind("<Control-End>", self._on_ctrl_end)
+        self.bind("<Control-Home>", self._on_ctrl_home)
+        self.bind("<Control-End>", self._on_ctrl_end)
         self.bind("<Configure>", self._on_resize)
         self.after_idle(self._apply_rowheight)
 
@@ -153,6 +170,7 @@ class BookTable(ttk.Frame):
         if event.widget is not self:
             return
         self._apply_column_widths(event.width)
+        self._schedule_window_label()
 
     def _apply_column_widths(self, total_width: int) -> None:
         yscroll = 18
@@ -169,6 +187,94 @@ class BookTable(ttk.Frame):
     def _on_shift_wheel(self, event: tk.Event) -> str:
         self.tree.xview_scroll(int(-1 * (event.delta / 120)), "units")
         return "break"
+
+    def _on_yview(self, first: str, last: str) -> None:
+        self._yscroll.set(first, last)
+        self._schedule_window_label()
+
+    def _on_ctrl_home(self, _event=None) -> str:
+        self.go_top()
+        return "break"
+
+    def _on_ctrl_end(self, _event=None) -> str:
+        self.go_bottom()
+        return "break"
+
+    def go_top(self) -> None:
+        children = self.tree.get_children()
+        if not children:
+            return
+        self._jump_to(children[0], 0.0)
+
+    def go_bottom(self) -> None:
+        children = self.tree.get_children()
+        if not children:
+            return
+        self._jump_to(children[-1], 1.0)
+
+    def _jump_to(self, iid: str, fraction: float) -> None:
+        self.tree.yview_moveto(fraction)
+        self.tree.see(iid)
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.focus_set()
+        book = self._by_iid.get(iid)
+        if book and self.on_select:
+            self.on_select(book)
+        self._refresh_window_label()
+
+    def visible_window(self) -> tuple[int, int, int]:
+        children = self.tree.get_children()
+        count = len(children)
+        if not count:
+            return 0, 0, 0
+        first_frac, last_frac = self.tree.yview()
+        start = max(0, int(float(first_frac) * count) - 2)
+        top = 0
+        bottom = 0
+        for index in range(start, count):
+            if self.tree.bbox(children[index]):
+                if not top:
+                    top = index + 1
+                bottom = index + 1
+            elif top:
+                break
+        if not top:
+            top = min(count, int(float(first_frac) * count) + 1)
+            bottom = min(count, max(top, int(float(last_frac) * count)))
+        return top, bottom, count
+
+    def _schedule_window_label(self) -> None:
+        if self._window_job:
+            return
+        self._window_job = self.after(50, self._flush_window_label)
+
+    def _flush_window_label(self) -> None:
+        self._window_job = None
+        self._refresh_window_label()
+
+    def _refresh_window_label(self) -> None:
+        top, bottom, count = self.visible_window()
+        if not count:
+            self.window_label.set("Rows 0–0 of 0")
+            return
+        shown = max(0, bottom - top + 1) if top else 0
+        self.window_label.set(f"Rows {top:,}–{bottom:,} of {count:,}  ·  {shown:,} on screen")
+
+    def _visible_keys(self) -> set[str]:
+        return {book.key() for book in self.books if self._matches_filter(book)}
+
+    def toggle_header_selection(self) -> None:
+        keys = self._visible_keys()
+        if keys and keys <= self.checked:
+            self.clear_selection()
+        else:
+            self.select_all()
+
+    def _sync_mark_heading(self) -> None:
+        keys = self._visible_keys()
+        mark = "☑" if keys and keys <= self.checked else "☐"
+        self.tree.heading("mark", text=mark, command=self.toggle_header_selection)
 
     def set_books(
         self,
@@ -203,6 +309,7 @@ class BookTable(ttk.Frame):
         self._by_iid[iid] = book
         self.tree.insert("", "end", iid=iid, values=self._row_values(book), tags=self._row_tags(book))
         self.tree.see(iid)
+        self._schedule_window_label()
 
     def set_filters(self, keys: set[str] | None) -> None:
         self.filter_keys = {key for key in (keys or set()) if key}
@@ -248,7 +355,10 @@ class BookTable(ttk.Frame):
             self.sort_column = column
             self.sort_reverse = column in {"created", "modified", "database"}
         for key, label in HEADINGS.items():
+            if key == "mark":
+                continue
             self.tree.heading(key, text=self._header_text(key, label), command=lambda k=key: self.toggle_sort(k))
+        self._sync_mark_heading()
         self._sort_order()
         self._reload()
 
@@ -301,6 +411,7 @@ class BookTable(ttk.Frame):
         return [book for book in self.books if book.key() in self.checked]
 
     def _after_check_change(self) -> None:
+        self._sync_mark_heading()
         if self.on_check:
             self.on_check()
         if "checked" in self.filter_keys:
@@ -363,7 +474,9 @@ class BookTable(ttk.Frame):
             iid = f"{book_index}:{key}"
             self._by_iid[iid] = book
             self.tree.insert("", "end", iid=iid, values=self._row_values(book), tags=self._row_tags(book))
+        self._sync_mark_heading()
         self.after_idle(lambda: self._apply_column_widths(self.winfo_width() or 800))
+        self.after_idle(self._refresh_window_label)
 
     def refresh_book(self, book: Book) -> None:
         for iid, item in self._by_iid.items():
