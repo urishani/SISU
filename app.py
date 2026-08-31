@@ -804,11 +804,19 @@ class BookCatalogApp(tk.Tk):
         return parse_site_urls(self.url_text.get("1.0", "end"))
 
     def _current_publishers(self) -> list[str]:
+        from publisher_sites import _haystack
+
         names: list[str] = []
+        seen: set[str] = set()
         for book in self.books:
             name = (book.publisher or "").strip()
-            if name and not any(publishers_match(name, existing) for existing in names):
-                names.append(name)
+            if not name:
+                continue
+            key = _haystack(name).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
         return names
 
     def open_settings(self, focus_publisher: str = "", focus_tab: str = "") -> None:
@@ -837,10 +845,6 @@ class BookCatalogApp(tk.Tk):
         self._settings_popup = win
 
         def close() -> None:
-            try:
-                win.unbind_all("<MouseWheel>")
-            except tk.TclError:
-                pass
             self._settings_popup = None
             win.destroy()
 
@@ -991,6 +995,7 @@ class BookCatalogApp(tk.Tk):
             _fill_rows(snapshot)
 
         def _fill_rows(items: list[tuple[str, str]], highlight_name: str = "") -> None:
+            _suspend_settings_table(inner, True)
             for child in inner.winfo_children():
                 child.destroy()
             rows.clear()
@@ -1003,11 +1008,11 @@ class BookCatalogApp(tk.Tk):
                     url,
                     highlight=bool(highlight_name) and publishers_match(name, highlight_name),
                 )
+            _suspend_settings_table(inner, False)
 
         seed = merged_publisher_rows(self._current_publishers())
         if focus_publisher.strip() and not any(publishers_match(focus_publisher, name) for name, _url in seed):
             seed.insert(0, (focus_publisher.strip(), ""))
-        _fill_rows(seed, highlight_name=focus_publisher)
 
         ttk.Button(
             publisher_tab,
@@ -1054,6 +1059,7 @@ class BookCatalogApp(tk.Tk):
             _fill_alias_rows(snapshot)
 
         def _fill_alias_rows(items: list[tuple[str, str]]) -> None:
+            _suspend_settings_table(alias_inner, True)
             for child in alias_inner.winfo_children():
                 child.destroy()
             alias_rows.clear()
@@ -1061,6 +1067,7 @@ class BookCatalogApp(tk.Tk):
             ttk.Label(alias_inner, text="Catalog field", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
             for label, field in items:
                 _append_alias_row(label, field)
+            _suspend_settings_table(alias_inner, False)
 
         alias_comment = ""
         cover_items: list[tuple[str, str]] = []
@@ -1081,7 +1088,6 @@ class BookCatalogApp(tk.Tk):
                 covers_map = parsed.get("cover_values") or {}
                 if isinstance(covers_map, dict):
                     cover_items = [(str(word), str(code)) for word, code in covers_map.items()]
-        _fill_alias_rows(loaded_aliases)
         ttk.Button(aliases_tab, text="Add label", command=lambda: _append_alias_row("", "")).pack(anchor="w")
 
         ttk.Label(
@@ -1123,6 +1129,7 @@ class BookCatalogApp(tk.Tk):
             _fill_cover_rows(snapshot)
 
         def _fill_cover_rows(items: list[tuple[str, str]]) -> None:
+            _suspend_settings_table(cover_inner, True)
             for child in cover_inner.winfo_children():
                 child.destroy()
             cover_rows.clear()
@@ -1132,8 +1139,8 @@ class BookCatalogApp(tk.Tk):
             ttk.Label(cover_inner, text="Code", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
             for word, code in items:
                 _append_cover_row(word, code)
+            _suspend_settings_table(cover_inner, False)
 
-        _fill_cover_rows(cover_items)
         ttk.Button(aliases_tab, text="Add cover word", command=lambda: _append_cover_row("", "")).pack(anchor="w")
 
         llm = data.get("llm") if isinstance(data.get("llm"), dict) else {}
@@ -1440,6 +1447,10 @@ class BookCatalogApp(tk.Tk):
         show_tab(start_tab)
         win.lift()
         win.focus_force()
+        win.update_idletasks()
+        _fill_rows(seed, highlight_name=focus_publisher)
+        _fill_alias_rows(loaded_aliases)
+        _fill_cover_rows(cover_items)
 
     def _on_list_title_change(self) -> None:
         self._bind_list_excel_path(rename_existing=not self._list_locked)
@@ -4548,10 +4559,19 @@ def _settings_scroll_table(
     canvas.configure(yscrollcommand=scroll.set)
     canvas.pack(side="left", fill="both", expand=True)
     scroll.pack(side="right", fill="y")
+    inner._settings_canvas = canvas
+    inner._settings_window_id = window_id
+    inner._suspend_sync = False
 
     def sync(_event=None) -> None:
-        canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
-        canvas.itemconfigure(window_id, width=max(1, canvas.winfo_width()))
+        if getattr(inner, "_suspend_sync", False):
+            return
+        width = int(canvas.winfo_width() or 0)
+        if width > 20:
+            canvas.itemconfigure(window_id, width=width)
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=bbox)
 
     inner.bind("<Configure>", sync)
     canvas.bind("<Configure>", sync)
@@ -4563,6 +4583,22 @@ def _settings_scroll_table(
     canvas.bind("<MouseWheel>", wheel)
     inner.bind("<MouseWheel>", wheel)
     return inner
+
+
+def _suspend_settings_table(inner: ttk.Frame, paused: bool) -> None:
+    inner._suspend_sync = paused
+    if paused:
+        return
+    canvas = getattr(inner, "_settings_canvas", None)
+    window_id = getattr(inner, "_settings_window_id", None)
+    if canvas is None or window_id is None:
+        return
+    width = int(canvas.winfo_width() or 0)
+    if width > 20:
+        canvas.itemconfigure(window_id, width=width)
+    bbox = canvas.bbox("all")
+    if bbox:
+        canvas.configure(scrollregion=bbox)
 
 
 def _book_urls(book: Book) -> list[str]:
