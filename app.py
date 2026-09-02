@@ -38,6 +38,7 @@ from book_crawler import (
     BookCrawler,
     CrawlCancelled,
     CrawlReport,
+    books_match,
     catalog_listing_url,
     entry_now,
     fill_missing_entry_dates,
@@ -46,6 +47,7 @@ from book_crawler import (
     format_person_name,
     format_price,
     listing_url_key,
+    overlay_evrit_catalog,
     parse_site_urls,
     site_display_name,
     site_host,
@@ -4027,7 +4029,9 @@ class BookCatalogApp(tk.Tk):
                 return True
             left = (item.url or "").strip()
             right = (book.url or "").strip()
-            return bool(left) and left == right
+            if left and left == right:
+                return True
+            return books_match(item, book)
 
         existing = next((item for item in self.books if same(item)), None)
         if existing is None:
@@ -4039,6 +4043,10 @@ class BookCatalogApp(tk.Tk):
             self._refresh_selection_label()
             self._set_running_summary()
             return
+        if existing is not book:
+            existing.merge_missing(book)
+            overlay_evrit_catalog(existing, book)
+            existing.refresh_text_fields()
         self.table.refresh_book(existing)
         self._select_live_book(existing)
         self._schedule_live_save()

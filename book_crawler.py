@@ -223,6 +223,7 @@ PRODUCT_PATH_HINTS = (
     "/product/",
     "/products/",
     "/catalog/product/",
+    "/page_",
     "/p/",
     "/item/",
     "/book/",
@@ -379,10 +380,36 @@ SITE_DISPLAY_NAMES = {
 
 CATALOG_MIN_LISTING_PAGES = 40
 UNLIMITED_LISTING_PAGES = 10_000
-PAGE_IN_URL_RE = re.compile(r"(?:[?&](?:page|p|pg)=|/page(?:/|-))(\d+)", re.I)
+PAGE_IN_URL_RE = re.compile(r"(?:[?&](?:page|p|pg|bscrp)=|/page(?:/|-))(\d+)", re.I)
+LISTING_PAGE_QUERY_KEYS = ("bscrp", "page", "p", "pg", "pagenumber", "pageNumber")
 EVRIT_GROUP_RE = re.compile(r"/group/(\d+)(?:/|$)", re.I)
 EVRIT_PRODUCT_RE = re.compile(r"/product/(\d+)(?:/|$)", re.I)
+SHOPIFY_COLLECTION_RE = re.compile(r"/collections/([^/?#]+)", re.I)
 EVRIT_NEW_BOOKS_SLUG = "ספרים-חדשים"
+CATALOG_HOME_PATHS = {
+    "booknet.co.il": "/ספרים-חדשים",
+    "ybook.co.il": "/collections/newest-products",
+    "modan.co.il": "/חדש-על-המדף",
+    "keter-books.co.il": "/ספרים-חדשים",
+    "am-oved.co.il": "/חדשים",
+    "kinbooks.co.il": "/ספרים-חדשים",
+    "nli.org.il": "/he/search?materialType=books",
+}
+HOST_PUBLISHERS = {
+    "ybook.co.il": "ידיעות ספרים",
+    "modan.co.il": "מודן",
+    "keter-books.co.il": "כתר",
+    "am-oved.co.il": "עם עובד",
+    "kinbooks.co.il": "כנרת זמורה דביר",
+    "kibutz-poalim.co.il": "הקיבוץ המאוחד",
+    "schocken.co.il": "שוקן",
+    "matarbooks.co.il": "מטר",
+    "ahuzatbayit.co.il": "אחוזת בית",
+    "resling.co.il": "רסלינג",
+    "babel.co.il": "בבל",
+    "magnespress.co.il": "מאגנס",
+    "korenpub.com": "Koren",
+}
 
 
 def site_host(url: str) -> str:
@@ -402,6 +429,33 @@ def is_evrit_host(url: str) -> bool:
     return "e-vrit" in host or host == "evrit.co.il" or host.endswith(".evrit.co.il")
 
 
+def is_booknet_host(url: str) -> bool:
+    return site_host(url) == "booknet.co.il"
+
+
+def is_nli_host(url: str) -> bool:
+    host = site_host(url)
+    return host == "nli.org.il" or host.endswith(".nli.org.il")
+
+
+def is_ybook_host(url: str) -> bool:
+    return site_host(url) == "ybook.co.il"
+
+
+def is_shopify_url(url: str) -> bool:
+    path = urlparse(url or "").path.lower()
+    return "/collections/" in path or "/products/" in path
+
+
+def shopify_collection_handle(url: str) -> str:
+    match = SHOPIFY_COLLECTION_RE.search(unquote(urlparse(url or "").path))
+    return unquote(match.group(1)) if match else ""
+
+
+def default_publisher_for_host(url: str) -> str:
+    return HOST_PUBLISHERS.get(site_host(url), "")
+
+
 def catalog_listing_url(url: str) -> str:
     """Turn a site homepage into the year catalog listing that Search should read."""
     raw = (url or "").strip()
@@ -415,6 +469,13 @@ def catalog_listing_url(url: str) -> str:
         return urlunparse(
             parsed._replace(path=f"/group/3/{quote(EVRIT_NEW_BOOKS_SLUG)}", query="", fragment="")
         )
+    home = CATALOG_HOME_PATHS.get(site_host(raw), "")
+    if home and path in {"", "/"}:
+        if "?" in home:
+            home_path, query = home.split("?", 1)
+        else:
+            home_path, query = home, ""
+        return urlunparse(parsed._replace(path=home_path, query=query, fragment=""))
     return raw
 
 
@@ -1372,13 +1433,29 @@ def identity_keys(book: Book) -> set[str]:
         keys.add(f"isbn:{book.isbn}")
     if book.danacode:
         keys.add(f"dana:{book.danacode}")
+    short = re.sub(r"\D", "", book.danacode_short() or book.extra.get("danacode_short") or "")
+    if short:
+        keys.add(f"dana:{short}")
     title = normalize_name(book.title)
     author = normalize_name(book.author)
-    if title:
-        keys.add(f"title:{title}")
-        if author:
-            keys.add(f"ta:{title}|{author}")
+    if title and author:
+        keys.add(f"ta:{title}|{author}")
     return keys
+
+
+def authors_match(left: str, right: str) -> bool:
+    left_name = normalize_name(left)
+    right_name = normalize_name(right)
+    if not left_name or not right_name:
+        return False
+    if left_name in right_name or right_name in left_name:
+        return True
+    left_tokens = set(left_name.split())
+    right_tokens = set(right_name.split())
+    if not left_tokens or not right_tokens:
+        return False
+    smaller, larger = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
+    return smaller <= larger
 
 
 def books_match(left: Book, right: Book) -> bool:
@@ -1393,7 +1470,7 @@ def books_match(left: Book, right: Book) -> bool:
         right_author = normalize_name(right.author)
         if not left_author or not right_author:
             return len(left_title) >= 8 and len(right_title) >= 8
-        return left_author in right_author or right_author in left_author
+        return authors_match(left_author, right_author)
     return False
 
 
@@ -1649,6 +1726,17 @@ def parse_price(text: str | None) -> str:
     return format_price(match.group(1)) or match.group(1)
 
 
+def plausible_ils(value: str) -> str:
+    formatted = format_price(value) or parse_price(value)
+    try:
+        amount = float(formatted)
+    except (TypeError, ValueError):
+        return ""
+    if amount < 3 or amount > 2500:
+        return ""
+    return formatted
+
+
 def format_price(text: str | None) -> str:
     raw = str(text or "").strip().replace(",", "")
     if not raw:
@@ -1668,6 +1756,7 @@ def prefer_catalog_price(book: Book, soup: BeautifulSoup) -> None:
         struck = block.select_one("s, del, strike")
         if struck:
             catalog = parse_price(struck.get_text(" ", strip=True))
+            catalog = plausible_ils(catalog)
             if catalog:
                 break
     if not catalog:
@@ -1676,9 +1765,21 @@ def prefer_catalog_price(book: Book, soup: BeautifulSoup) -> None:
             if parent is None:
                 continue
             container = parent.parent if parent.parent else parent
-            catalog = parse_price(container.get_text(" ", strip=True))
+            catalog = plausible_ils(parse_price(container.get_text(" ", strip=True)))
             if catalog:
                 break
+    if not catalog:
+        regular = soup.select_one(".special_price, .oldprice, .label-price")
+        if regular and not regular.find_parent(class_=["list_product", "grid-products", "product-cube"]):
+            catalog = plausible_ils(regular.get_text(" ", strip=True))
+        if not catalog:
+            for node in soup.find_all(string=re.compile(r"מחיר\s*רגיל", re.I)):
+                parent = getattr(node, "parent", None)
+                if parent is None:
+                    continue
+                catalog = plausible_ils(parent.get_text(" ", strip=True))
+                if catalog:
+                    break
     if catalog:
         book.price_ils = catalog
 
@@ -1864,6 +1965,13 @@ def labeled_value_pairs(soup: BeautifulSoup) -> dict[str, str]:
         )
         if title and value:
             remember(title.get_text(" ", strip=True), value.get_text(" ", strip=True))
+    for row in soup.select("li"):
+        if not isinstance(row, Tag):
+            continue
+        title = row.select_one(".titleBullet, .title-bullet")
+        value = row.select_one(".valBullet, .val-bullet")
+        if title and value:
+            remember(title.get_text(" ", strip=True), value.get_text(" ", strip=True))
     return pairs
 
 
@@ -1914,6 +2022,11 @@ def fill_from_booknet(book: Book, soup: BeautifulSoup, url: str) -> None:
     price = root.select_one("#product-page-price")
     if price:
         book.price_ils = book.price_ils or price.get("data-price") or parse_price(price.get_text(" ", strip=True))
+    printed = root.select_one(".itemPrice ins, #itemPrice ins, .price ins")
+    if printed:
+        printed_price = parse_price(printed.get_text(" ", strip=True))
+        if printed_price:
+            book.price_ils = printed_price
     summary = root.select_one("#itemSummary")
     if summary:
         text = summary.get_text("\n", strip=True)
@@ -1944,9 +2057,19 @@ def fill_from_magento(book: Book, soup: BeautifulSoup) -> None:
 
 
 def fill_from_nli(book: Book, soup: BeautifulSoup, url: str) -> None:
-    if "nli.org.il" not in site_host(url):
+    if not is_nli_host(url):
         return
     text = soup.get_text("\n", strip=True)
+    title = soup.select_one(
+        "h1, .item-title, .full-view-title, prm-brief-result h3, [data-field='title']"
+    )
+    if title:
+        book.title = book.title or clean(title.get_text(" ", strip=True))
+    creator = soup.select_one("[data-field='creator'], .item-detail-creator, prm-brief-result .author")
+    if creator:
+        book.author = book.author or format_person_name(creator.get_text(" ", strip=True)) or clean(
+            creator.get_text(" ", strip=True)
+        )
     if not book.ddc:
         match = re.search(
             r"(?:dewey(?:\s+(?:decimal|class(?:ification| number)?))?|ddc|דיואי(?:\s+עשרוני)?|סיווג\s*דיואי)\s*[:\-]?\s*([0-9]{1,3}(?:\.[0-9]+)*)",
@@ -1971,6 +2094,147 @@ def fill_from_nli(book: Book, soup: BeautifulSoup, url: str) -> None:
                 if len(digits) >= 6:
                     book.marc = digits
                     break
+    if not book.isbn:
+        for match in ISBN_RE.finditer(text[:8000]):
+            apply_identifier(book, match.group(0))
+            if book.isbn:
+                break
+
+
+def shopify_money(raw: Any, cents: bool | None = None) -> str:
+    if raw is None or raw == "":
+        return ""
+    text = str(raw).strip().replace(",", "")
+    if not text:
+        return ""
+    dotted = "." in text
+    try:
+        amount = float(text)
+    except ValueError:
+        return parse_price(text)
+    use_cents = cents if cents is not None else (not dotted and amount >= 1000 and amount == int(amount))
+    if use_cents:
+        amount = amount / 100.0
+    return format_price(amount)
+
+
+def fill_from_shopify_payload(book: Book, item: dict[str, Any], origin: str = "", cents: bool | None = None) -> None:
+    """Map a Shopify product or collection JSON object onto a book."""
+    if not isinstance(item, dict):
+        return
+    title = clean(item.get("title") or item.get("name") or "")
+    if title:
+        book.title = book.title or title
+    handle = str(item.get("handle") or "").strip().strip("/")
+    if origin and handle:
+        book.url = book.url or f"{origin.rstrip('/')}/products/{handle.split('/')[-1]}"
+    vendor = clean(item.get("vendor") or "")
+    host_publisher = default_publisher_for_host(book.url or origin)
+    if vendor:
+        vendor_norm = normalize_name(vendor)
+        publisher_like = any(word in vendor_norm for word in ("הוצאה", "ספרים", "publish", "books"))
+        if publisher_like:
+            book.publisher = book.publisher or vendor
+        else:
+            book.author = book.author or vendor
+    if host_publisher:
+        book.publisher = book.publisher or host_publisher
+    published = str(item.get("published_at") or item.get("created_at") or "")
+    if published and not book.year:
+        book.year = extract_year(published)
+    body = _plain_markup_text(item.get("body_html") or item.get("description") or "")
+    if body:
+        book.description = book.description or body
+        book.pages = book.pages or parse_pages(body)
+    tags = item.get("tags") or []
+    if isinstance(tags, str):
+        tags = [part.strip() for part in tags.split(",")]
+    for tag in tags:
+        text = clean(str(tag))
+        if not text:
+            continue
+        apply_identifier(book, text)
+        year = extract_year(text)
+        if year and not book.year:
+            book.year = year
+        if not book.publisher and any(word in normalize_name(text) for word in ("הוצאה", "ספרים")):
+            book.publisher = text
+    variants = item.get("variants") if isinstance(item.get("variants"), list) else []
+    variant = variants[0] if variants and isinstance(variants[0], dict) else {}
+    apply_identifier(book, str(variant.get("barcode") or item.get("barcode") or ""))
+    apply_identifier(book, str(variant.get("sku") or item.get("sku") or ""))
+    compare = shopify_money(variant.get("compare_at_price") or item.get("compare_at_price"), cents)
+    price = shopify_money(variant.get("price") or item.get("price"), cents)
+    book.price_ils = compare or price or book.price_ils
+    images = item.get("images") if isinstance(item.get("images"), list) else []
+    image = ""
+    if images:
+        first = images[0]
+        if isinstance(first, dict):
+            image = str(first.get("src") or first.get("url") or "")
+        else:
+            image = str(first)
+    image = image or str(item.get("featured_image") or "")
+    if image and not book.cover_image_url:
+        book.cover_image_url = image.split("?")[0]
+
+
+def fill_from_bsmart(book: Book, soup: BeautifulSoup, url: str) -> None:
+    """Publisher shops such as Modan, Keter, and Am Oved share this catalog HTML."""
+    if not soup.select_one(".saleprice, .list_product, .grid-products, .titleBullet, .autor-lang, .authorName"):
+        return
+    if is_booknet_host(url) or is_evrit_host(url) or is_nli_host(url):
+        return
+    title = soup.select_one("h1")
+    if title:
+        book.title = book.title or clean(re.sub(r"\s+\|.*$", "", title.get_text(" ", strip=True)))
+    authors = [
+        clean(tag.get_text(" ", strip=True)).strip(" |")
+        for tag in soup.select(".autor-lang, p.authorName, .authorName")
+    ]
+    authors = [name for name in authors if name and name.casefold() not in {book.title.casefold(), "מאפיינים"}]
+    if authors and not book.author:
+        book.author = format_person_name(authors[0]) or authors[0]
+    host_publisher = default_publisher_for_host(url)
+    if host_publisher:
+        book.publisher = book.publisher or host_publisher
+    catalog = ""
+    sale_price = ""
+    for node in soup.select(".saleprice-block, .special_price, .oldprice, .saleprice"):
+        if node.find_parent(class_=["list_product", "grid-products", "product-cube"]):
+            continue
+        amount = plausible_ils(node.get_text(" ", strip=True))
+        classes = " ".join(node.get("class") or [])
+        if "saleprice-block" in classes or "special_price" in classes or "oldprice" in classes:
+            catalog = catalog or amount
+        else:
+            sale_price = sale_price or amount
+    if catalog:
+        book.price_ils = catalog
+    elif sale_price:
+        book.price_ils = book.price_ils or sale_price
+    if book.price_ils and not plausible_ils(book.price_ils):
+        book.price_ils = ""
+    for row in soup.select("li"):
+        label = row.select_one(".titleBullet")
+        value = row.select_one(".valBullet")
+        if label and value:
+            fill_from_labels(book, {label.get_text(" ", strip=True): value.get_text(" ", strip=True)})
+    if not book.year or not book.pages:
+        for item in soup.select("li"):
+            text = item.get_text(" ", strip=True)
+            if "שנת הוצאה" in text and not book.year:
+                book.year = extract_year(text)
+            if ("עמוד" in text or "עמ'" in text) and not book.pages:
+                book.pages = parse_pages(text)
+    bst = soup.select_one("[data-bst]")
+    if bst:
+        apply_identifier(book, str(bst.get("data-bst") or ""))
+    cover = soup.find(string=re.compile(r"סוג כריכה"))
+    if cover and not book.cover_type:
+        parent = getattr(cover, "parent", None)
+        if parent is not None:
+            book.cover_type = map_cover(parent.get_text(" ", strip=True))
 
 
 def extract_book_from_html(html: str, url: str) -> Book:
@@ -1980,6 +2244,7 @@ def extract_book_from_html(html: str, url: str) -> Book:
         fill_from_schema(book, item, url)
     fill_from_booknet(book, soup, url)
     fill_from_magento(book, soup)
+    fill_from_bsmart(book, soup, url)
     from field_map import attach_page_fields, collect_extra_pairs, remember_candidates
 
     pairs = labeled_value_pairs(soup)
@@ -2001,6 +2266,8 @@ def extract_book_from_html(html: str, url: str) -> Book:
     apply_identifier(book, url)
     book.cover_type = book.cover_type or map_cover(book.title)
     prefer_catalog_price(book, soup)
+    if book.price_ils and not plausible_ils(book.price_ils):
+        book.price_ils = ""
     book.year = extract_year(book.year)
     book.title = clean(book.title)
     book.author = format_person_name(book.author) or clean(book.author)
@@ -2067,8 +2334,12 @@ def is_product_page(soup: BeautifulSoup, url: str) -> bool:
         return True
     if soup.select_one(".catalog-product-view, .product-info-main, #product_addtocart_form"):
         return True
+    if soup.select_one(".list_product, .grid-products, .product-cube, body.product_list"):
+        return False
+    if soup.select_one("h1") and soup.select_one(".saleprice, .titleBullet, .autor-lang"):
+        return True
     path = urlparse(url).path.lower()
-    return any(hint in path for hint in ("/מוצרים/", "/product/", "/products/", "/product-page/", "/book/"))
+    return any(hint in path for hint in ("/מוצרים/", "/product/", "/products/", "/product-page/", "/book/", "/page_"))
 
 
 def series_volume(text: str) -> str:
@@ -2433,6 +2704,261 @@ def collect_product_links(soup: BeautifulSoup, page_url: str) -> list[str]:
     return [url for url, _title in collect_product_entries(soup, page_url)]
 
 
+_LISTING_SKIP_TITLES = {
+    "לפרטים נוספים",
+    "הוסף לסל",
+    "הוספה למועדפים",
+    "לכל הספרים",
+    "לרשימת הספרים המלאה",
+}
+
+
+def _bsmart_price_index(html: str) -> dict[str, tuple[str, str]]:
+    """id -> (list price, barcode)."""
+    found: dict[str, tuple[str, str]] = {}
+    match = re.search(r"var idObjects = '(\[.*?\])'", html or "", re.S)
+    if not match:
+        return found
+    try:
+        rows = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return found
+    if not isinstance(rows, list):
+        return found
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item_id = str(row.get("id") or "").strip()
+        if not item_id:
+            continue
+        price = format_price(row.get("bsmartPrice"))
+        code = ""
+        codes = row.get("codes")
+        if isinstance(codes, list):
+            for entry in codes:
+                if isinstance(entry, dict) and entry.get("code"):
+                    code = str(entry.get("code") or "")
+                    break
+        found[item_id] = (price, code)
+    return found
+
+
+def _card_bsmart_id(card: Tag) -> str:
+    for tag in card.select("[id]"):
+        match = re.search(r"(?:stock|saleprice|oldprice|crntPrice)(\d+)$", str(tag.get("id") or ""))
+        if match:
+            return match.group(1)
+    match = re.search(r"currentID\s*=\s*'(\d+)'", str(card))
+    return match.group(1) if match else ""
+
+
+def _listing_link(card: Tag, page_url: str) -> str:
+    skip_bits = ("/מבצעים/", "/מחברים/", "/הוצאות/", "/קטגוריות/", "/authors/", "/collections/")
+    fallback = ""
+    for tag in card.select("a[href]"):
+        href = str(tag.get("href") or "")
+        if href.startswith("javascript") or href in {"#", "/"}:
+            continue
+        url = normalize_url(page_url, href)
+        if not url or is_asset_url(url):
+            continue
+        path = unquote(urlparse(url).path)
+        if unquote(urlparse(page_url).path).rstrip("/") == path.rstrip("/"):
+            continue
+        if any(bit in path for bit in skip_bits):
+            continue
+        if any(hint in path.lower() or hint in path for hint in PRODUCT_PATH_HINTS):
+            return url
+        if not fallback:
+            fallback = url
+    return fallback
+
+
+def collect_booknet_listings(soup: BeautifulSoup, page_url: str) -> list[Book]:
+    books: list[Book] = []
+    seen: set[str] = set()
+    for card in soup.select(".product-cube, .products.product-cube"):
+        if not isinstance(card, Tag):
+            continue
+        url = _listing_link(card, page_url)
+        if not url or "/מוצרים/" not in unquote(urlparse(url).path) or url in seen:
+            continue
+        seen.add(url)
+        title = clean(card.get("data-fullname") or card.get("data-fullName") or "")
+        if not title:
+            heading = card.select_one("h3.productTitle, .productTitle")
+            title = clean(heading.get_text(" ", strip=True) if heading else "")
+        if not title or title in _LISTING_SKIP_TITLES:
+            continue
+        book = Book(url=url, title=title)
+        book.publisher = clean(card.get("data-manufacturer") or "")
+        author = card.select_one(".product-author, .book-below-title")
+        if author:
+            book.author = format_person_name(author.get_text(" ", strip=True)) or clean(author.get_text(" ", strip=True))
+        price_node = card.select_one(".price ins, ins")
+        if price_node:
+            book.price_ils = parse_price(price_node.get_text(" ", strip=True))
+        img = card.select_one("img[data-original], img[src]")
+        src = ""
+        if img:
+            src = str(img.get("data-original") or img.get("src") or "")
+            alt = clean(img.get("alt") or "")
+            if alt and not book.title:
+                book.title = alt
+            if src.startswith("/"):
+                book.cover_image_url = urljoin(page_url, src)
+            elif src.startswith("http"):
+                book.cover_image_url = src
+        apply_identifier(book, url)
+        apply_identifier(book, src)
+        book.refresh_text_fields()
+        books.append(book)
+    return books
+
+
+def collect_bsmart_listings(soup: BeautifulSoup, page_url: str) -> list[Book]:
+    cards = [tag for tag in soup.select(".list_product") if isinstance(tag, Tag)]
+    if not cards:
+        cards = [tag for tag in soup.select(".grid-products") if isinstance(tag, Tag)]
+    if not cards:
+        cards = [tag for tag in soup.select(".products .item") if isinstance(tag, Tag)]
+    if not cards:
+        return []
+    prices = _bsmart_price_index(str(soup))
+    books: list[Book] = []
+    seen: set[str] = set()
+    host_publisher = default_publisher_for_host(page_url)
+    for card in cards:
+        url = _listing_link(card, page_url)
+        if not url or url in seen:
+            continue
+        title = clean(card.get("data-title") or "")
+        if not title:
+            heading = card.select_one("h2, h3, .description h2")
+            title = clean(heading.get_text(" ", strip=True) if heading else "")
+        if not title:
+            img = card.select_one("img[alt]")
+            alt = clean(img.get("alt") if img else "")
+            title = alt.split("|")[0].strip() if alt else ""
+        if not title or title in _LISTING_SKIP_TITLES or len(title) < 2:
+            continue
+        seen.add(url)
+        book = Book(url=url, title=title)
+        author = clean(card.get("data-brand") or "")
+        if not author:
+            name = card.select_one(".authorName, .description > div")
+            if name:
+                author = clean(name.get_text(" ", strip=True))
+        if author and author.casefold() != title.casefold():
+            book.author = format_person_name(author) or author
+        if host_publisher:
+            book.publisher = host_publisher
+        apply_identifier(book, str(card.get("data-bst") or ""))
+        item_id = _card_bsmart_id(card)
+        if item_id and item_id in prices:
+            price, code = prices[item_id]
+            if price:
+                book.price_ils = price
+            apply_identifier(book, code)
+        if not book.price_ils:
+            for sel in (".special_price", ".oldprice", ".saleprice"):
+                node = card.select_one(sel)
+                if node:
+                    book.price_ils = parse_price(node.get_text(" ", strip=True))
+                    if book.price_ils:
+                        break
+        img = card.select_one("img[data-src], img[src]")
+        if img:
+            src = str(img.get("data-src") or img.get("src") or "")
+            if src.startswith("/"):
+                book.cover_image_url = urljoin(page_url, src)
+            elif src.startswith("http"):
+                book.cover_image_url = src
+        book.refresh_text_fields()
+        books.append(book)
+    return books
+
+
+def collect_magento_listings(soup: BeautifulSoup, page_url: str) -> list[Book]:
+    books: list[Book] = []
+    seen: set[str] = set()
+    for card in soup.select(".product-item-info, li.product-item"):
+        if not isinstance(card, Tag):
+            continue
+        link = card.select_one("a.product-item-link, a.product-item-photo")
+        url = normalize_url(page_url, link.get("href") if link else "")
+        if not url or url in seen:
+            continue
+        title = clean(link.get_text(" ", strip=True) if link else "")
+        if not title:
+            img = card.select_one("img")
+            title = clean(img.get("alt") if img else "")
+        if not title:
+            continue
+        seen.add(url)
+        book = Book(url=url, title=title)
+        price = card.select_one("[data-price-amount], .price-wrapper .price")
+        if price:
+            book.price_ils = price.get("data-price-amount") or parse_price(price.get_text(" ", strip=True))
+        book.publisher = book.publisher or default_publisher_for_host(page_url)
+        book.refresh_text_fields()
+        books.append(book)
+    return books
+
+
+def collect_nli_listings(soup: BeautifulSoup, page_url: str) -> list[Book]:
+    if not is_nli_host(page_url):
+        return []
+    books: list[Book] = []
+    seen: set[str] = set()
+    for card in soup.select(
+        "prm-brief-result, .result-item, .item-brief, article.result, .search-result-item, md-list-item"
+    ):
+        if not isinstance(card, Tag):
+            continue
+        link = card.select_one("a[href*='fulldisplay'], a[href*='docid'], a[href*='/books/'], h3 a[href], .item-title a")
+        url = _listing_link(card, page_url) if not link else normalize_url(page_url, str(link.get("href") or ""))
+        if not url or url in seen:
+            continue
+        title_el = card.select_one("h3, .item-title, .media-title, [data-field='title']")
+        title = clean(title_el.get_text(" ", strip=True) if title_el else "")
+        if not title:
+            continue
+        seen.add(url)
+        book = Book(url=url, title=title)
+        author_el = card.select_one(".author, [data-field='creator'], .item-detail-creator")
+        if author_el:
+            book.author = format_person_name(author_el.get_text(" ", strip=True)) or clean(
+                author_el.get_text(" ", strip=True)
+            )
+        year_el = card.select_one("[data-field='date'], .date")
+        if year_el:
+            book.year = extract_year(year_el.get_text(" ", strip=True))
+        fill_from_nli(book, card, url)
+        book.refresh_text_fields()
+        books.append(book)
+    return books
+
+
+def collect_listing_books(soup: BeautifulSoup, page_url: str) -> list[Book]:
+    """Site-specific listing cards with title, author, price, and identifiers."""
+    if is_booknet_host(page_url) or soup.select_one(".product-cube"):
+        found = collect_booknet_listings(soup, page_url)
+        if found:
+            return found
+    if is_nli_host(page_url):
+        found = collect_nli_listings(soup, page_url)
+        if found:
+            return found
+    found = collect_bsmart_listings(soup, page_url)
+    if found:
+        return found
+    found = collect_magento_listings(soup, page_url)
+    if found:
+        return found
+    return []
+
+
 def _url_key(url: str) -> str:
     parsed = urlparse(url)
     path = unquote(parsed.path).rstrip("/") or "/"
@@ -2665,7 +3191,7 @@ def fills_needed(candidate: Book, wanted: Book) -> int:
 def listed_page_number(url: str) -> int:
     parsed = urlparse(url or "")
     qs = parse_qs(parsed.query)
-    for key in ("page", "p", "pg", "pagenumber", "pageNumber"):
+    for key in LISTING_PAGE_QUERY_KEYS:
         raw = (qs.get(key) or [""])[0]
         if str(raw).isdigit():
             return int(raw)
@@ -2700,7 +3226,7 @@ def last_listing_page(soup: BeautifulSoup, page_url: str) -> int:
 
     for tag in soup.select(
         ".pagination a[href], .pages a[href], .pager a[href], nav.pagination a[href], "
-        "a[rel='last'], a[rel='next'], a.page-next, a.num, "
+        "a[rel='last'], a[rel='next'], a.page-next, a.num, link[rel='next'], "
         ".pagination option, .pages option, .pager option, select[name*='page'] option"
     ):
         href = str(tag.get("href") or tag.get("value") or "")
@@ -2746,22 +3272,32 @@ def json_item_count(payload: dict[str, Any] | None) -> int:
     return 0
 
 
-def sequential_listing_urls(page_url: str, max_pages: int) -> list[str]:
+def listing_page_query_key(url: str) -> str:
+    qs = parse_qs(urlparse(url or "").query)
+    for key in LISTING_PAGE_QUERY_KEYS:
+        if key in qs:
+            return key
+    return "page"
+
+
+def sequential_listing_urls(page_url: str, max_pages: int, page_key: str = "") -> list[str]:
     parsed = urlparse(page_url)
     qs = parse_qs(parsed.query, keep_blank_values=True)
+    key = page_key or listing_page_query_key(page_url)
     current = page_number(page_url)
     urls: list[str] = []
+    drop = {key, "page", "p", "pg", "bscrp"}
     for number in range(1, max_pages + 1):
         if number == current:
             continue
         items = [
-            (key, value)
-            for key, values in qs.items()
-            if key not in {"page", "p", ""}
+            (name, value)
+            for name, values in qs.items()
+            if name not in drop and name != ""
             for value in values
             if value
         ]
-        items.append(("page", str(number)))
+        items.append((key, str(number)))
         urls.append(urlunparse(parsed._replace(query=urlencode(items, safe="/"))))
     return urls
 
@@ -2769,14 +3305,22 @@ def sequential_listing_urls(page_url: str, max_pages: int) -> list[str]:
 def collect_pagination_links(soup: BeautifulSoup, page_url: str, max_pages: int = 40) -> list[str]:
     links: list[str] = []
     start = urlparse(page_url)
-    for tag in soup.select(".pagination a[href], .pages a[href], a[rel='next'], a.page-next, a.num"):
+    page_key = listing_page_query_key(page_url)
+    for tag in soup.select(
+        ".pagination a[href], .pages a[href], a[rel='next'], a.page-next, a.num, link[rel='next']"
+    ):
         url = normalize_url(page_url, tag.get("href", ""))
         if not url:
             continue
         parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
         same_list = unquote(parsed.path).rstrip("/") == unquote(start.path).rstrip("/")
-        if not same_list and "page" not in parse_qs(parsed.query):
+        if not same_list and not any(key in qs for key in LISTING_PAGE_QUERY_KEYS):
             continue
+        for key in LISTING_PAGE_QUERY_KEYS:
+            if key in qs:
+                page_key = key
+                break
         if url not in links:
             links.append(url)
     if not links:
@@ -2785,7 +3329,7 @@ def collect_pagination_links(soup: BeautifulSoup, page_url: str, max_pages: int 
     cap = listing_page_cap(max_pages)
     if last > 1:
         cap = min(cap, last)
-    return sequential_listing_urls(page_url, max(1, cap))
+    return sequential_listing_urls(page_url, max(1, cap), page_key=page_key)
 
 
 class BookCrawler:
@@ -2855,7 +3399,8 @@ class BookCrawler:
             raise SiteError(failure, url=response.url or url)
         if response.status_code >= 400:
             raise SiteError(http_status_message(response.status_code, response.url or url), url=response.url or url)
-        if "/api/" not in urlparse(url).path.lower():
+        path_l = urlparse(url).path.lower()
+        if "/api/" not in path_l and not path_l.endswith(".js") and not path_l.endswith("products.json"):
             time.sleep(self.delay_seconds)
         return html, response.url
 
@@ -2888,6 +3433,113 @@ class BookCrawler:
         book.refresh_text_fields()
         book.mark_origin_fields()
 
+    def _load_json(self, url: str) -> Any:
+        try:
+            raw, _final = self.fetch(url)
+        except (SiteError, requests.RequestException):
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def apply_shopify_product_json(self, book: Book, page_url: str) -> None:
+        parsed = urlparse(page_url if "://" in (page_url or "") else "https://" + (page_url or book.url or ""))
+        path = unquote(parsed.path).rstrip("/")
+        if "/products/" not in path.lower():
+            return
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        js_url = page_url if path.lower().endswith(".js") else f"{origin}{path}.js"
+        payload = self._load_json(js_url)
+        if isinstance(payload, dict):
+            fill_from_shopify_payload(book, payload, origin, cents=True)
+            book.refresh_text_fields()
+            book.mark_origin_fields()
+
+    def _shopify_collection_product_urls(
+        self,
+        page_url: str,
+        year: str,
+        max_products: int,
+        include_unknown_year: bool,
+        on_urls: Callable[[list[str]], None] | None = None,
+        on_listed: Callable[[Book], None] | None = None,
+    ) -> list[str] | None:
+        handle = shopify_collection_handle(page_url)
+        if not handle:
+            if is_ybook_host(page_url):
+                handle = "newest-products"
+            else:
+                return None
+        parsed = urlparse(page_url if "://" in page_url else "https://" + page_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        urls: list[str] = []
+        seen: set[str] = set()
+        want_year = str(year or "").strip()
+        page = 1
+        take = 250
+        try:
+            while len(urls) < max_products and page < 400:
+                self._check_cancel()
+                api_url = f"{origin}/collections/{quote(handle)}/products.json?page={page}&limit={take}"
+                payload = self._load_json(api_url)
+                self.report.listing_pages += 1
+                if not isinstance(payload, dict):
+                    return None if page == 1 and not urls else urls
+                items = payload.get("products")
+                if not isinstance(items, list):
+                    return None if page == 1 and not urls else urls
+                if page == 1:
+                    self._emit(
+                        "pages",
+                        {
+                            "site": site_display_name(page_url),
+                            "url": page_url,
+                            "current": 1,
+                            "total": 0,
+                            "unlimited": max_products >= 50_000,
+                            "limit": 0,
+                        },
+                    )
+                if not items:
+                    break
+                batch: list[str] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    listed = Book(url="")
+                    fill_from_shopify_payload(listed, item, origin, cents=False)
+                    listed.refresh_text_fields()
+                    if not listed.url or listed.url in seen:
+                        continue
+                    if want_year and listed.year and not listed.matches_year(want_year, include_unknown_year):
+                        continue
+                    if want_year and not listed.year and not include_unknown_year:
+                        continue
+                    seen.add(listed.url)
+                    urls.append(listed.url)
+                    batch.append(listed.url)
+                    if on_listed and listed.title:
+                        listed.append_scan_log("Found in the catalog listing.")
+                        listed.refresh_scan_status()
+                        on_listed(listed)
+                    if len(urls) >= max_products:
+                        break
+                if on_urls and batch:
+                    on_urls(batch)
+                self.progress(
+                    f"{site_display_name(page_url)} catalog: {len(urls)} book(s) for {want_year or 'any year'} "
+                    f"after Shopify page {page}…"
+                )
+                if len(items) < take or len(urls) >= max_products:
+                    break
+                page += 1
+        except CrawlCancelled:
+            raise
+        except (SiteError, requests.RequestException):
+            return None if not urls else urls
+        return urls or None
+
     def _book_and_html(self, product_url: str, remember: bool = True) -> tuple[Book | None, str, str]:
         from book_cache import get_page_book, remember_page_book, save_page_cache
 
@@ -2896,11 +3548,15 @@ class BookCrawler:
             if is_evrit_host(product_url):
                 self.apply_evrit_product_apis(cached, cached.url or product_url)
                 remember_page_book(cached)
+            elif "/products/" in urlparse(product_url).path.lower():
+                self.apply_shopify_product_json(cached, cached.url or product_url)
+                remember_page_book(cached)
             self.report.product_cached += 1
             return cached, "", cached.url
         html, resolved = self.fetch(product_url)
         book = extract_book_from_html(html, resolved)
         self.apply_evrit_product_apis(book, resolved or product_url)
+        self.apply_shopify_product_json(book, resolved or product_url)
         self.report.product_fetched += 1
         if remember and book.title and not is_query_listing_url(resolved):
             remember_page_book(book)
@@ -3114,6 +3770,7 @@ class BookCrawler:
         if is_product_page(soup, final_url):
             book = extract_book_from_html(html, final_url)
             self.apply_evrit_product_apis(book, final_url)
+            self.apply_shopify_product_json(book, final_url)
             self.report.product_fetched += 1
             self.report.product_links = 1
             if book.title:
@@ -3158,6 +3815,16 @@ class BookCrawler:
                 on_listed=keep_listed,
             )
             used_api = api_urls is not None
+            if not used_api:
+                api_urls = self._shopify_collection_product_urls(
+                    final_url,
+                    year,
+                    max_products,
+                    include_unknown_year,
+                    on_urls=on_api_urls,
+                    on_listed=keep_listed,
+                )
+                used_api = api_urls is not None
             if used_api:
                 self.report.product_links = len(product_urls)
             if not used_api:
@@ -3183,12 +3850,21 @@ class BookCrawler:
                     else:
                         self.progress(f"Reading catalog page {page_n}…")
                     note_pages(page_n, known_total)
-                    for product_url, listing_title in collect_product_entries(soup, listing_url):
-                        if not same_domain(start_url, product_url) or is_asset_url(product_url):
-                            continue
-                        if product_url not in product_urls:
-                            product_urls.append(product_url)
-                        take_listed(product_url, Book(url=product_url, title=listing_title))
+                    listed_books = collect_listing_books(soup, listing_url)
+                    if listed_books:
+                        for listed in listed_books:
+                            if not same_domain(start_url, listed.url) or is_asset_url(listed.url):
+                                continue
+                            if listed.url not in product_urls:
+                                product_urls.append(listed.url)
+                            take_listed(listed.url, listed)
+                    else:
+                        for product_url, listing_title in collect_product_entries(soup, listing_url):
+                            if not same_domain(start_url, product_url) or is_asset_url(product_url):
+                                continue
+                            if product_url not in product_urls:
+                                product_urls.append(product_url)
+                            take_listed(product_url, Book(url=product_url, title=listing_title))
                     next_cap = min(page_cap, known_total) if known_total else page_cap
                     if len(visited_listings) < next_cap:
                         for page_url in collect_pagination_links(soup, listing_url, next_cap):
