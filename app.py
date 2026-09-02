@@ -40,6 +40,7 @@ from book_crawler import (
     CrawlReport,
     books_match,
     catalog_listing_url,
+    dedupe_book_list,
     entry_now,
     fill_missing_entry_dates,
     fill_missing_phonetics,
@@ -47,7 +48,7 @@ from book_crawler import (
     format_person_name,
     format_price,
     listing_url_key,
-    overlay_evrit_catalog,
+    merge_later_into,
     parse_site_urls,
     site_display_name,
     site_host,
@@ -1826,6 +1827,7 @@ class BookCatalogApp(tk.Tk):
         self._excel_dir = Path(excel_dir) if excel_dir else self._default_excel_dir()
         self._bind_list_excel_path(rename_existing=False)
         self.books = books_from_payload(data)
+        cleanup = dedupe_book_list(self.books)
         phonetic_filled = self._prepare_books(self.books)
         self.table.set_books(self.books, keep_checks=False)
         self._clear_selected_book()
@@ -1849,6 +1851,9 @@ class BookCatalogApp(tk.Tk):
         extra = self._phonetic_fill_message(phonetic_filled)
         if extra:
             message = f"{message} {extra}"
+        if cleanup.removed:
+            message = f"{message} {cleanup.summary()}"
+            self.after(400, lambda report=cleanup: self._show_stats_report("Duplicate cleanup", report.report_text()))
         self._set_status(message)
         self._refresh_list_status()
 
@@ -2417,12 +2422,13 @@ class BookCatalogApp(tk.Tk):
         )
         try:
             self._crawl_progress(f"Searching {len(urls)} bookstore and catalog URL(s)…")
+            books = list(seed_books or [])
             books = crawler.search_all_sites(
                 urls=urls,
                 year=year,
                 max_listing_pages=max_pages,
                 include_unknown_year=include_unknown,
-                seed_books=seed_books,
+                seed_books=books,
                 seed_stamp=seed_stamp,
             )
             self._prepare_books(books)
@@ -2452,7 +2458,7 @@ class BookCatalogApp(tk.Tk):
                 pass
             self._ui_queue.put(("done", (books, crawler.report)))
         except CrawlCancelled:
-            self._ui_queue.put(("cancelled", None))
+            self._ui_queue.put(("cancelled", (books, crawler.report)))
         except Exception as exc:
             self._ui_queue.put(("error", str(exc)))
         finally:
@@ -2485,7 +2491,11 @@ class BookCatalogApp(tk.Tk):
                 books, report = payload
                 self._finish_search(books, cancelled=False, report=report)
             elif kind == "cancelled":
-                self._finish_search(self.books, cancelled=True)
+                if isinstance(payload, tuple) and len(payload) == 2:
+                    books, report = payload
+                    self._finish_search(books, cancelled=True, report=report)
+                else:
+                    self._finish_search(self.books, cancelled=True)
             elif kind == "error":
                 self._finish_search(self.books, cancelled=False, failed=True, error=str(payload))
                 messagebox.showerror("Search failed", str(payload))
@@ -2539,9 +2549,11 @@ class BookCatalogApp(tk.Tk):
         self._persist_working(self._list_report)
         year = self.year.get().strip() or "any year"
         list_failed = failed or bool(report.error and not self.books and not cancelled)
+        dup_note = self._scan_duplicate_status(report)
 
         def _status(text: str) -> None:
-            self._set_status((text + (" " + phonetic_note if phonetic_note else "")).strip())
+            extra = " ".join(part for part in (phonetic_note, dup_note) if part)
+            self._set_status((text + (" " + extra if extra else "")).strip())
 
         if cancelled:
             self._end_work("stopped")
@@ -2559,11 +2571,75 @@ class BookCatalogApp(tk.Tk):
         outcome = "stopped" if cancelled else "failed" if list_failed else "done"
         self._activity.finish(outcome, self.status.get())
         self.summary.set(report.summary())
+        if dup_note:
+            self.after(400, lambda r=report: self._show_stats_report("Search duplicates", self._scan_duplicate_report(r)))
         if self._selected_book:
             self.more_btn.configure(state="normal")
             self._update_workflow_buttons(self._selected_book)
         self._refresh_list_status()
         self._refresh_selection_label()
+
+    def _scan_duplicate_status(self, report: CrawlReport) -> str:
+        found = int(report.duplicates_found or 0)
+        updated = int(report.duplicates_updated or 0)
+        removed = int(report.list_removed or 0)
+        modified = int(report.list_modified or 0)
+        parts: list[str] = []
+        if found:
+            parts.append(
+                f"{found:,} existing book(s) were duplicates and were not added again"
+                + (f"; {updated:,} of them gained fields from later listings" if updated else "")
+                + "."
+            )
+        if removed:
+            parts.append(
+                f"Cleared {removed:,} extra duplicate row(s) from the list"
+                + (f"; {modified:,} earlier book(s) were updated from those later rows" if modified else "")
+                + "."
+            )
+        return " ".join(parts)
+
+    def _scan_duplicate_report(self, report: CrawlReport) -> str:
+        lines = [
+            "Search duplicate report",
+            "",
+            f"Books on the list now: {len(self.books):,}",
+            f"New books this search: {int(report.new_names or 0):,}",
+            f"Existing books discovered as duplicates (not added again): {int(report.duplicates_found or 0):,}",
+            f"Existing books updated from later listings: {int(report.duplicates_updated or 0):,}",
+        ]
+        if report.list_removed:
+            lines.extend(
+                [
+                    "",
+                    "Leftover rows still on the list were cleaned the same way:",
+                    f"Books that had extra rows: {int(report.list_duplicate_books or 0):,}",
+                    f"Extra rows merged and removed: {int(report.list_removed or 0):,}",
+                    f"Earlier books updated from those later rows: {int(report.list_modified or 0):,}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _show_stats_report(self, title: str, body: str) -> None:
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("560x380")
+        win.minsize(420, 260)
+        win.transient(self)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        view = tk.Text(frame, wrap="word", font=("Segoe UI", 10), padx=8, pady=8)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=view.yview)
+        view.configure(yscrollcommand=scroll.set)
+        view.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        view.insert("1.0", body)
+        view.configure(state="disabled")
+        ttk.Button(frame, text="OK", command=win.destroy).grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        win.lift()
+        win.focus_force()
 
     def _on_check_change(self) -> None:
         self._refresh_selection_label()
@@ -4044,9 +4120,7 @@ class BookCatalogApp(tk.Tk):
             self._set_running_summary()
             return
         if existing is not book:
-            existing.merge_missing(book)
-            overlay_evrit_catalog(existing, book)
-            existing.refresh_text_fields()
+            merge_later_into(existing, book, fallback_now=True)
         self.table.refresh_book(existing)
         self._select_live_book(existing)
         self._schedule_live_save()

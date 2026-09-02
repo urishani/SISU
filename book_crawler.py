@@ -1025,7 +1025,7 @@ class Book:
             return False
         return host in self.site_pages()
 
-    def merge_missing(self, other: "Book") -> list[str]:
+    def merge_missing(self, other: "Book", *, stamp: bool = True) -> list[str]:
         filled: list[str] = []
         filled.extend(remember_danacode(self, other.danacode, other.field_source_url("danacode") or other.url))
         for name in FILLABLE_FIELDS:
@@ -1083,7 +1083,7 @@ class Book:
         if other.extra.get("page_fields"):
             self.extra["page_fields"] = other.extra["page_fields"]
         filled = list(dict.fromkeys(filled))
-        if filled:
+        if filled and stamp:
             self.stamp_modified()
         return filled
 
@@ -1268,6 +1268,11 @@ class CrawlReport:
     skipped_year: int = 0
     enriched: int = 0
     new_names: int = 0
+    duplicates_found: int = 0
+    duplicates_updated: int = 0
+    list_duplicate_books: int = 0
+    list_removed: int = 0
+    list_modified: int = 0
     from_cache: bool = False
     cancelled: bool = False
     error: str = ""
@@ -1301,6 +1306,16 @@ class CrawlReport:
             parts.append(f"{self.enriched} filled from other sites")
         if self.cancelled:
             parts.append("stopped early")
+        if self.duplicates_found:
+            parts.append(
+                f"{self.duplicates_found:,} existing book(s) matched as duplicates"
+                + (f", {self.duplicates_updated:,} updated from later listings" if self.duplicates_updated else "")
+            )
+        if self.list_removed:
+            parts.append(
+                f"{self.list_removed:,} extra duplicate row(s) removed"
+                + (f", {self.list_modified:,} earlier book(s) gained fields" if self.list_modified else "")
+            )
         if self.site_notes:
             parts.append(" · ".join(self.site_notes))
         return "Search summary — " + ". ".join(parts) + "."
@@ -1485,35 +1500,29 @@ def merge_catalog(primary: list[Book], extras: list[Book]) -> int:
     return filled
 
 
-def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool]:
-    """Merge extra into the list, or append it. Returns (canonical book, added?)."""
+def absorb_book(primary: list[Book], extra: Book) -> tuple[Book, bool, list[str]]:
+    """Merge extra into the list, or append it. Returns (canonical book, added?, filled fields)."""
     extra.refresh_text_fields()
     extra_title = (extra.title or "").strip()
     extra_url = (extra.url or "").strip()
     if extra_url:
         for book in primary:
             if (book.url or "").strip() == extra_url:
-                _keep_identity(book, extra)
-                book.merge_missing(extra)
-                overlay_evrit_catalog(book, extra)
-                book.refresh_text_fields()
-                return book, False
+                filled = merge_later_into(book, extra, fallback_now=True)
+                return book, False, filled
     if extra_title:
         for book in primary:
             if books_match(book, extra):
-                _keep_identity(book, extra)
-                book.merge_missing(extra)
-                overlay_evrit_catalog(book, extra)
-                book.refresh_text_fields()
-                return book, False
+                filled = merge_later_into(book, extra, fallback_now=True)
+                return book, False, filled
         extra.stamp_created()
         primary.append(extra)
-        return extra, True
+        return extra, True, []
     if extra_url:
         extra.stamp_created()
         primary.append(extra)
-        return extra, True
-    return extra, False
+        return extra, True, []
+    return extra, False, []
 
 
 def overlay_evrit_catalog(book: Book, extra: Book) -> None:
@@ -1534,6 +1543,179 @@ def overlay_evrit_catalog(book: Book, extra: Book) -> None:
         better = not current
     if better:
         book.price_ils = extra.price_ils
+
+
+def later_entry_stamp(extra: Book, *, fallback_now: bool = False) -> str:
+    stamp = (extra.modified_at or "").strip() or (extra.created_at or "").strip()
+    if stamp:
+        return stamp
+    return entry_now() if fallback_now else ""
+
+
+def merge_later_into(keeper: Book, extra: Book, *, fallback_now: bool = False) -> list[str]:
+    """Copy complementary fields from extra into keeper and date the update from extra."""
+    extra.refresh_text_fields()
+    before = (keeper.year, keeper.pages, format_price(keeper.price_ils))
+    filled = keeper.merge_missing(extra, stamp=False)
+    overlay_evrit_catalog(keeper, extra)
+    after = (keeper.year, keeper.pages, format_price(keeper.price_ils))
+    if after[0] != before[0] and "year" not in filled:
+        filled.append("year")
+    if after[1] != before[1] and "pages" not in filled:
+        filled.append("pages")
+    if after[2] != before[2] and "price_ils" not in filled:
+        filled.append("price_ils")
+    _keep_identity(keeper, extra)
+    filled = list(dict.fromkeys(filled))
+    if filled:
+        stamp = later_entry_stamp(extra, fallback_now=fallback_now)
+        current = (keeper.modified_at or "").strip()
+        if stamp and (not current or stamp > current):
+            keeper.modified_at = stamp
+        if not (keeper.created_at or "").strip() and stamp:
+            keeper.created_at = stamp
+    keeper.refresh_text_fields()
+    return filled
+
+
+@dataclass
+class DedupeReport:
+    started_with: int = 0
+    ended_with: int = 0
+    duplicate_books: int = 0
+    extra_copies: int = 0
+    removed: int = 0
+    modified: int = 0
+
+    def summary(self) -> str:
+        if not self.removed and not self.duplicate_books:
+            return "No duplicate rows on this list."
+        parts = [
+            f"{self.duplicate_books:,} book(s) had more than one row "
+            f"({self.extra_copies:,} extra cop{'y' if self.extra_copies == 1 else 'ies'}).",
+            f"{self.removed:,} later row(s) were merged into the earlier book and removed.",
+        ]
+        if self.modified:
+            parts.append(
+                f"{self.modified:,} kept book(s) gained fields from the later copies "
+                "and were marked updated with that later date."
+            )
+        else:
+            parts.append("No kept book needed extra fields from the later copies.")
+        parts.append(f"The list now has {self.ended_with:,} book(s) (was {self.started_with:,}).")
+        return " ".join(parts)
+
+    def report_text(self) -> str:
+        lines = [
+            "Duplicate cleanup",
+            "",
+            f"Books that had duplicates: {self.duplicate_books:,}",
+            f"Extra duplicate rows found: {self.extra_copies:,}",
+            f"Rows removed after merging: {self.removed:,}",
+            f"Earlier books updated from later copies: {self.modified:,}",
+            f"Books on the list before cleanup: {self.started_with:,}",
+            f"Books on the list after cleanup: {self.ended_with:,}",
+            "",
+            self.summary(),
+        ]
+        return "\n".join(lines)
+
+
+def _created_rank(book: Book, index: int) -> tuple[int, str, int]:
+    created = (book.created_at or "").strip()
+    if created:
+        return (0, created, index)
+    return (1, "", index)
+
+
+def _duplicate_index_groups(books: list[Book]) -> list[list[int]]:
+    n = len(books)
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            return
+        if rank[ri] < rank[rj]:
+            parent[ri] = rj
+        elif rank[ri] > rank[rj]:
+            parent[rj] = ri
+        else:
+            parent[rj] = ri
+            rank[ri] += 1
+
+    buckets: dict[str, list[int]] = {}
+    for i, book in enumerate(books):
+        keys = identity_keys(book)
+        url = (book.url or "").strip()
+        if url:
+            keys.add("url:" + url)
+        for key in keys:
+            seen = buckets.setdefault(key, [])
+            for j in seen:
+                union(i, j)
+            seen.append(i)
+
+    by_token: dict[str, list[int]] = {}
+    for i, book in enumerate(books):
+        name = normalize_name(book.title)
+        token = name.split()[0] if name else ""
+        if not token:
+            continue
+        seen = by_token.setdefault(token, [])
+        for j in seen:
+            if find(i) == find(j):
+                continue
+            left_url = (books[i].url or "").strip()
+            right_url = (books[j].url or "").strip()
+            if (left_url and left_url == right_url) or books_match(books[i], books[j]):
+                union(i, j)
+        seen.append(i)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return [indexes for indexes in groups.values() if len(indexes) > 1]
+
+
+def dedupe_book_list(books: list[Book]) -> DedupeReport:
+    """Keep the earliest book in each duplicate group and merge later copies into it."""
+    report = DedupeReport(started_with=len(books), ended_with=len(books))
+    if len(books) < 2:
+        return report
+    groups = _duplicate_index_groups(books)
+    if not groups:
+        return report
+    drop: set[int] = set()
+    modified_ids: set[int] = set()
+    for indexes in groups:
+        ranked = sorted(indexes, key=lambda i: _created_rank(books[i], i))
+        keeper_index = ranked[0]
+        keeper = books[keeper_index]
+        extras = ranked[1:]
+        report.duplicate_books += 1
+        report.extra_copies += len(extras)
+        for extra_index in extras:
+            extra = books[extra_index]
+            filled = merge_later_into(keeper, extra, fallback_now=False)
+            if filled:
+                modified_ids.add(id(keeper))
+            drop.add(extra_index)
+    report.modified = len(modified_ids)
+    report.removed = len(drop)
+    if drop:
+        kept = [book for index, book in enumerate(books) if index not in drop]
+        books.clear()
+        books.extend(kept)
+    report.ended_with = len(books)
+    return report
 
 
 def fill_missing_entry_dates(books: list[Book], when: str = "") -> int:
@@ -1606,7 +1788,7 @@ def union_catalog(primary: list[Book], extras: list[Book]) -> int:
     """Merge matching books, and append titles that are not already in the list."""
     added = 0
     for extra in extras:
-        _canonical, is_new = absorb_book(primary, extra)
+        _canonical, is_new, _filled = absorb_book(primary, extra)
         if is_new:
             added += 1
     return added
@@ -3348,6 +3530,8 @@ class BookCrawler:
         self.event = event or (lambda _kind, _data: None)
         self.report = CrawlReport()
         self.last_site_error = ""
+        self._duplicate_ids: set[int] = set()
+        self._duplicate_updated_ids: set[int] = set()
         self.session = requests.Session()
         retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
@@ -3374,7 +3558,11 @@ class BookCrawler:
             pass
 
     def _take_book(self, books: list[Book], book: Book, site: str, url: str) -> None:
-        canonical, is_new = absorb_book(books, book)
+        canonical, is_new, filled = absorb_book(books, book)
+        if not is_new:
+            self._duplicate_ids.add(id(canonical))
+            if filled:
+                self._duplicate_updated_ids.add(id(canonical))
         titled = sum(1 for item in books if (item.title or "").strip())
         self._emit(
             "book",
@@ -3682,7 +3870,7 @@ class BookCrawler:
         known_total = 0
 
         def keep(book: Book) -> tuple[Book, bool]:
-            canonical, is_new = absorb_book(results, book)
+            canonical, is_new, _filled = absorb_book(results, book)
             if on_book:
                 on_book(canonical)
             return canonical, is_new
@@ -4312,6 +4500,19 @@ class BookCrawler:
                 filled += 1
         return filled
 
+    def _finish_duplicate_stats(self, books: list[Book], started_with: int, notes: list[str]) -> None:
+        cleanup = dedupe_book_list(books)
+        self.report.matched = len(books)
+        self.report.new_names = max(0, len(books) - started_with)
+        self.report.duplicates_found = len(self._duplicate_ids)
+        self.report.duplicates_updated = len(self._duplicate_updated_ids)
+        self.report.list_duplicate_books = cleanup.duplicate_books
+        self.report.list_removed = cleanup.removed
+        self.report.list_modified = cleanup.modified
+        self.report.site_notes = notes
+        if cleanup.removed:
+            self.progress(cleanup.summary())
+
     def search_all_sites(
         self,
         urls: list[str],
@@ -4321,8 +4522,10 @@ class BookCrawler:
         seed_books: list[Book] | None = None,
         seed_stamp: str = "",
     ) -> list[Book]:
-        books: list[Book] = list(seed_books or [])
+        books: list[Book] = seed_books if seed_books is not None else []
         started_with = len(books)
+        self._duplicate_ids.clear()
+        self._duplicate_updated_ids.clear()
         fill_missing_entry_dates(books, seed_stamp)
         for book in books:
             book.refresh_text_fields()
@@ -4377,10 +4580,13 @@ class BookCrawler:
                 "Publisher websites are skipped during Search (use More on a book)."
             )
             self.enrich_books(books, listing_urls, max_searches=0)
-            self.report.matched = len(books)
-            self.report.new_names = max(0, len(books) - started_with)
-            self.report.site_notes = notes
+            self._finish_duplicate_stats(books, started_with, notes)
             return books
+        except CrawlCancelled:
+            self.report.cancelled = True
+            self.report.site_notes = notes
+            self._finish_duplicate_stats(books, started_with, notes)
+            raise
         finally:
             try:
                 from book_cache import flush_page_cache
