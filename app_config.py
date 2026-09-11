@@ -1,4 +1,4 @@
-"""Load and save SISU settings: browser choice, publisher websites, and LLM."""
+"""Load and save SISU settings: browser choice, catalog sites, publisher websites, and LLM."""
 
 from __future__ import annotations
 
@@ -13,6 +13,12 @@ from publisher_sites import builtin_publisher_entries, publishers_match, resolve
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
+DEFAULT_SEARCH_URLS = (
+    "https://www.booknet.co.il/ספרים-חדשים",
+    "https://www.e-vrit.co.il/group/3/ספרים-חדשים",
+    "https://www.nli.org.il/he/search?materialType=books",
+)
+PLACEHOLDER_URL_MARKERS = ("example.com", "example.org", "a.example")
 
 BROWSERS: tuple[tuple[str, str], ...] = (
     ("chrome", "Google Chrome"),
@@ -72,11 +78,16 @@ def _llm_defaults() -> dict:
     }
 
 
+def _default_search_sites() -> list[dict]:
+    return [{"url": url, "enabled": True} for url in DEFAULT_SEARCH_URLS]
+
+
 def _defaults() -> dict:
     return {
         "browser": "chrome",
         "browser_path": "",
         "publishers": {},
+        "search_sites": _default_search_sites(),
         "excel_dir": "",
         "llm": _llm_defaults(),
     }
@@ -146,8 +157,62 @@ def _normalize(raw: dict) -> dict:
                 continue
             publishers[label] = normalize_site_url(str(url or ""))
     data["publishers"] = publishers
+    if "search_sites" in raw:
+        data["search_sites"] = _normalize_search_sites(raw.get("search_sites"), fallback=False)
+    else:
+        data["search_sites"] = _default_search_sites()
     data["llm"] = _normalize_llm(raw.get("llm") if isinstance(raw.get("llm"), dict) else {})
     return data
+
+
+def _is_placeholder_url(url: str) -> bool:
+    return any(marker in (url or "").casefold() for marker in PLACEHOLDER_URL_MARKERS)
+
+
+def _normalize_search_sites(raw: object, *, fallback: bool = True) -> list[dict]:
+    items: list[dict] = []
+    seen: set[str] = set()
+    source: list = raw if isinstance(raw, list) else []
+    for item in source:
+        if isinstance(item, str):
+            url, enabled = item, True
+        elif isinstance(item, dict):
+            url = str(item.get("url") or "")
+            enabled = bool(item.get("enabled", True))
+        else:
+            continue
+        url = normalize_site_url(url)
+        if not url or _is_placeholder_url(url) or url in seen:
+            continue
+        seen.add(url)
+        items.append({"url": url, "enabled": enabled})
+    if items or not fallback:
+        return items
+    return _default_search_sites()
+
+
+def search_sites() -> list[dict]:
+    value = load_config().get("search_sites") or []
+    return [dict(item) for item in value if isinstance(item, dict) and str(item.get("url") or "").strip()]
+
+
+def all_search_urls() -> list[str]:
+    return [str(item.get("url") or "").strip() for item in search_sites() if str(item.get("url") or "").strip()]
+
+
+def enabled_search_urls() -> list[str]:
+    return [
+        str(item.get("url") or "").strip()
+        for item in search_sites()
+        if str(item.get("url") or "").strip() and item.get("enabled", True)
+    ]
+
+
+def update_search_sites(sites: Iterable[dict | str]) -> list[dict]:
+    data = load_config()
+    data["search_sites"] = _normalize_search_sites(list(sites), fallback=False)
+    save_config(data)
+    return search_sites()
 
 
 def _normalize_llm(raw: dict) -> dict:

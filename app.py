@@ -23,15 +23,20 @@ from dataclasses import asdict
 from activity_log import ActivityLog
 from app_config import (
     BROWSERS,
+    DEFAULT_SEARCH_URLS,
     LLM_DEFAULT_BASE_URLS,
     LLM_DEFAULT_MODELS,
     LLM_SERVICES,
+    all_search_urls,
     browser_executable,
     browser_label,
+    enabled_search_urls,
     load_config,
     merged_publisher_rows,
     normalize_site_url,
     save_config,
+    search_sites,
+    update_search_sites,
 )
 from book_crawler import (
     Book,
@@ -49,7 +54,6 @@ from book_crawler import (
     format_price,
     listing_url_key,
     merge_later_into,
-    parse_site_urls,
     site_display_name,
     site_host,
 )
@@ -64,7 +68,6 @@ from scan_lists import (
     books_from_payload,
     build_payload,
     default_scan_title,
-    DEFAULT_SEARCH_URLS,
     delete_named,
     empty_payload,
     list_summaries,
@@ -193,7 +196,6 @@ ERROR_FG = "#B42318"
 ERROR_BG = "#FDECEC"
 FINAL_FG = "#0B57D0"
 FINAL_BG = "#E8F0FE"
-DEFAULT_URLS = "\n".join(DEFAULT_SEARCH_URLS)
 UPDATE_CHECK_FIRST_MS = 2_000
 UPDATE_CHECK_EVERY_MS = 15 * 60 * 1000
 
@@ -279,6 +281,11 @@ class BookCatalogApp(tk.Tk):
         self._ui_queue: queue.Queue = queue.Queue()
         self._clean_fingerprint = ""
         self._list_actions_ready = False
+        self._site_rows: list[dict] = []
+        self._site_list_inner: ttk.Frame | None = None
+        self._site_list_canvas: tk.Canvas | None = None
+        self._site_list_window_id: int | None = None
+        self._site_list_updating = False
 
         self._setup_style()
         self._build()
@@ -365,7 +372,7 @@ class BookCatalogApp(tk.Tk):
             self.open_lists_manager,
             "Open, rename, or delete saved scan lists.",
         )
-        header_button("Settings", self.open_settings, "Publisher websites, field aliases, the browser to open, and LLM.")
+        header_button("Settings", self.open_settings, "Catalog sites, publisher websites, field aliases, the browser to open, and LLM.")
         self.after_idle(self._fit_search_fields)
 
         body = ttk.Frame(self)
@@ -442,23 +449,65 @@ class BookCatalogApp(tk.Tk):
         self.excel_share_btn.pack(side="left", padx=(6, 0))
         self._callout(self.excel_share_btn, "Start an email with this list’s Excel file attached.")
 
-        ttk.Label(form, text="Site URLs").grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=(2, 0))
+        url_heading = ttk.Frame(form)
+        url_heading.grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=(2, 0))
+        ttk.Label(url_heading, text="Site URLs").pack(anchor="e")
+        edit_sites_btn = ttk.Button(
+            url_heading,
+            text="Edit…",
+            command=lambda: self.open_settings(focus_tab="sites"),
+        )
+        edit_sites_btn.pack(anchor="e", pady=(4, 0))
+        self._callout(edit_sites_btn, "Add, remove, or reorder catalog sites in Settings.")
         url_wrap = ttk.Frame(form)
         url_wrap.grid(row=1, column=1, sticky="nw", pady=(2, 0))
         url_wrap.columnconfigure(0, weight=0)
         url_wrap.rowconfigure(0, weight=1)
-        self.url_text = tk.Text(url_wrap, height=3, width=52, wrap="none", font=("Segoe UI", 10), undo=True, padx=6, pady=2)
-        url_scroll_y = ttk.Scrollbar(url_wrap, orient="vertical", command=self.url_text.yview)
-        self.url_text.configure(yscrollcommand=url_scroll_y.set)
-        self.url_text.grid(row=0, column=0, sticky="nw")
-        url_scroll_y.grid(row=0, column=1, sticky="ns")
-        self.url_text.insert("1.0", DEFAULT_URLS)
-        self.url_text.tag_configure("searching", background="#FDE6C4", foreground="#9A3412")
-        self.url_text.bind("<<Modified>>", self._on_url_text_modified)
-        self._callout(
-            self.url_text,
-            "One bookstore or catalog URL per line. Search reads all of them, merges unique titles, and does not stop at the first list.",
+        site_canvas = tk.Canvas(
+            url_wrap,
+            height=78,
+            width=420,
+            bg=WHITE,
+            highlightbackground="#C9BBA8",
+            highlightthickness=1,
         )
+        site_scroll = ttk.Scrollbar(url_wrap, orient="vertical", command=site_canvas.yview)
+        site_inner = ttk.Frame(site_canvas, style="Card.TFrame")
+        site_window = site_canvas.create_window((0, 0), window=site_inner, anchor="nw")
+        site_canvas.configure(yscrollcommand=site_scroll.set)
+        site_canvas.grid(row=0, column=0, sticky="nw")
+        site_scroll.grid(row=0, column=1, sticky="ns")
+        self._site_list_canvas = site_canvas
+        self._site_list_inner = site_inner
+        self._site_list_window_id = site_window
+        self._site_list_wrap = url_wrap
+
+        def _sync_site_list(_event=None) -> None:
+            canvas = self._site_list_canvas
+            inner = self._site_list_inner
+            window_id = self._site_list_window_id
+            if canvas is None or inner is None or window_id is None:
+                return
+            width = int(canvas.winfo_width() or 0)
+            if width > 20:
+                canvas.itemconfigure(window_id, width=width)
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+
+        def _site_list_wheel(event: tk.Event) -> str:
+            site_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        site_inner.bind("<Configure>", _sync_site_list)
+        site_canvas.bind("<Configure>", _sync_site_list)
+        site_canvas.bind("<MouseWheel>", _site_list_wheel)
+        site_inner.bind("<MouseWheel>", _site_list_wheel)
+        self._callout(
+            site_canvas,
+            "Check the sites Search should read. Uncheck sites to skip them. Edit the list and its order in Settings.",
+        )
+        self._rebuild_site_url_list()
         self.excel_path.trace_add("write", lambda *_args: self._fit_search_fields())
 
         search_side = ttk.Frame(form)
@@ -496,7 +545,7 @@ class BookCatalogApp(tk.Tk):
         self.search_btn.pack(side="left", padx=(0, 4))
         self._callout(
             self.search_btn,
-            "Search every bookstore URL, merge unique titles into one list, then fill catalog and publisher pages.",
+            "Search the checked bookstore URLs, merge unique titles into one list, then fill catalog and publisher pages.",
         )
         self.log_btn = ttk.Button(buttons, text="Show log", command=self.show_activity_log)
         self.log_btn.pack(side="left", padx=(0, 4))
@@ -770,26 +819,30 @@ class BookCatalogApp(tk.Tk):
         self._set_label_wrap(self.colored_info_label, width)
         self._set_label_wrap(self.summary_label, width)
 
-    def _on_url_text_modified(self, _event=None) -> None:
-        url_box = getattr(self, "url_text", None)
-        if url_box is None or not url_box.edit_modified():
-            return
-        url_box.edit_modified(False)
-        self._fit_search_fields()
-        self._on_list_fields_changed()
-
     def _fit_search_fields(self) -> None:
-        url_box = getattr(self, "url_text", None)
         excel_box = getattr(self, "excel_entry", None)
-        if url_box is None or excel_box is None:
+        canvas = getattr(self, "_site_list_canvas", None)
+        if canvas is not None:
+            url_font = tkfont.Font(font=("Segoe UI", 10))
+            texts = [str(row.get("url") or "") for row in self._site_rows if row.get("url")]
+            if not texts:
+                texts = ["https://www.booknet.co.il/"]
+            width_px = max(url_font.measure(text) for text in texts) + 56
+            width_px = max(320, min(560, width_px))
+            rows = max(1, min(4, len(self._site_rows) or 1))
+            height_px = rows * 26 + 6
+            current_w = int(canvas.cget("width") or 0)
+            current_h = int(canvas.cget("height") or 0)
+            if current_w != width_px or current_h != height_px:
+                canvas.configure(width=width_px, height=height_px)
+            window_id = self._site_list_window_id
+            if window_id is not None:
+                canvas.itemconfigure(window_id, width=width_px)
+                bbox = canvas.bbox("all")
+                if bbox:
+                    canvas.configure(scrollregion=bbox)
+        if excel_box is None:
             return
-        url_font = tkfont.Font(font=url_box.cget("font"))
-        lines = [line for line in url_box.get("1.0", "end-1c").splitlines() if line.strip()]
-        if not lines:
-            lines = ["https://www.booknet.co.il/"]
-        url_cols = self._cols_for_texts(url_font, lines, 40, 68)
-        if int(url_box.cget("width") or 0) != url_cols:
-            url_box.configure(width=url_cols)
         path = self.excel_path.get().strip() or "C:\\SISU\\list.xlsx"
         excel_font = tkfont.nametofont("TkDefaultFont")
         excel_cols = self._cols_for_texts(excel_font, [path], 36, 64)
@@ -803,8 +856,170 @@ class BookCatalogApp(tk.Tk):
         cols = int((widest + zero * 2) / zero)
         return max(min_cols, min(max_cols, cols))
 
+    @staticmethod
+    def _canonical_search_url(url: str) -> str:
+        value = normalize_site_url(url)
+        if not value:
+            return ""
+        return catalog_listing_url(value)
+
+    @staticmethod
+    def _search_site_key(url: str) -> str:
+        value = BookCatalogApp._canonical_search_url(url)
+        return listing_url_key(value) if value else ""
+
     def _urls(self) -> list[str]:
-        return parse_site_urls(self.url_text.get("1.0", "end"))
+        selected: list[str] = []
+        seen: set[str] = set()
+        for row in getattr(self, "_site_rows", []):
+            if not row.get("var") or not bool(row["var"].get()):
+                continue
+            url = self._canonical_search_url(str(row.get("url") or ""))
+            key = self._search_site_key(url)
+            if not url or not key or key in seen:
+                continue
+            seen.add(key)
+            selected.append(url)
+        if selected or self._site_rows:
+            return selected
+        return [self._canonical_search_url(url) for url in enabled_search_urls() if self._canonical_search_url(url)]
+
+    def _rebuild_site_url_list(self, selected: list[str] | None = None) -> None:
+        inner = getattr(self, "_site_list_inner", None)
+        if inner is None:
+            return
+        self._site_list_updating = True
+        if selected is None:
+            if self._site_rows:
+                selected = [str(row.get("url") or "") for row in self._site_rows if row.get("var") and bool(row["var"].get())]
+            else:
+                selected = enabled_search_urls() or all_search_urls()
+        selected_keys = {self._search_site_key(url) for url in selected if self._search_site_key(url)}
+        for child in inner.winfo_children():
+            child.destroy()
+        self._site_rows = []
+        catalog = search_sites() or [{"url": url, "enabled": True} for url in DEFAULT_SEARCH_URLS]
+        locked = bool(getattr(self, "_list_locked", False) or getattr(self, "_busy", False))
+        check_state = "disabled" if locked else "normal"
+        for item in catalog:
+            url = self._canonical_search_url(str(item.get("url") or ""))
+            if not url:
+                continue
+            key = self._search_site_key(url)
+            checked = key in selected_keys
+            row = tk.Frame(inner, bg=WHITE)
+            row.pack(fill="x", anchor="w")
+            var = tk.BooleanVar(value=checked)
+            check = tk.Checkbutton(
+                row,
+                variable=var,
+                bg=WHITE,
+                activebackground=WHITE,
+                selectcolor=WHITE,
+                highlightthickness=0,
+                bd=0,
+                pady=0,
+                state=check_state,
+                command=self._on_site_check_change,
+            )
+            check.pack(side="left", padx=(4, 2))
+            label = tk.Label(
+                row,
+                text=url,
+                bg=WHITE,
+                fg=NAVY,
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 10),
+            )
+            label.pack(side="left", fill="x", expand=True, pady=1)
+
+            def _toggle_from_label(_event=None, item=var, box=check) -> None:
+                if str(box.cget("state")) == "disabled":
+                    return
+                item.set(not bool(item.get()))
+                self._on_site_check_change()
+
+            label.bind("<Button-1>", _toggle_from_label)
+            label.bind(
+                "<MouseWheel>",
+                lambda event: self._site_list_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                if self._site_list_canvas
+                else None,
+            )
+            self._site_rows.append({"url": url, "var": var, "frame": row, "check": check, "label": label})
+        if not self._site_rows:
+            empty = tk.Label(
+                inner,
+                text="No catalog sites yet. Use Edit… to add them in Settings.",
+                bg=WHITE,
+                fg=NAVY,
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 10),
+                wraplength=400,
+            )
+            empty.pack(fill="x", padx=6, pady=6)
+        self._site_list_updating = False
+        self._fit_search_fields()
+        self._set_site_list_enabled(not (self._list_locked or self._busy))
+
+    def _set_site_list_enabled(self, on: bool) -> None:
+        state = "normal" if on else "disabled"
+        for row in self._site_rows:
+            try:
+                row["check"].configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _on_site_check_change(self) -> None:
+        if self._site_list_updating:
+            return
+        self._persist_site_enabled()
+        if getattr(self, "_list_actions_ready", False):
+            self._persist_working()
+        else:
+            self._on_list_fields_changed()
+
+    def _persist_site_enabled(self) -> None:
+        enabled_map = {
+            self._search_site_key(str(row.get("url") or "")): bool(row["var"].get())
+            for row in self._site_rows
+            if row.get("var")
+        }
+        updated = []
+        for item in search_sites() or [{"url": url, "enabled": True} for url in DEFAULT_SEARCH_URLS]:
+            url = self._canonical_search_url(str(item.get("url") or ""))
+            if not url:
+                continue
+            key = self._search_site_key(url)
+            updated.append({"url": url, "enabled": enabled_map.get(key, bool(item.get("enabled", True)))})
+        if updated:
+            update_search_sites(updated)
+
+    def _ingest_payload_sites(self, urls: list[str]) -> None:
+        catalog = search_sites()
+        known = {self._search_site_key(str(item.get("url") or "")) for item in catalog}
+        added = False
+        for raw in urls:
+            url = self._canonical_search_url(raw)
+            key = self._search_site_key(url)
+            if not url or not key or key in known:
+                continue
+            catalog.append({"url": url, "enabled": True})
+            known.add(key)
+            added = True
+        if added or any(self._canonical_search_url(str(item.get("url") or "")) != str(item.get("url") or "") for item in catalog):
+            canonical = []
+            seen: set[str] = set()
+            for item in catalog:
+                url = self._canonical_search_url(str(item.get("url") or ""))
+                key = self._search_site_key(url)
+                if not url or not key or key in seen:
+                    continue
+                seen.add(key)
+                canonical.append({"url": url, "enabled": bool(item.get("enabled", True))})
+            update_search_sites(canonical)
 
     def _current_publishers(self) -> list[str]:
         from publisher_sites import _haystack
@@ -858,11 +1073,13 @@ class BookCatalogApp(tk.Tk):
         tab_bar = tk.Frame(body, bg=BG)
         tab_bar.pack(fill="x", pady=(0, 8))
         browser_tab = ttk.Frame(body, padding=12)
+        sites_tab = ttk.Frame(body, padding=12)
         publisher_tab = ttk.Frame(body, padding=12)
         aliases_tab = ttk.Frame(body, padding=12)
         llm_tab = ttk.Frame(body, padding=12)
         tab_frames = {
             "browser": browser_tab,
+            "sites": sites_tab,
             "publishers": publisher_tab,
             "aliases": aliases_tab,
             "llm": llm_tab,
@@ -895,6 +1112,7 @@ class BookCatalogApp(tk.Tk):
             tab_buttons[key] = button
 
         make_tab("browser", "Browser")
+        make_tab("sites", "Site URLs")
         make_tab("publishers", "Publisher sites")
         make_tab("aliases", "Field aliases")
         make_tab("llm", "LLM")
@@ -930,6 +1148,87 @@ class BookCatalogApp(tk.Tk):
             text="Google Chrome is the default. Choose another browser, or the system default, if you prefer.",
             wraplength=680,
         ).pack(anchor="w", pady=(12, 0))
+
+        ttk.Label(
+            sites_tab,
+            text="Bookstore and library catalogs Search reads, in this order. Move a site up or down, then Save. On the main window, check the sites to include in a search.",
+            wraplength=740,
+        ).pack(anchor="w")
+        site_wrap = ttk.Frame(sites_tab)
+        site_wrap.pack(fill="both", expand=True, pady=(8, 6))
+        site_inner = _settings_scroll_table(site_wrap, columns=(0,))
+        site_vars: list[tk.StringVar] = []
+
+        def _fill_site_rows(urls: list[str], focus_last: bool = False) -> None:
+            _suspend_settings_table(site_inner, True)
+            for child in site_inner.winfo_children():
+                child.destroy()
+            site_vars.clear()
+            ttk.Label(site_inner, text="Catalog URL", font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Label(site_inner, text="").grid(row=0, column=1)
+            ttk.Label(site_inner, text="").grid(row=0, column=2)
+            ttk.Label(site_inner, text="").grid(row=0, column=3)
+            last_entry: tk.Entry | None = None
+            total = len(urls)
+            for index, url in enumerate(urls):
+                last_entry = _append_site_row(url, index=index, total=total)
+            _suspend_settings_table(site_inner, False)
+            if focus_last and last_entry is not None:
+                last_entry.focus_set()
+
+        def _append_site_row(url: str = "", index: int | None = None, total: int | None = None) -> tk.Entry:
+            url_var = tk.StringVar(value=url)
+            pair_index = len(site_vars) if index is None else index
+            count = (total if total is not None else pair_index + 1)
+            grid_row = pair_index + 1
+            url_entry = tk.Entry(site_inner, textvariable=url_var, font=("Segoe UI", 10), relief="solid", bd=1)
+            url_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
+            _bind_entry_clipboard(url_entry)
+            up_btn = ttk.Button(
+                site_inner,
+                text="Up",
+                width=4,
+                command=lambda item=pair_index: _move_site_row(item, -1),
+            )
+            up_btn.grid(row=grid_row, column=1, padx=(0, 4), pady=3)
+            down_btn = ttk.Button(
+                site_inner,
+                text="Down",
+                width=5,
+                command=lambda item=pair_index: _move_site_row(item, 1),
+            )
+            down_btn.grid(row=grid_row, column=2, padx=(0, 4), pady=3)
+            ttk.Button(
+                site_inner,
+                text="Remove",
+                command=lambda item=url_var: _remove_site_row(item),
+            ).grid(row=grid_row, column=3, pady=3)
+            if pair_index == 0:
+                up_btn.configure(state="disabled")
+            if pair_index >= count - 1:
+                down_btn.configure(state="disabled")
+            site_vars.append(url_var)
+            return url_entry
+
+        def _remove_site_row(item: tk.StringVar) -> None:
+            snapshot = [var.get() for var in site_vars if var is not item]
+            _fill_site_rows(snapshot)
+
+        def _move_site_row(index: int, delta: int) -> None:
+            snapshot = [var.get() for var in site_vars]
+            new_index = index + delta
+            if new_index < 0 or new_index >= len(snapshot):
+                return
+            snapshot[index], snapshot[new_index] = snapshot[new_index], snapshot[index]
+            _fill_site_rows(snapshot)
+
+        ttk.Button(
+            sites_tab,
+            text="Add site",
+            command=lambda: _fill_site_rows([var.get() for var in site_vars] + [""], focus_last=True),
+        ).pack(anchor="w")
 
         ttk.Label(
             publisher_tab,
@@ -1407,6 +1706,23 @@ class BookCatalogApp(tk.Tk):
                 if not name:
                     continue
                 publishers[name] = normalize_site_url(url_var.get())
+            previous_enabled = {
+                self._search_site_key(str(item.get("url") or "")): bool(item.get("enabled", True))
+                for item in search_sites()
+            }
+            for row in self._site_rows:
+                if not row.get("var"):
+                    continue
+                previous_enabled[self._search_site_key(str(row.get("url") or ""))] = bool(row["var"].get())
+            sites: list[dict] = []
+            seen_sites: set[str] = set()
+            for var in site_vars:
+                url = self._canonical_search_url(var.get())
+                key = self._search_site_key(url)
+                if not url or not key or key in seen_sites:
+                    continue
+                seen_sites.add(key)
+                sites.append({"url": url, "enabled": previous_enabled.get(key, True)})
             try:
                 llm_fields = _llm_fields()
             except ValueError as exc:
@@ -1421,6 +1737,7 @@ class BookCatalogApp(tk.Tk):
                     "browser": browser_var.get().strip() or "chrome",
                     "browser_path": custom_path.get().strip(),
                     "publishers": publishers,
+                    "search_sites": sites,
                     "excel_dir": current.get("excel_dir") or "",
                     "llm": current_llm,
                 }
@@ -1429,6 +1746,8 @@ class BookCatalogApp(tk.Tk):
                 show_tab("aliases")
                 return
             close()
+            selected = [item["url"] for item in sites if item.get("enabled")]
+            self._rebuild_site_url_list(selected=selected)
             extra = ""
             if llm_fields.get("enabled") and self.books:
                 extra = self._refill_phonetics_with_llm()
@@ -1443,6 +1762,8 @@ class BookCatalogApp(tk.Tk):
             if focus_tab == "llm"
             else "aliases"
             if focus_tab == "aliases"
+            else "sites"
+            if focus_tab == "sites"
             else "publishers"
             if focus_publisher.strip()
             else "browser"
@@ -1452,6 +1773,9 @@ class BookCatalogApp(tk.Tk):
         win.focus_force()
         win.update_idletasks()
         _fill_rows(seed, highlight_name=focus_publisher)
+        site_seed = [self._canonical_search_url(str(item.get("url") or "")) for item in search_sites()]
+        site_seed = [url for url in site_seed if url] or list(DEFAULT_SEARCH_URLS)
+        _fill_site_rows(site_seed)
         _fill_alias_rows(loaded_aliases)
         _fill_cover_rows(cover_items)
 
@@ -1769,14 +2093,10 @@ class BookCatalogApp(tk.Tk):
         self._update_list_action_buttons()
 
     def _apply_lock_state(self) -> None:
-        locked = self._list_locked and not self._busy
         search_state = "disabled" if (self._list_locked or self._busy) else "normal"
         edit_state = "disabled" if self._list_locked else "normal"
         self.search_btn.configure(state=search_state)
-        try:
-            self.url_text.configure(state=edit_state)
-        except tk.TclError:
-            pass
+        self._set_site_list_enabled(not (self._list_locked or self._busy))
         self.year_entry.configure(state=edit_state)
         self.no_limit_check.configure(state=edit_state)
         self.unknown_check.configure(state=edit_state)
@@ -1803,10 +2123,10 @@ class BookCatalogApp(tk.Tk):
         self._list_report = data.get("report") or {}
         self._skip_cache_restore = bool(data.get("skip_cache_restore"))
         self.list_title.set(str(data.get("title") or "New"))
-        urls = merge_search_urls(list(data.get("urls") or []))
-        self.url_text.configure(state="normal")
-        self.url_text.delete("1.0", "end")
-        self.url_text.insert("1.0", "\n".join(urls))
+        urls = merge_search_urls(list(data.get("urls") or []), fallback=False)
+        self._ingest_payload_sites(urls)
+        self._rebuild_site_url_list(selected=urls or None)
+        self._persist_site_enabled()
         if data.get("year") not in (None, ""):
             self.year.set(str(data.get("year")))
         if "max_pages" in data and data.get("max_pages") is not None:
@@ -1883,7 +2203,7 @@ class BookCatalogApp(tk.Tk):
             "Clear the current working list? Stash it first if you want to keep these books.",
         ):
             return
-        urls = self._urls() or parse_site_urls(DEFAULT_URLS)
+        urls = self._urls() or all_search_urls() or list(DEFAULT_SEARCH_URLS)
         payload = empty_payload(
             title="New",
             urls=urls,
@@ -1911,7 +2231,7 @@ class BookCatalogApp(tk.Tk):
         ):
             return
         save_stash(self._current_payload())
-        urls = self._urls() or parse_site_urls(DEFAULT_URLS)
+        urls = self._urls() or all_search_urls() or list(DEFAULT_SEARCH_URLS)
         payload = empty_payload(
             title="New",
             urls=urls,
@@ -2181,7 +2501,7 @@ class BookCatalogApp(tk.Tk):
         urls = self._urls()
         year = self.year.get().strip()
         if not urls:
-            messagebox.showwarning("Missing URL", "Paste one bookstore URL per line.")
+            messagebox.showwarning("Missing URL", "Check at least one site URL to search.")
             return
         if year and not year.isdigit():
             messagebox.showwarning("Year", "Publication year should be a number such as 2026.")
@@ -2190,6 +2510,7 @@ class BookCatalogApp(tk.Tk):
         self._cancel.clear()
         self._busy = True
         self.search_btn.configure(state="disabled")
+        self._set_site_list_enabled(False)
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
@@ -2761,6 +3082,7 @@ class BookCatalogApp(tk.Tk):
         self._cancel.clear()
         self._busy = True
         self.search_btn.configure(state="disabled")
+        self._set_site_list_enabled(False)
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
@@ -3983,24 +4305,35 @@ class BookCatalogApp(tk.Tk):
             self.pages_label.configure(text="Max pages")
 
     def _highlight_site_url(self, url: str) -> None:
-        box = self.url_text
-        try:
-            box.tag_remove("searching", "1.0", "end")
-        except tk.TclError:
-            return
-        if not url:
-            return
-        target = listing_url_key(url)
-        host = site_host(url)
-        lines = box.get("1.0", "end-1c").splitlines()
-        for index, line in enumerate(lines, start=1):
-            raw = line.strip()
-            if not raw or raw.startswith("#"):
+        target = self._search_site_key(url) if url else ""
+        host = site_host(url) if url else ""
+        active_row = None
+        for row in self._site_rows:
+            row_url = str(row.get("url") or "")
+            active = bool(url) and (
+                self._search_site_key(row_url) == target or (host and site_host(row_url) == host)
+            )
+            bg = "#FDE6C4" if active else WHITE
+            fg = "#9A3412" if active else NAVY
+            try:
+                row["frame"].configure(bg=bg)
+                row["check"].configure(bg=bg, activebackground=bg)
+                row["label"].configure(bg=bg, fg=fg)
+            except tk.TclError:
                 continue
-            if listing_url_key(raw) == target or site_host(raw) == host:
-                box.tag_add("searching", f"{index}.0", f"{index}.end")
-                box.see(f"{index}.0")
-                return
+            if active:
+                active_row = row["frame"]
+        canvas = self._site_list_canvas
+        if canvas is None or active_row is None:
+            return
+        try:
+            canvas.update_idletasks()
+            top = active_row.winfo_y()
+            height = max(active_row.winfo_height(), 1)
+            inner_height = max(int(canvas.bbox("all")[3] if canvas.bbox("all") else 1), 1)
+            canvas.yview_moveto(max(0.0, min(1.0, (top - height) / inner_height)))
+        except tk.TclError:
+            pass
 
     def _refresh_scan_live(
         self,

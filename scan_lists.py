@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app_config import DEFAULT_SEARCH_URLS, PLACEHOLDER_URL_MARKERS, all_search_urls
 from book_cache import CACHE_DIR, LAST_PATH, remember_page_book, save_page_cache
 from book_crawler import Book
 
@@ -18,12 +19,6 @@ WORKING_PATH = LISTS_DIR / "working.json"
 STASH_PATH = LISTS_DIR / "stash.json"
 INDEX_PATH = LISTS_DIR / "index.json"
 NAMED_DIR = LISTS_DIR / "named"
-DEFAULT_SEARCH_URLS = (
-    "https://www.booknet.co.il/ספרים-חדשים",
-    "https://www.e-vrit.co.il/group/3/ספרים-חדשים",
-    "https://www.nli.org.il/he/search?materialType=books",
-)
-PLACEHOLDER_URL_MARKERS = ("example.com", "example.org", "a.example")
 
 
 def now_stamp() -> str:
@@ -98,7 +93,7 @@ def empty_payload(
         "locked": False,
         "archived": False,
         "year": year,
-        "urls": merge_search_urls(list(urls or [])),
+        "urls": merge_search_urls(list(urls or all_search_urls() or DEFAULT_SEARCH_URLS)),
         "max_pages": max_pages,
         "include_unknown": include_unknown,
         "books": [],
@@ -141,7 +136,7 @@ def build_payload(
         "locked": bool(locked),
         "archived": bool(archived),
         "year": year,
-        "urls": merge_search_urls(list(urls or [])),
+        "urls": merge_search_urls(list(urls or []), fallback=False),
         "max_pages": pages,
         "include_unknown": bool(include_unknown),
         "books": [asdict(book) for book in books],
@@ -254,7 +249,7 @@ def save_working(payload: dict[str, Any]) -> Path:
     existing = _read_json(WORKING_PATH)
     if existing and _book_count(existing) > _book_count(payload) and _urls_are_placeholders(raw_urls):
         return WORKING_PATH
-    payload["urls"] = merge_search_urls(raw_urls)
+    payload["urls"] = merge_search_urls(raw_urls, fallback=False)
     payload["updated_at"] = now_stamp()
     if not payload.get("created_at"):
         payload["created_at"] = payload["updated_at"]
@@ -271,9 +266,9 @@ def _book_count(data: dict[str, Any] | None) -> int:
     return len(data.get("books") or [])
 
 
-def merge_search_urls(urls: list[str] | None) -> list[str]:
+def merge_search_urls(urls: list[str] | None, *, fallback: bool = True) -> list[str]:
     merged: list[str] = []
-    for raw in list(urls or []) + list(DEFAULT_SEARCH_URLS):
+    for raw in list(urls or []):
         value = str(raw or "").strip()
         if not value:
             continue
@@ -281,7 +276,9 @@ def merge_search_urls(urls: list[str] | None) -> list[str]:
             continue
         if value not in merged:
             merged.append(value)
-    return merged or list(DEFAULT_SEARCH_URLS)
+    if merged or not fallback:
+        return merged
+    return list(all_search_urls() or DEFAULT_SEARCH_URLS)
 
 
 def _urls_are_placeholders(urls: list[str] | None) -> bool:
@@ -383,7 +380,7 @@ def load_working() -> dict[str, Any] | None:
         restore_stash_if_placeholder(migrated)
         return migrated
     if data:
-        data["urls"] = merge_search_urls(list(data.get("urls") or []))
+        data["urls"] = merge_search_urls(list(data.get("urls") or []), fallback=False)
         restore_stash_if_placeholder(data)
         return data
     return None
@@ -406,7 +403,7 @@ def stash_has_data() -> bool:
 
 def save_stash(payload: dict[str, Any]) -> Path:
     payload = dict(payload)
-    payload["urls"] = merge_search_urls(list(payload.get("urls") or []))
+    payload["urls"] = merge_search_urls(list(payload.get("urls") or []), fallback=False)
     payload["updated_at"] = now_stamp()
     return _write_json(STASH_PATH, payload)
 
