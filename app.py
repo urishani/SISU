@@ -326,8 +326,11 @@ class BookCatalogApp(tk.Tk):
         )
         version_text = read_app_version().label()
         if version_text:
-            ttk.Label(header, text=f"({version_text})", style="Sub.TLabel").pack(
-                side="left", padx=(10, 12), pady=10
+            version_label = ttk.Label(header, text=version_text, style="Sub.TLabel")
+            version_label.pack(side="left", padx=(10, 12), pady=10)
+            self._callout(
+                version_label,
+                "This copy’s version number and the date and time it was last committed.",
             )
         ttk.Label(
             header,

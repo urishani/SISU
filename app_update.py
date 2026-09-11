@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
+VERSION_PATH = APP_DIR / "version.json"
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _DATA_ROOTS = ("cache/", "lists/")
 _DATA_FILES = {"field_aliases.json", "config.json"}
@@ -33,11 +36,11 @@ class AppVersion:
 
     def label(self) -> str:
         if self.number and self.date:
-            return f"version {self.number}, {self.date}"
+            return f"v{self.number} · {self.date}"
         if self.number:
-            return f"version {self.number}"
+            return f"v{self.number}"
         if self.date:
-            return f"version {self.date}"
+            return self.date
         return ""
 
 
@@ -81,13 +84,38 @@ def is_git_copy() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def read_app_version() -> AppVersion:
-    """Version is the Git commit count on this copy, with the date of HEAD."""
+def _short_stamp(raw: str) -> str:
+    text = (raw or "").strip()
+    if len(text) >= 16 and text[4] == "-" and text[10] == " ":
+        return text[:16]
+    return text
+
+
+def _read_version_file() -> AppVersion | None:
+    if not VERSION_PATH.exists():
+        return None
+    try:
+        raw = json.loads(VERSION_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        number = int(raw.get("number") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    date = _short_stamp(str(raw.get("changed_at") or raw.get("date") or ""))
+    if number <= 0 and not date:
+        return None
+    return AppVersion(number=max(0, number), date=date)
+
+
+def _read_version_from_git() -> AppVersion:
     if not is_git_copy():
         return AppVersion(number=0, date="")
     try:
         count = _git("rev-list", "--count", "HEAD", timeout=8)
-        stamped = _git("log", "-1", "--format=%cs", timeout=8)
+        stamped = _git("log", "-1", "--format=%ci", timeout=8)
         commit = _git("rev-parse", "--short", "HEAD", timeout=8)
     except (OSError, subprocess.TimeoutExpired):
         return AppVersion(number=0, date="")
@@ -97,12 +125,30 @@ def read_app_version() -> AppVersion:
             number = int((count.stdout or "").strip())
         except ValueError:
             number = 0
-    date = stamped.stdout.strip() if stamped.returncode == 0 else ""
+    date = _short_stamp(stamped.stdout) if stamped.returncode == 0 else ""
     return AppVersion(
         number=number,
         date=date,
         commit=commit.stdout.strip() if commit.returncode == 0 else "",
     )
+
+
+def read_app_version() -> AppVersion:
+    """Prefer version.json (number + change date/time); fall back to Git history."""
+    filed = _read_version_file()
+    if filed is not None:
+        return filed
+    return _read_version_from_git()
+
+
+def bump_app_version() -> AppVersion:
+    """Add one to the displayed version and stamp the local date and time."""
+    current = read_app_version()
+    number = max(0, int(current.number or 0)) + 1
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    payload = {"number": number, "changed_at": stamp}
+    VERSION_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return AppVersion(number=number, date=stamp)
 
 
 def _normalize_git_path(path: str) -> str:
