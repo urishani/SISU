@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -56,6 +57,7 @@ from book_crawler import (
     merge_later_into,
     site_display_name,
     site_host,
+    SourceStats,
 )
 from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
@@ -2599,7 +2601,7 @@ class BookCatalogApp(tk.Tk):
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Each Search is a separate log. Progress lines such as listing book 48 are rewritten in place so the file stays small. The current search is saved every few seconds while it runs.",
+            text="Each Search is a separate log. The Performance block at the top shows time and counts per catalog: books, new, duplicates, and field updates. Publisher lookups from More are logged the same way. Progress lines such as listing book 48 are rewritten in place.",
             wraplength=940,
         ).pack(anchor="w", pady=(0, 8))
         split = ttk.Panedwindow(body, orient="horizontal")
@@ -2893,6 +2895,7 @@ class BookCatalogApp(tk.Tk):
                 "The working list is kept until you save or clear it."
             )
         outcome = "stopped" if cancelled else "failed" if list_failed else "done"
+        self._activity.set_performance(self._performance_payload(report))
         self._activity.finish(outcome, self.status.get())
         self.summary.set(report.summary())
         if dup_note:
@@ -2922,6 +2925,24 @@ class BookCatalogApp(tk.Tk):
                 + "."
             )
         return " ".join(parts)
+
+    @staticmethod
+    def _performance_payload(report: CrawlReport | None) -> dict:
+        if report is None:
+            return {}
+        sources = []
+        for item in report.source_stats or []:
+            if isinstance(item, dict):
+                sources.append(item)
+            else:
+                sources.append(asdict(item))
+        return {
+            "elapsed_seconds": float(report.elapsed_seconds or 0),
+            "elapsed_listing": float(report.elapsed_listing or 0),
+            "elapsed_cache": float(report.elapsed_cache or 0),
+            "elapsed_publisher": float(report.elapsed_publisher or 0),
+            "sources": sources,
+        }
 
     def _scan_duplicate_report(self, report: CrawlReport) -> str:
         lines = [
@@ -3339,6 +3360,13 @@ class BookCatalogApp(tk.Tk):
         remap: dict[str, str] = {}
         updated = 0
         errors = 0
+        started = time.monotonic()
+        stats = SourceStats(
+            name=publisher,
+            url=resolve_publisher_site(publisher) or "",
+            kind="publisher",
+        )
+        crawler._current_source = stats
         try:
             for index, book in enumerate(books, start=1):
                 self._ui_queue.put(
@@ -3358,6 +3386,11 @@ class BookCatalogApp(tk.Tk):
                 write_field_report(self.excel_path.get().strip() or None)
             except Exception:
                 pass
+            stats.seconds = time.monotonic() - started
+            crawler.report.source_stats.append(stats)
+            crawler.report.elapsed_publisher = stats.seconds
+            crawler.report.elapsed_seconds = stats.seconds
+            crawler.progress(stats.line())
             self._ui_queue.put(
                 (
                     "more_done",
@@ -3369,10 +3402,15 @@ class BookCatalogApp(tk.Tk):
                         "remap": remap,
                         "selected": selected,
                         "publisher": publisher,
+                        "performance": self._performance_payload(crawler.report),
                     },
                 )
             )
         except CrawlCancelled:
+            stats.seconds = time.monotonic() - started
+            crawler.report.source_stats.append(stats)
+            crawler.report.elapsed_publisher = stats.seconds
+            crawler.report.elapsed_seconds = stats.seconds
             save_working(self._current_payload())
             self._ui_queue.put(
                 (
@@ -3384,11 +3422,14 @@ class BookCatalogApp(tk.Tk):
                         "remap": remap,
                         "selected": selected,
                         "publisher": publisher,
+                        "performance": self._performance_payload(crawler.report),
                     },
                 )
             )
         except Exception as exc:
             self._ui_queue.put(("more_error", str(exc)))
+        finally:
+            crawler._current_source = None
 
     def open_field_report(self) -> None:
         try:
@@ -3518,6 +3559,8 @@ class BookCatalogApp(tk.Tk):
             self._end_work("done")
         self._set_status(summary)
         outcome = "failed" if payload is None or failed else "stopped" if (payload or {}).get("cancelled") else "done"
+        if isinstance(payload, dict) and payload.get("performance"):
+            self._activity.set_performance(payload.get("performance") or {})
         self._activity.finish(outcome, summary)
         self._complete_lookup_popup(summary, failed=failed)
         if selected:

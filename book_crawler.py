@@ -1256,6 +1256,53 @@ class CrawlCancelled(Exception):
     pass
 
 
+def format_duration(seconds: float) -> str:
+    secs = max(0.0, float(seconds or 0))
+    if secs < 60:
+        return f"{secs:.1f}s"
+    minutes, rem = divmod(secs, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {rem:.0f}s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}h {minutes}m"
+
+
+@dataclass
+class SourceStats:
+    """Per catalog or publisher source: counts and wall time for one Search or More run."""
+
+    name: str = ""
+    url: str = ""
+    kind: str = "catalog"
+    seconds: float = 0.0
+    listed: int = 0
+    added: int = 0
+    duplicates: int = 0
+    updated: int = 0
+    publisher_checked: int = 0
+    publisher_updated: int = 0
+    listing_pages: int = 0
+    error: str = ""
+
+    def line(self) -> str:
+        bits = [self.name or self.url or self.kind, format_duration(self.seconds)]
+        if self.kind == "publisher":
+            bits.append(f"{self.publisher_checked:,} investigated")
+            bits.append(f"{self.publisher_updated:,} updated")
+        elif self.kind == "cache":
+            bits.append(f"{self.updated:,} book(s) gained fields from cached pages")
+        else:
+            bits.append(f"{self.listed:,} books")
+            bits.append(f"{self.added:,} new")
+            bits.append(f"{self.duplicates:,} duplicates")
+            bits.append(f"{self.updated:,} updated")
+        if self.listing_pages:
+            bits.append(f"{self.listing_pages:,} listing page(s)")
+        if self.error:
+            bits.append(self.error.split(".")[0].strip())
+        return " · ".join(bits)
+
+
 @dataclass
 class CrawlReport:
     listing_pages: int = 0
@@ -1278,6 +1325,11 @@ class CrawlReport:
     error: str = ""
     error_books: int = 0
     site_notes: list[str] = field(default_factory=list)
+    source_stats: list[SourceStats] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+    elapsed_listing: float = 0.0
+    elapsed_cache: float = 0.0
+    elapsed_publisher: float = 0.0
 
     def summary(self) -> str:
         if self.error and not self.matched:
@@ -1285,6 +1337,8 @@ class CrawlReport:
         if self.from_cache:
             return f"From cache: {self.matched} book(s) loaded. No pages fetched."
         parts = [f"{self.matched:,} book(s) on the list"]
+        if self.elapsed_seconds:
+            parts.append(f"{format_duration(self.elapsed_seconds)} total")
         if self.new_names:
             parts.append(f"{self.new_names:,} new this search")
         if self.product_links:
@@ -1319,6 +1373,24 @@ class CrawlReport:
         if self.site_notes:
             parts.append(" · ".join(self.site_notes))
         return "Search summary — " + ". ".join(parts) + "."
+
+    def performance_text(self) -> str:
+        lines = ["Performance by source"]
+        if self.elapsed_seconds:
+            lines.append(f"Total {format_duration(self.elapsed_seconds)}")
+        if self.elapsed_listing:
+            lines.append(f"Catalog listing {format_duration(self.elapsed_listing)}")
+        if self.elapsed_cache:
+            lines.append(f"Cached-page fill {format_duration(self.elapsed_cache)}")
+        if self.elapsed_publisher:
+            lines.append(f"Publisher lookup {format_duration(self.elapsed_publisher)}")
+        if self.source_stats:
+            lines.append("")
+            for stats in self.source_stats:
+                lines.append(stats.line())
+        else:
+            lines.append("No per-source timings were recorded.")
+        return "\n".join(lines)
 
 
 def has_hebrew(text: str | None) -> bool:
@@ -3532,6 +3604,7 @@ class BookCrawler:
         self.last_site_error = ""
         self._duplicate_ids: set[int] = set()
         self._duplicate_updated_ids: set[int] = set()
+        self._current_source: SourceStats | None = None
         self.session = requests.Session()
         retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
@@ -3559,6 +3632,15 @@ class BookCrawler:
 
     def _take_book(self, books: list[Book], book: Book, site: str, url: str) -> None:
         canonical, is_new, filled = absorb_book(books, book)
+        stats = self._current_source
+        if stats is not None:
+            stats.listed += 1
+            if is_new:
+                stats.added += 1
+            else:
+                stats.duplicates += 1
+                if filled:
+                    stats.updated += 1
         if not is_new:
             self._duplicate_ids.add(id(canonical))
             if filled:
@@ -4330,6 +4412,9 @@ class BookCrawler:
             host = urlparse(publisher_url).netloc
             book.mark_publisher_lookup(publisher_url, note=f"Looking on {host}…")
             self.progress(f"Looking on the publisher site {host} for “{book.display_title()}”…")
+            stats = self._current_source
+            if stats is not None and stats.kind == "publisher":
+                stats.publisher_checked += 1
             try:
                 match = self.find_matching_product(publisher_url, book, try_slugs=True)
             except CrawlCancelled:
@@ -4358,6 +4443,9 @@ class BookCrawler:
                 for item in findings:
                     mapped = item.get("field") or "not mapped"
                     self.progress(f"  {item['label']}: {item['value']}  [{mapped}]")
+            stats = self._current_source
+            if stats is not None and stats.kind == "publisher" and added:
+                stats.publisher_updated += 1
             if added:
                 note = f"New from {host}: {', '.join(added)}"
                 self.progress(note)
@@ -4465,39 +4553,54 @@ class BookCrawler:
         ]
         filled = 0
         total = len(pending)
-        for index, book in enumerate(pending, start=1):
-            self._check_cancel()
-            publisher_url = resolve_publisher_site(book.publisher) or ""
-            host = urlparse(publisher_url).netloc
-            site_name = site_display_name(publisher_url) if publisher_url else host
-            self.progress(
-                f"Filling publisher details {index} of {total} on {host}: {book.display_title()}"
-            )
-            self._emit("site", {"url": publisher_url, "name": site_name or host, "index": index, "total": total})
-            self._emit(
-                "fill",
-                {
-                    "book": book,
-                    "index": index,
-                    "total": total,
-                    "found": len(books),
-                    "site": site_name or host,
-                    "url": publisher_url,
-                },
-            )
-            added = self.enrich_one_book(book)
-            self._emit(
-                "book",
-                {
-                    "book": book,
-                    "new": False,
-                    "found": len(books),
-                    "site": site_name or host,
-                    "url": publisher_url,
-                },
-            )
-            if added:
-                filled += 1
+        started = time.perf_counter()
+        pub_stats = SourceStats(name="Publisher sites", kind="publisher")
+        previous = self._current_source
+        self._current_source = pub_stats
+        try:
+            for index, book in enumerate(pending, start=1):
+                self._check_cancel()
+                publisher_url = resolve_publisher_site(book.publisher) or ""
+                host = urlparse(publisher_url).netloc
+                site_name = site_display_name(publisher_url) if publisher_url else host
+                if host and pub_stats.name == "Publisher sites":
+                    pub_stats.name = site_name or host
+                    pub_stats.url = publisher_url
+                self.progress(
+                    f"Filling publisher details {index} of {total} on {host}: {book.display_title()}"
+                )
+                self._emit("site", {"url": publisher_url, "name": site_name or host, "index": index, "total": total})
+                self._emit(
+                    "fill",
+                    {
+                        "book": book,
+                        "index": index,
+                        "total": total,
+                        "found": len(books),
+                        "site": site_name or host,
+                        "url": publisher_url,
+                    },
+                )
+                added = self.enrich_one_book(book)
+                self._emit(
+                    "book",
+                    {
+                        "book": book,
+                        "new": False,
+                        "found": len(books),
+                        "site": site_name or host,
+                        "url": publisher_url,
+                    },
+                )
+                if added:
+                    filled += 1
+        finally:
+            pub_stats.seconds = time.perf_counter() - started
+            self.report.elapsed_publisher += pub_stats.seconds
+            if pending:
+                self.report.source_stats.append(pub_stats)
+                self.progress(pub_stats.line())
+            self._current_source = previous
         return filled
 
     def _finish_duplicate_stats(self, books: list[Book], started_with: int, notes: list[str]) -> None:
@@ -4535,6 +4638,8 @@ class BookCrawler:
         max_products = 50_000 if requested <= 0 else max(4000, page_limit * 100)
         listed = 0
         notes: list[str] = []
+        search_started = time.perf_counter()
+        listing_started = search_started
         try:
             for index, url in enumerate(listing_urls, start=1):
                 self._check_cancel()
@@ -4543,6 +4648,10 @@ class BookCrawler:
                 self._emit("site", {"url": url, "name": host, "index": index, "total": len(listing_urls)})
                 self.last_site_error = ""
                 before = len(books)
+                pages_before = self.report.listing_pages
+                stats = SourceStats(name=host, url=url, kind="catalog")
+                self._current_source = stats
+                site_started = time.perf_counter()
                 found = self.crawl(
                     start_url=url,
                     year=year,
@@ -4552,6 +4661,12 @@ class BookCrawler:
                     start_error=False,
                     on_book=lambda book, site=host, site_url=url: self._take_book(books, book, site, site_url),
                 )
+                stats.seconds = time.perf_counter() - site_started
+                stats.listing_pages = max(0, self.report.listing_pages - pages_before)
+                if self.last_site_error:
+                    stats.error = self.last_site_error
+                self._current_source = None
+                self.report.source_stats.append(stats)
                 added = len(books) - before
                 titled = len([book for book in found if book.title])
                 listed += 1 if titled else 0
@@ -4559,11 +4674,16 @@ class BookCrawler:
                     short = self.last_site_error.split(".")[0]
                     notes.append(f"{host}: could not open ({short})")
                 else:
-                    notes.append(f"{host}: {titled} listed, {added} new")
+                    notes.append(
+                        f"{host}: {stats.listed} listed, {stats.added} new, "
+                        f"{stats.duplicates} duplicates, {stats.updated} updated, {format_duration(stats.seconds)}"
+                    )
+                self.progress(stats.line())
                 self.progress(
                     f"{host}: {titled} book(s) this year. "
                     f"{added} new name(s). Combined list: {len(books)}."
                 )
+            self.report.elapsed_listing = time.perf_counter() - listing_started
             self.report.site_notes = notes
             self.report.error = ""
             self.report.matched = len(books)
@@ -4579,7 +4699,14 @@ class BookCrawler:
                 + ". Filling extra details from pages already in the cache. "
                 "Publisher websites are skipped during Search (use More on a book)."
             )
-            self.enrich_books(books, listing_urls, max_searches=0)
+            cache_started = time.perf_counter()
+            cache_stats = SourceStats(name="Cached catalog pages", kind="cache")
+            cache_stats.updated = self.enrich_books(books, listing_urls, max_searches=0)
+            cache_stats.seconds = time.perf_counter() - cache_started
+            self.report.elapsed_cache = cache_stats.seconds
+            if cache_stats.seconds or cache_stats.updated:
+                self.report.source_stats.append(cache_stats)
+                self.progress(cache_stats.line())
             self._finish_duplicate_stats(books, started_with, notes)
             return books
         except CrawlCancelled:
@@ -4588,6 +4715,10 @@ class BookCrawler:
             self._finish_duplicate_stats(books, started_with, notes)
             raise
         finally:
+            self._current_source = None
+            self.report.elapsed_seconds = time.perf_counter() - search_started
+            for line in self.report.performance_text().splitlines():
+                self.progress(line)
             try:
                 from book_cache import flush_page_cache
 

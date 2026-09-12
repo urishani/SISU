@@ -35,6 +35,17 @@ def _stamp_label(value: str) -> str:
     return text[:19]
 
 
+def _format_duration(seconds: float) -> str:
+    secs = max(0.0, float(seconds or 0))
+    if secs < 60:
+        return f"{secs:.1f}s"
+    minutes, rem = divmod(secs, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {rem:.0f}s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}h {minutes}m"
+
+
 def slot_for(text: str) -> str | None:
     for name, pattern in _SLOT_PATTERNS:
         if pattern.search(text or ""):
@@ -62,6 +73,7 @@ class ActivityLog:
             "status": "running",
             "lines": [],
             "slots": {},
+            "performance": {},
         }
         with self._lock:
             if self.current and self.current.get("status") == "running":
@@ -96,6 +108,15 @@ class ActivityLog:
                 lines.append(entry)
             self._dirty = True
         self.save()
+
+    def set_performance(self, data: dict[str, Any] | None) -> None:
+        with self._lock:
+            run = self.current
+            if run is None:
+                return
+            run["performance"] = dict(data or {})
+            self._dirty = True
+        self.save(force=True)
 
     def finish(self, status: str, summary: str = "") -> None:
         if summary:
@@ -183,6 +204,7 @@ class ActivityLog:
         ]
         if run.get("detail"):
             header.append(str(run["detail"]))
+        header.extend(self._render_performance(run.get("performance") or {}))
         header.append("")
         body = []
         for item in run.get("lines") or []:
@@ -194,6 +216,58 @@ class ActivityLog:
                 body.append(f"{ts}  {text}")
         return "\n".join(header + body)
 
+    def _render_performance(self, data: object) -> list[str]:
+        if not isinstance(data, dict) or not data:
+            return []
+        lines = ["", "Performance"]
+        elapsed = data.get("elapsed_seconds")
+        try:
+            total = float(elapsed or 0)
+        except (TypeError, ValueError):
+            total = 0.0
+        if total:
+            lines.append(f"Total  {_format_duration(total)}")
+        for key, label in (
+            ("elapsed_listing", "Catalog listing"),
+            ("elapsed_cache", "Cached-page fill"),
+            ("elapsed_publisher", "Publisher lookup"),
+        ):
+            try:
+                value = float(data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value:
+                lines.append(f"{label}  {_format_duration(value)}")
+        sources = data.get("sources") or []
+        if isinstance(sources, list):
+            for item in sources:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or item.get("url") or item.get("kind") or "source")
+                try:
+                    seconds = float(item.get("seconds") or 0)
+                except (TypeError, ValueError):
+                    seconds = 0.0
+                kind = str(item.get("kind") or "catalog")
+                if kind == "publisher":
+                    detail = (
+                        f"{int(item.get('publisher_checked') or 0):,} investigated · "
+                        f"{int(item.get('publisher_updated') or 0):,} updated"
+                    )
+                elif kind == "cache":
+                    detail = f"{int(item.get('updated') or 0):,} book(s) gained fields from cached pages"
+                else:
+                    detail = (
+                        f"{int(item.get('listed') or 0):,} books · "
+                        f"{int(item.get('added') or 0):,} new · "
+                        f"{int(item.get('duplicates') or 0):,} duplicates · "
+                        f"{int(item.get('updated') or 0):,} updated"
+                    )
+                lines.append(f"{name}  {_format_duration(seconds)}  ·  {detail}")
+        if len(lines) == 2 and not total:
+            return []
+        return lines
+
     def _write_run(self, run: dict[str, Any]) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         path = LOG_DIR / f"scan_{run['id']}.json"
@@ -204,6 +278,7 @@ class ActivityLog:
             "title": run.get("title") or "Search",
             "detail": run.get("detail") or "",
             "status": run.get("status") or "",
+            "performance": run.get("performance") or {},
             "lines": run.get("lines") or [],
         }
         try:
