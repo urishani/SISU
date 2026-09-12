@@ -287,7 +287,10 @@ class BookCatalogApp(tk.Tk):
         self._site_list_inner: ttk.Frame | None = None
         self._site_list_canvas: tk.Canvas | None = None
         self._site_list_window_id: int | None = None
+        self._site_list_header: tk.Frame | None = None
+        self._site_all_mark: tk.Label | None = None
         self._site_list_updating = False
+        self._site_list_enabled = True
 
         self._setup_style()
         self._build()
@@ -467,10 +470,36 @@ class BookCatalogApp(tk.Tk):
         url_wrap = ttk.Frame(form)
         url_wrap.grid(row=1, column=1, sticky="nw", pady=(2, 0))
         url_wrap.columnconfigure(0, weight=0)
-        url_wrap.rowconfigure(0, weight=1)
+        url_wrap.rowconfigure(1, weight=1)
+        site_header = tk.Frame(url_wrap, bg="#EDE6DA", highlightbackground="#C9BBA8", highlightthickness=1)
+        site_header.grid(row=0, column=0, sticky="ew")
+        site_all_mark = tk.Label(
+            site_header,
+            text="☐",
+            bg="#EDE6DA",
+            fg=NAVY,
+            font=("Segoe UI", 12),
+            cursor="hand2",
+            padx=6,
+            pady=2,
+        )
+        site_all_mark.pack(side="left")
+        site_header_label = tk.Label(
+            site_header,
+            text="Site URL",
+            bg="#EDE6DA",
+            fg=NAVY,
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        )
+        site_header_label.pack(side="left", fill="x", expand=True, padx=(2, 8), pady=4)
+        site_all_mark.bind("<Button-1>", lambda _e: self._toggle_all_sites())
+        site_all_mark.bind("<MouseWheel>", self._on_site_list_wheel)
+        self._callout(site_all_mark, "Select every catalog site, or clear all, like the ☑ in the book list.")
+        self._callout(site_header_label, "Catalog sites Search can read. Click a URL to open it in the browser.")
         site_canvas = tk.Canvas(
             url_wrap,
-            height=78,
+            height=120,
             width=420,
             bg=WHITE,
             highlightbackground="#C9BBA8",
@@ -480,12 +509,14 @@ class BookCatalogApp(tk.Tk):
         site_inner = ttk.Frame(site_canvas, style="Card.TFrame")
         site_window = site_canvas.create_window((0, 0), window=site_inner, anchor="nw")
         site_canvas.configure(yscrollcommand=site_scroll.set)
-        site_canvas.grid(row=0, column=0, sticky="nw")
-        site_scroll.grid(row=0, column=1, sticky="ns")
+        site_canvas.grid(row=1, column=0, sticky="nw")
+        site_scroll.grid(row=1, column=1, sticky="ns")
         self._site_list_canvas = site_canvas
         self._site_list_inner = site_inner
         self._site_list_window_id = site_window
         self._site_list_wrap = url_wrap
+        self._site_list_header = site_header
+        self._site_all_mark = site_all_mark
 
         def _sync_site_list(_event=None) -> None:
             canvas = self._site_list_canvas
@@ -500,17 +531,14 @@ class BookCatalogApp(tk.Tk):
             if bbox:
                 canvas.configure(scrollregion=bbox)
 
-        def _site_list_wheel(event: tk.Event) -> str:
-            site_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-
         site_inner.bind("<Configure>", _sync_site_list)
         site_canvas.bind("<Configure>", _sync_site_list)
-        site_canvas.bind("<MouseWheel>", _site_list_wheel)
-        site_inner.bind("<MouseWheel>", _site_list_wheel)
+        site_canvas.bind("<MouseWheel>", self._on_site_list_wheel)
+        site_inner.bind("<MouseWheel>", self._on_site_list_wheel)
+        site_header.bind("<MouseWheel>", self._on_site_list_wheel)
         self._callout(
             site_canvas,
-            "Check the sites Search should read. Uncheck sites to skip them. Edit the list and its order in Settings.",
+            "Check the sites Search should read. Click a URL to open it in the browser. Uncheck sites to skip them. Edit the list and its order in Settings.",
         )
         self._rebuild_site_url_list()
         self.excel_path.trace_add("write", lambda *_args: self._fit_search_fields())
@@ -624,8 +652,7 @@ class BookCatalogApp(tk.Tk):
         select_all_btn.pack(side="right", padx=(8, 0))
         self._callout(select_all_btn, "Tick every book currently shown in the table (after filters).")
         self.table.pack(fill="both", expand=True)
-        self._callout(self.table, "The book table. Click a title to open it on the right.")
-        self._callout(self.table.tree, "Click a book row to see its fields. Click ☑ to select it. Click the header ☑ to select all or clear. Click the publisher to look it up.")
+        self._callout(self.table, "The book table. Click a title to open it on the right. Hover a clipped field to see the full value.")
         self._callout(self.table.top_btn, "Jump to the first book in the list. Ctrl+Home does the same.")
         self._callout(self.table.bottom_btn, "Jump to the last book in the list. Ctrl+End does the same.")
         self._callout(
@@ -828,14 +855,22 @@ class BookCatalogApp(tk.Tk):
         excel_box = getattr(self, "excel_entry", None)
         canvas = getattr(self, "_site_list_canvas", None)
         if canvas is not None:
-            url_font = tkfont.Font(font=("Segoe UI", 10))
+            url_font = tkfont.Font(font=("Segoe UI", 10, "underline"))
             texts = [str(row.get("url") or "") for row in self._site_rows if row.get("url")]
             if not texts:
                 texts = ["https://www.booknet.co.il/"]
-            width_px = max(url_font.measure(text) for text in texts) + 56
-            width_px = max(320, min(560, width_px))
-            rows = max(1, min(4, len(self._site_rows) or 1))
-            height_px = rows * 26 + 6
+            width_px = max(url_font.measure(text) for text in texts) + 72
+            width_px = max(360, min(640, width_px))
+            visible = max(1, min(4, len(self._site_rows) or 1))
+            row_h = 28
+            if self._site_rows:
+                try:
+                    measured = int(self._site_rows[0]["frame"].winfo_reqheight() or 0)
+                    if measured > 8:
+                        row_h = measured
+                except (tk.TclError, KeyError, TypeError):
+                    pass
+            height_px = visible * row_h + 8
             current_w = int(canvas.cget("width") or 0)
             current_h = int(canvas.cget("height") or 0)
             if current_w != width_px or current_h != height_px:
@@ -853,6 +888,90 @@ class BookCatalogApp(tk.Tk):
         excel_cols = self._cols_for_texts(excel_font, [path], 36, 64)
         if int(str(excel_box.cget("width") or 0)) != excel_cols:
             excel_box.configure(width=excel_cols)
+
+    def _on_site_list_wheel(self, event: tk.Event) -> str:
+        canvas = self._site_list_canvas
+        if canvas is not None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    @staticmethod
+    def _site_mark(on: bool) -> str:
+        return "☑" if on else "☐"
+
+    def _bind_site_list_wheel(self, widget: tk.Misc) -> None:
+        widget.bind("<MouseWheel>", self._on_site_list_wheel)
+
+    def _style_site_row(self, row: dict, active: bool = False) -> None:
+        bg = "#FDE6C4" if active else WHITE
+        enabled = bool(getattr(self, "_site_list_enabled", True))
+        mark_fg = NAVY if enabled else "#9A9A9A"
+        mark_cursor = "hand2" if enabled else "arrow"
+        try:
+            row["frame"].configure(bg=bg)
+            row["check"].configure(bg=bg, fg=mark_fg, cursor=mark_cursor)
+            row["label"].configure(bg=bg, fg="#0B57D0", cursor="hand2")
+        except (tk.TclError, KeyError):
+            pass
+
+    def _sync_site_all_mark(self) -> None:
+        mark = getattr(self, "_site_all_mark", None)
+        if mark is None:
+            return
+        rows = self._site_rows
+        all_on = bool(rows) and all(bool(row["var"].get()) for row in rows if row.get("var"))
+        enabled = bool(getattr(self, "_site_list_enabled", True))
+        try:
+            mark.configure(
+                text=self._site_mark(all_on),
+                fg=NAVY if enabled else "#9A9A9A",
+                cursor="hand2" if enabled else "arrow",
+            )
+        except tk.TclError:
+            pass
+
+    def _toggle_site_checked(self, row: dict) -> None:
+        if not getattr(self, "_site_list_enabled", True):
+            return
+        var = row.get("var")
+        check = row.get("check")
+        if var is None or check is None:
+            return
+        var.set(not bool(var.get()))
+        try:
+            check.configure(text=self._site_mark(bool(var.get())))
+        except tk.TclError:
+            pass
+        self._sync_site_all_mark()
+        self._on_site_check_change()
+
+    def _toggle_all_sites(self) -> None:
+        if not getattr(self, "_site_list_enabled", True) or not self._site_rows:
+            return
+        all_on = all(bool(row["var"].get()) for row in self._site_rows if row.get("var"))
+        new_value = not all_on
+        self._site_list_updating = True
+        try:
+            for row in self._site_rows:
+                var = row.get("var")
+                if var is None:
+                    continue
+                var.set(new_value)
+                try:
+                    row["check"].configure(text=self._site_mark(new_value))
+                except (tk.TclError, KeyError):
+                    pass
+        finally:
+            self._site_list_updating = False
+        self._sync_site_all_mark()
+        self._on_site_check_change()
+
+    def _open_catalog_site(self, url: str) -> None:
+        site = self._canonical_search_url(url)
+        if not site:
+            site = (url or "").strip()
+        if site:
+            self._open_in_browser(site)
 
     @staticmethod
     def _cols_for_texts(face: tkfont.Font, texts: list[str], min_cols: int, max_cols: int) -> int:
@@ -904,8 +1023,6 @@ class BookCatalogApp(tk.Tk):
             child.destroy()
         self._site_rows = []
         catalog = search_sites() or [{"url": url, "enabled": True} for url in DEFAULT_SEARCH_URLS]
-        locked = bool(getattr(self, "_list_locked", False) or getattr(self, "_busy", False))
-        check_state = "disabled" if locked else "normal"
         for item in catalog:
             url = self._canonical_search_url(str(item.get("url") or ""))
             if not url:
@@ -915,44 +1032,37 @@ class BookCatalogApp(tk.Tk):
             row = tk.Frame(inner, bg=WHITE)
             row.pack(fill="x", anchor="w")
             var = tk.BooleanVar(value=checked)
-            check = tk.Checkbutton(
+            check = tk.Label(
                 row,
-                variable=var,
+                text=self._site_mark(checked),
                 bg=WHITE,
-                activebackground=WHITE,
-                selectcolor=WHITE,
-                highlightthickness=0,
-                bd=0,
-                pady=0,
-                state=check_state,
-                command=self._on_site_check_change,
+                fg=NAVY,
+                font=("Segoe UI", 12),
+                cursor="hand2",
+                padx=6,
+                pady=2,
             )
-            check.pack(side="left", padx=(4, 2))
+            check.pack(side="left")
             label = tk.Label(
                 row,
                 text=url,
                 bg=WHITE,
-                fg=NAVY,
+                fg="#0B57D0",
                 anchor="w",
                 justify="left",
-                font=("Segoe UI", 10),
+                font=("Segoe UI", 10, "underline"),
+                cursor="hand2",
             )
-            label.pack(side="left", fill="x", expand=True, pady=1)
-
-            def _toggle_from_label(_event=None, item=var, box=check) -> None:
-                if str(box.cget("state")) == "disabled":
-                    return
-                item.set(not bool(item.get()))
-                self._on_site_check_change()
-
-            label.bind("<Button-1>", _toggle_from_label)
-            label.bind(
-                "<MouseWheel>",
-                lambda event: self._site_list_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                if self._site_list_canvas
-                else None,
-            )
-            self._site_rows.append({"url": url, "var": var, "frame": row, "check": check, "label": label})
+            label.pack(side="left", fill="x", expand=True, pady=2)
+            item_row = {"url": url, "var": var, "frame": row, "check": check, "label": label}
+            check.bind("<Button-1>", lambda _e, current=item_row: self._toggle_site_checked(current))
+            label.bind("<Button-1>", lambda _e, target=url: self._open_catalog_site(target))
+            self._bind_site_list_wheel(row)
+            self._bind_site_list_wheel(check)
+            self._bind_site_list_wheel(label)
+            self._callout(check, "Include this catalog in Search.")
+            self._callout(label, "Open this catalog in the browser.")
+            self._site_rows.append(item_row)
         if not self._site_rows:
             empty = tk.Label(
                 inner,
@@ -965,21 +1075,23 @@ class BookCatalogApp(tk.Tk):
                 wraplength=400,
             )
             empty.pack(fill="x", padx=6, pady=6)
+            self._bind_site_list_wheel(empty)
         self._site_list_updating = False
+        self._sync_site_all_mark()
         self._fit_search_fields()
+        self.after_idle(self._fit_search_fields)
         self._set_site_list_enabled(not (self._list_locked or self._busy))
 
     def _set_site_list_enabled(self, on: bool) -> None:
-        state = "normal" if on else "disabled"
+        self._site_list_enabled = bool(on)
         for row in self._site_rows:
-            try:
-                row["check"].configure(state=state)
-            except tk.TclError:
-                pass
+            self._style_site_row(row)
+        self._sync_site_all_mark()
 
     def _on_site_check_change(self) -> None:
         if self._site_list_updating:
             return
+        self._sync_site_all_mark()
         self._persist_site_enabled()
         if getattr(self, "_list_actions_ready", False):
             self._persist_working()
@@ -1156,7 +1268,7 @@ class BookCatalogApp(tk.Tk):
 
         ttk.Label(
             sites_tab,
-            text="Bookstore and library catalogs Search reads, in this order. Move a site up or down, then Save. On the main window, check the sites to include in a search.",
+            text="Bookstore and library catalogs Search reads, in this order. Open a site in the browser, or move it up or down, then Save. On the main window, check the sites to include in a search.",
             wraplength=740,
         ).pack(anchor="w")
         site_wrap = ttk.Frame(sites_tab)
@@ -1175,6 +1287,7 @@ class BookCatalogApp(tk.Tk):
             ttk.Label(site_inner, text="").grid(row=0, column=1)
             ttk.Label(site_inner, text="").grid(row=0, column=2)
             ttk.Label(site_inner, text="").grid(row=0, column=3)
+            ttk.Label(site_inner, text="").grid(row=0, column=4)
             last_entry: tk.Entry | None = None
             total = len(urls)
             for index, url in enumerate(urls):
@@ -1191,25 +1304,57 @@ class BookCatalogApp(tk.Tk):
             url_entry = tk.Entry(site_inner, textvariable=url_var, font=("Segoe UI", 10), relief="solid", bd=1)
             url_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
             _bind_entry_clipboard(url_entry)
+
+            def _open_row(_event=None, item=url_var) -> str | None:
+                target = item.get().strip()
+                if target:
+                    self._open_catalog_site(target)
+                return "break"
+
+            url_entry.bind("<Double-Button-1>", _open_row)
+            url_entry.bind("<Control-Button-1>", _open_row)
+            open_btn = tk.Button(
+                site_inner,
+                text="Open",
+                font=("Segoe UI", 9, "underline"),
+                fg="#0B57D0",
+                activeforeground="#0B57D0",
+                relief="flat",
+                cursor="hand2",
+                command=lambda item=url_var: _open_row(item=item),
+            )
+            open_btn.grid(row=grid_row, column=1, padx=(0, 4), pady=3)
+            self._callout(open_btn, "Open this catalog in the browser.")
+
+            def _sync_open(*_args: object, button=open_btn, var=url_var) -> None:
+                has_url = bool(var.get().strip())
+                button.configure(
+                    state="normal" if has_url else "disabled",
+                    fg="#0B57D0" if has_url else "#9A9A9A",
+                    cursor="hand2" if has_url else "arrow",
+                )
+
+            url_var.trace_add("write", _sync_open)
+            _sync_open()
             up_btn = ttk.Button(
                 site_inner,
                 text="Up",
                 width=4,
                 command=lambda item=pair_index: _move_site_row(item, -1),
             )
-            up_btn.grid(row=grid_row, column=1, padx=(0, 4), pady=3)
+            up_btn.grid(row=grid_row, column=2, padx=(0, 4), pady=3)
             down_btn = ttk.Button(
                 site_inner,
                 text="Down",
                 width=5,
                 command=lambda item=pair_index: _move_site_row(item, 1),
             )
-            down_btn.grid(row=grid_row, column=2, padx=(0, 4), pady=3)
+            down_btn.grid(row=grid_row, column=3, padx=(0, 4), pady=3)
             ttk.Button(
                 site_inner,
                 text="Remove",
                 command=lambda item=url_var: _remove_site_row(item),
-            ).grid(row=grid_row, column=3, pady=3)
+            ).grid(row=grid_row, column=4, pady=3)
             if pair_index == 0:
                 up_btn.configure(state="disabled")
             if pair_index >= count - 1:
@@ -4359,16 +4504,9 @@ class BookCatalogApp(tk.Tk):
             active = bool(url) and (
                 self._search_site_key(row_url) == target or (host and site_host(row_url) == host)
             )
-            bg = "#FDE6C4" if active else WHITE
-            fg = "#9A3412" if active else NAVY
-            try:
-                row["frame"].configure(bg=bg)
-                row["check"].configure(bg=bg, activebackground=bg)
-                row["label"].configure(bg=bg, fg=fg)
-            except tk.TclError:
-                continue
+            self._style_site_row(row, active=active)
             if active:
-                active_row = row["frame"]
+                active_row = row.get("frame")
         canvas = self._site_list_canvas
         if canvas is None or active_row is None:
             return

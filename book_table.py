@@ -8,11 +8,14 @@ from tkinter import ttk
 from typing import Callable
 
 from book_crawler import Book, format_entry_stamp, format_price
-from bidi_text import rtl_left_aligned
+from bidi_text import rtl_left_aligned, strip_bidi_marks
 
 ROW_PAD = 6
 MARK_WIDTH = 36
 COLLAPSED_WIDTH = 48
+TITLE_MAX_FRACTION = 1 / 3
+CELL_PAD = 18
+NAVY = "#1F3651"
 COLLAPSIBLE = ("created", "modified", "database")
 SHORT_HEADINGS = {
     "created": "CR",
@@ -102,6 +105,9 @@ class BookTable(ttk.Frame):
         self._window_job: str | None = None
         self._collapsed: set[str] = set()
         self._skip_sort = False
+        self._tip: tk.Toplevel | None = None
+        self._tip_after: str | None = None
+        self._tip_target: tuple[str, str] | None = None
         self.window_label = tk.StringVar(value="Rows 0–0 of 0")
 
         style = ttk.Style(self)
@@ -155,6 +161,8 @@ class BookTable(ttk.Frame):
         xscroll.grid(row=2, column=0, sticky="ew")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Motion>", self._on_motion)
+        self.tree.bind("<Leave>", self._on_tree_leave)
+        self.tree.bind("<MouseWheel>", self._hide_overflow_tip, add="+")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Shift-MouseWheel>", self._on_shift_wheel)
         self.tree.bind("<Control-Home>", self._on_ctrl_home)
@@ -191,17 +199,41 @@ class BookTable(ttk.Frame):
         self._apply_column_widths(event.width)
         self._schedule_window_label()
 
+    def _title_content_width(self) -> int:
+        widest = MIN_WIDTHS["title"]
+        children = self.tree.get_children()
+        if not children:
+            return widest
+        sample = children if len(children) <= 80 else (*children[:40], *children[-40:])
+        pad = CELL_PAD + 6
+        for iid in sample:
+            text = str(self.tree.set(iid, "title") or "")
+            widest = max(widest, self._row_font.measure(text) + pad)
+        return widest
+
     def _apply_column_widths(self, total_width: int) -> None:
         yscroll = 18
         inner = max(1, int(total_width) - yscroll)
+        title_cap = max(MIN_WIDTHS["title"], int(inner * TITLE_MAX_FRACTION))
         widths = {key: MIN_WIDTHS[key] for key in MIN_WIDTHS}
         for key in COLLAPSIBLE:
             if key in self._collapsed:
                 widths[key] = COLLAPSED_WIDTH
+        widths["title"] = min(max(MIN_WIDTHS["title"], self._title_content_width()), title_cap)
         needed = MARK_WIDTH + sum(widths.values())
-        extra = max(0, inner - needed)
-        if extra:
-            widths["title"] += extra
+        extra = inner - needed
+        if extra < 0:
+            cut = min(-extra, max(0, widths["title"] - MIN_WIDTHS["title"]))
+            widths["title"] -= cut
+            extra += cut
+        growable = [key for key in MIN_WIDTHS if key != "title" and key not in self._collapsed]
+        if extra > 0 and growable:
+            total_min = sum(MIN_WIDTHS[key] for key in growable) or len(growable)
+            remaining = extra
+            for index, key in enumerate(growable):
+                share = remaining if index == len(growable) - 1 else extra * MIN_WIDTHS[key] // total_min
+                remaining -= share
+                widths[key] += max(0, share)
         self.tree.column("mark", width=MARK_WIDTH, minwidth=MARK_WIDTH, stretch=False)
         for key, width in widths.items():
             minw = COLLAPSED_WIDTH if key in self._collapsed else MIN_WIDTHS[key]
@@ -213,6 +245,7 @@ class BookTable(ttk.Frame):
 
     def _on_yview(self, first: str, last: str) -> None:
         self._yscroll.set(first, last)
+        self._hide_overflow_tip()
         self._schedule_window_label()
 
     def _on_ctrl_home(self, _event=None) -> str:
@@ -524,6 +557,7 @@ class BookTable(ttk.Frame):
         return ()
 
     def _reload(self) -> None:
+        self._hide_overflow_tip()
         self.tree.delete(*self.tree.get_children())
         self._by_iid.clear()
         for book_index in self.order:
@@ -564,18 +598,117 @@ class BookTable(ttk.Frame):
             return str(keys[index])
         return None
 
+    def _cell_is_truncated(self, text: str, column: str) -> bool:
+        raw = strip_bidi_marks(text).strip()
+        if not raw or raw == "—":
+            return False
+        width = int(self.tree.column(column, "width") or 0)
+        return self._row_font.measure(text) > max(0, width - CELL_PAD)
+
+    def _full_cell_text(self, book: Book, column: str) -> str:
+        if column == "title":
+            return book.display_title()
+        try:
+            index = COLUMNS.index(column)
+        except ValueError:
+            return ""
+        return strip_bidi_marks(str(self._row_values(book)[index] or "")).strip()
+
+    def _hide_overflow_tip(self, _event=None) -> None:
+        if self._tip_after is not None:
+            try:
+                self.after_cancel(self._tip_after)
+            except tk.TclError:
+                pass
+            self._tip_after = None
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+        self._tip_target = None
+
+    def _on_tree_leave(self, event: tk.Event) -> None:
+        try:
+            x, y, width, height = 0, 0, self.tree.winfo_width(), self.tree.winfo_height()
+            if 0 <= event.x < width and 0 <= event.y < height:
+                return
+        except tk.TclError:
+            pass
+        self._hide_overflow_tip()
+
+    def _show_overflow_tip(self, x: int, y: int, text: str, target: tuple[str, str]) -> None:
+        self._tip_after = None
+        if self._tip_target != target or self._tip is not None or not text:
+            return
+        if not self.tree.winfo_ismapped():
+            return
+        tip = tk.Toplevel(self.tree)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x + 12}+{y + 18}")
+        try:
+            tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tip,
+            text=text,
+            justify="left",
+            wraplength=420,
+            background="#FFF8E8",
+            foreground=NAVY,
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+            padx=8,
+            pady=6,
+        ).pack()
+        self._tip = tip
+
+    def _consider_overflow_tip(self, event: tk.Event) -> None:
+        region = self.tree.identify("region", event.x, event.y)
+        column = self._column_at(event)
+        row = self.tree.identify_row(event.y)
+        if region != "cell" or not row or not column or column == "mark":
+            if self._tip_target is not None:
+                self._hide_overflow_tip()
+            return
+        displayed = str(self.tree.set(row, column) or "")
+        if not self._cell_is_truncated(displayed, column):
+            if self._tip_target is not None:
+                self._hide_overflow_tip()
+            return
+        target = (row, column)
+        if self._tip_target == target:
+            return
+        self._hide_overflow_tip()
+        book = self._by_iid.get(row)
+        if not book:
+            return
+        text = self._full_cell_text(book, column)
+        if not text:
+            return
+        self._tip_target = target
+        x, y = int(event.x_root), int(event.y_root)
+        self._tip_after = self.after(450, lambda: self._show_overflow_tip(x, y, text, target))
+
     def _on_motion(self, event: tk.Event) -> None:
         region = self.tree.identify("region", event.x, event.y)
         column = self._column_at(event)
         if region == "heading" and column in COLLAPSIBLE:
             self.tree.configure(cursor="hand2")
+            self._hide_overflow_tip()
             return
         if region != "cell":
             self.tree.configure(cursor="")
+            self._hide_overflow_tip()
             return
         self.tree.configure(cursor="hand2" if column == "publisher" else "")
+        self._consider_overflow_tip(event)
 
     def _on_click(self, event: tk.Event) -> str | None:
+        self._hide_overflow_tip()
         region = self.tree.identify("region", event.x, event.y)
         column = self._column_at(event)
         if region == "heading" and column in COLLAPSIBLE:
