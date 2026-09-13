@@ -1303,7 +1303,7 @@ class BookCatalogApp(tk.Tk):
             grid_row = pair_index + 1
             url_entry = tk.Entry(site_inner, textvariable=url_var, font=("Segoe UI", 10), relief="solid", bd=1)
             url_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
-            _bind_entry_clipboard(url_entry)
+            _bind_entry_clipboard(url_entry, as_url=True)
 
             def _open_row(_event=None, item=url_var) -> str | None:
                 target = item.get().strip()
@@ -1312,7 +1312,6 @@ class BookCatalogApp(tk.Tk):
                 return "break"
 
             url_entry.bind("<Double-Button-1>", _open_row)
-            url_entry.bind("<Control-Button-1>", _open_row)
             open_btn = tk.Button(
                 site_inner,
                 text="Open",
@@ -1409,7 +1408,7 @@ class BookCatalogApp(tk.Tk):
             name_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
             url_shell.grid(row=grid_row, column=1, sticky="ew", padx=(0, 6), pady=3)
             _bind_entry_clipboard(name_entry)
-            _bind_entry_clipboard(url_entry)
+            _bind_entry_clipboard(url_entry, as_url=True)
             _paint_url(url_shell, url_var)
             url_var.trace_add("write", lambda *_args: _paint_url(url_shell, url_var))
             if highlight:
@@ -5107,39 +5106,223 @@ def _fill_markdown_view(view: tk.Text, source: str) -> None:
     view.configure(state="disabled")
 
 
-def _bind_entry_clipboard(entry: tk.Entry) -> None:
-    def paste(event: tk.Event) -> str:
-        widget = event.widget
+def _os_clipboard_text() -> str:
+    if sys.platform != "win32":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    CF_UNICODETEXT = 13
+    CF_TEXT = 1
+    for _ in range(6):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.02)
+    else:
+        return ""
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if handle:
+            pointer = kernel32.GlobalLock(handle)
+            if pointer:
+                try:
+                    text = ctypes.wstring_at(pointer)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+                if text:
+                    return text
+        handle = user32.GetClipboardData(CF_TEXT)
+        if handle:
+            pointer = kernel32.GlobalLock(handle)
+            if pointer:
+                try:
+                    raw = ctypes.string_at(pointer)
+                finally:
+                    kernel32.GlobalUnlock(handle)
+                text = raw.decode("utf-8", errors="ignore") if raw else ""
+                if text:
+                    return text
+        return ""
+    finally:
+        user32.CloseClipboard()
+
+
+def _tk_clipboard_text(widget: tk.Misc) -> str:
+    for kind in (None, "UTF8_STRING", "STRING", "UNICODETEXT", "TEXT"):
         try:
-            clip = str(widget.clipboard_get())
+            if kind:
+                value = widget.clipboard_get(type=kind)
+            else:
+                value = widget.clipboard_get()
+        except tk.TclError:
+            continue
+        text = str(value or "")
+        if text:
+            return text
+    return ""
+
+
+def _clipboard_text(widget: tk.Misc, retries: int = 4) -> str:
+    attempts = max(1, retries)
+    for index in range(attempts):
+        text = _tk_clipboard_text(widget) or _os_clipboard_text()
+        if text:
+            return text
+        if index + 1 < attempts:
+            time.sleep(0.02)
+    return ""
+
+
+def _clipboard_has_text(widget: tk.Misc) -> bool:
+    return bool(_clipboard_text(widget, retries=1).strip())
+
+
+def _normalize_clipboard_text(text: str, *, as_url: bool = False) -> str:
+    value = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not value:
+        return ""
+    if as_url:
+        value = value.strip().strip('"').strip("'")
+        match = re.search(r"https?://[^\s<>\"']+", value)
+        if match and ("<" in value or "\n" in value):
+            value = match.group(0)
+        else:
+            value = value.splitlines()[0].strip().strip('"').strip("'")
+    return value
+
+
+def _clipboard_has_text(widget: tk.Misc) -> bool:
+    return bool(_clipboard_text(widget).strip())
+
+
+def _insert_clipboard(widget: tk.Entry | ttk.Combobox, *, as_url: bool = False) -> str:
+    clip = _normalize_clipboard_text(_clipboard_text(widget), as_url=as_url)
+    if not clip:
+        return "break"
+    try:
+        widget.delete("sel.first", "sel.last")
+    except tk.TclError:
+        pass
+    widget.insert("insert", clip)
+    return "break"
+
+
+def _bind_entry_clipboard(entry: tk.Entry, *, as_url: bool = False) -> None:
+    def paste(_event=None) -> str:
+        return _insert_clipboard(entry, as_url=as_url)
+
+    def copy(_event=None) -> str:
+        try:
+            text = entry.selection_get()
         except tk.TclError:
             return "break"
         try:
-            widget.delete("sel.first", "sel.last")
+            entry.clipboard_clear()
+            entry.clipboard_append(text)
         except tk.TclError:
             pass
-        widget.insert("insert", clip)
         return "break"
 
-    for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>"):
+    def cut(_event=None) -> str:
+        copy()
+        try:
+            entry.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def select_all(_event=None) -> str:
+        entry.select_range(0, "end")
+        entry.icursor("end")
+        return "break"
+
+    def on_ctrl(event: tk.Event) -> str | None:
+        alt = bool(event.state & 0x20000) or bool(event.state & 0x8)
+        if alt:
+            return None
+        keycode = int(getattr(event, "keycode", 0) or 0)
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        if keycode == 86:
+            if keysym == "v":
+                return None
+            return paste()
+        if keycode == 67:
+            if keysym == "c":
+                return None
+            return copy()
+        if keycode == 88:
+            if keysym == "x":
+                return None
+            return cut()
+        if keycode == 65:
+            return select_all()
+        return None
+
+    def has_selection() -> bool:
+        try:
+            return bool(entry.selection_get())
+        except tk.TclError:
+            return False
+
+    menu = tk.Menu(entry, tearoff=0, font=("Segoe UI", 9))
+
+    def show_menu(event: tk.Event) -> str:
+        entry.focus_set()
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            pass
+        state_sel = "normal" if has_selection() else "disabled"
+        state_paste = "normal" if _clipboard_has_text(entry) else "disabled"
+        menu.add_command(label="Cut", command=cut, state=state_sel)
+        menu.add_command(label="Copy", command=copy, state=state_sel)
+        menu.add_command(label="Paste", command=lambda: paste(), state=state_paste)
+        menu.add_separator()
+        menu.add_command(label="Select all", command=select_all)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    entry._clip_menu = menu
+    for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>", "<Button-2>"):
         entry.bind(sequence, paste)
+    entry.bind("<Control-a>", select_all)
+    entry.bind("<Control-A>", select_all)
+    entry.bind("<Control-KeyPress>", on_ctrl)
+    entry.bind("<Button-3>", show_menu)
+    entry.bind("<Shift-F10>", show_menu)
 
 
 def _bind_combobox_clipboard(combo: ttk.Combobox) -> None:
-    def paste(_event: tk.Event) -> str:
-        try:
-            clip = str(combo.clipboard_get())
-        except tk.TclError:
-            return "break"
-        try:
-            combo.delete("sel.first", "sel.last")
-        except tk.TclError:
-            pass
-        combo.insert("insert", clip)
-        return "break"
+    def paste(_event=None) -> str:
+        return _insert_clipboard(combo, as_url=False)
 
-    for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>"):
+    def on_ctrl(event: tk.Event) -> str | None:
+        alt = bool(event.state & 0x20000) or bool(event.state & 0x8)
+        if alt:
+            return None
+        keycode = int(getattr(event, "keycode", 0) or 0)
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        if keycode == 86 and keysym != "v":
+            return paste()
+        return None
+
+    for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>", "<Button-2>"):
         combo.bind(sequence, paste)
+    combo.bind("<Control-KeyPress>", on_ctrl)
 
 
 def _settings_scroll_table(
