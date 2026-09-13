@@ -21,7 +21,7 @@ from urllib.parse import quote, urlparse
 
 from dataclasses import asdict
 
-from activity_log import ActivityLog
+from activity_log import ActivityLog, slot_for
 from app_config import (
     BROWSERS,
     DEFAULT_SEARCH_URLS,
@@ -101,6 +101,7 @@ WATCHED_FILES = (
     "field_map.py",
     "scanner_registry.py",
     "scan_lists.py",
+    "nli_catalog.py",
 )
 APP_NAME = "SISU Book Catalog Filler"
 
@@ -274,8 +275,16 @@ class BookCatalogApp(tk.Tk):
         self._scan_book = ""
         self._activity = ActivityLog()
         self._log_popup: tk.Toplevel | None = None
+        self._log_live_popup: tk.Toplevel | None = None
         self._log_list: tk.Listbox | None = None
         self._log_view: tk.Text | None = None
+        self._log_live_summary: tk.StringVar | None = None
+        self._log_live_detail: tk.StringVar | None = None
+        self._log_live_summary_label: tk.Label | None = None
+        self._log_live_detail_label: tk.Label | None = None
+        self._log_live_geom = ""
+        self._live_latest = ""
+        self._live_queued = False
         self._log_runs: list[dict[str, str]] = []
         self._log_selected_id = ""
         self._log_refresh_job: str | None = None
@@ -406,7 +415,7 @@ class BookCatalogApp(tk.Tk):
         list_btns.grid(row=0, column=2, sticky="w", padx=(8, 8))
         new_btn = ttk.Button(list_btns, text="New", command=self.new_working_list)
         new_btn.pack(side="left", padx=(0, 4))
-        self._callout(new_btn, "Start a fresh working list. The current unsaved list can be stashed first if you need it.")
+        self._callout(new_btn, "Start a fresh working list. A named list is saved to Lists first. An unnamed list can be stashed.")
         self.stash_btn = ttk.Button(list_btns, text="Stash", command=self.stash_working_list)
         self.stash_btn.pack(side="left", padx=(0, 4))
         self._callout(
@@ -1378,6 +1387,18 @@ class BookCatalogApp(tk.Tk):
             text="Add site",
             command=lambda: _fill_site_rows([var.get() for var in site_vars] + [""], focus_last=True),
         ).pack(anchor="w")
+        nli_key = tk.StringVar(value=str(data.get("nli_api_key") or ""))
+        ttk.Label(
+            sites_tab,
+            text="National Library searches nli.org.il through the Open Library API (not the JavaScript web page). A free key from https://api2.nli.org.il/signup/ avoids the shared guest-key limit.",
+            wraplength=740,
+        ).pack(anchor="w", pady=(10, 4))
+        nli_row = ttk.Frame(sites_tab)
+        nli_row.pack(fill="x")
+        ttk.Label(nli_row, text="NLI API key").pack(side="left")
+        nli_entry = ttk.Entry(nli_row, textvariable=nli_key, show="•")
+        nli_entry.pack(side="left", fill="x", expand=True, padx=8)
+        _bind_entry_clipboard(nli_entry)
 
         ttk.Label(
             publisher_tab,
@@ -1888,6 +1909,7 @@ class BookCatalogApp(tk.Tk):
                     "publishers": publishers,
                     "search_sites": sites,
                     "excel_dir": current.get("excel_dir") or "",
+                    "nli_api_key": nli_key.get().strip(),
                     "llm": current_llm,
                 }
             )
@@ -1930,7 +1952,32 @@ class BookCatalogApp(tk.Tk):
 
     def _on_list_title_change(self) -> None:
         self._bind_list_excel_path(rename_existing=not self._list_locked)
+        if (
+            getattr(self, "_list_actions_ready", False)
+            and not self._list_locked
+            and self._list_has_name()
+        ):
+            self._remember_named_list()
         self._persist_working()
+
+    def _remember_named_list(self) -> str:
+        """Write the current named list into Lists so New cannot lose it."""
+        title = self.list_title.get().strip()
+        if self._is_placeholder_title(title):
+            return ""
+        had_id = bool(str(self._list_id or "").strip())
+        try:
+            payload = save_named(self._current_payload())
+        except OSError as exc:
+            self._set_status(f"Could not save list “{title}”: {exc}")
+            return ""
+        self._list_id = str(payload.get("id") or "")
+        self._list_created_at = str(payload.get("created_at") or self._list_created_at)
+        if self._list_id and not had_id:
+            self._persist_working()
+        if self._lists_popup is not None:
+            self._reload_lists_table()
+        return self._list_id
 
     def _default_excel_dir(self) -> Path:
         configured = str(load_config().get("excel_dir") or "").strip()
@@ -2335,6 +2382,9 @@ class BookCatalogApp(tk.Tk):
             data,
             status=f"Restored the last working list “{data.get('title') or 'New'}” with {len(data.get('books') or [])} book(s).",
         )
+        if self._list_has_name() and not self._list_locked:
+            if not self._list_id or load_named(self._list_id) is None:
+                self._remember_named_list()
         if self._list_id:
             named = load_named(self._list_id)
             self._clean_fingerprint = self._fingerprint_payload(named) if named else ""
@@ -2349,9 +2399,18 @@ class BookCatalogApp(tk.Tk):
             return
         if self.books and not messagebox.askyesno(
             "New list",
-            "Clear the current working list? Stash it first if you want to keep these books.",
+            "Clear the current working list? Named lists are kept in Lists. Stash first if this list has no name and you want these books.",
         ):
             return
+        kept = ""
+        if self._list_has_name() and not self._list_locked:
+            kept = self._remember_named_list()
+            if not kept:
+                if not messagebox.askyesno(
+                    "New list",
+                    "The named list could not be saved to Lists. Start a new list anyway? The current books may be lost.",
+                ):
+                    return
         urls = self._urls() or all_search_urls() or list(DEFAULT_SEARCH_URLS)
         payload = empty_payload(
             title="New",
@@ -2361,7 +2420,10 @@ class BookCatalogApp(tk.Tk):
             include_unknown=bool(self.include_unknown.get()),
         )
         payload["excel_dir"] = str(self._excel_dir or "")
-        self._apply_payload(payload, status="Started a new empty working list.", as_saved=True)
+        status = "Started a new empty working list."
+        if kept:
+            status = f"Saved “{self.list_title.get().strip()}” to Lists, then started a new empty working list."
+        self._apply_payload(payload, status=status, as_saved=True)
 
     def stash_working_list(self) -> None:
         if self._busy:
@@ -2426,7 +2488,11 @@ class BookCatalogApp(tk.Tk):
                 return
             title = entered.strip() or title
             self.list_title.set(title)
-        payload = save_named(self._current_payload())
+        try:
+            payload = save_named(self._current_payload())
+        except OSError as exc:
+            messagebox.showerror("Save list", f"Could not save this list:\n{exc}")
+            return
         self._list_id = str(payload.get("id") or "")
         self._list_created_at = str(payload.get("created_at") or "")
         self._bind_list_excel_path(rename_existing=True)
@@ -2721,21 +2787,32 @@ class BookCatalogApp(tk.Tk):
         self._set_status("Stopping…")
 
     def _crawl_progress(self, msg: str) -> None:
-        try:
-            self._activity.log(msg)
-        except Exception:
-            pass
-        self._ui_queue.put(("status", msg))
+        text = str(msg or "").strip()
+        if not text:
+            return
+        self._live_latest = text
+        ephemeral = slot_for(text) in {"check", "pages", "fill"}
+        if not ephemeral:
+            try:
+                self._activity.log(text)
+            except Exception:
+                pass
+            self._ui_queue.put(("status", text))
+        if not self._live_queued:
+            self._live_queued = True
+            self._ui_queue.put(("live", text))
 
     def show_activity_log(self) -> None:
         if self._log_popup is not None:
             try:
                 self._log_popup.lift()
                 self._log_popup.focus_force()
+                self._lift_log_live()
                 self._reload_log_list(keep_selection=True)
                 return
             except tk.TclError:
                 self._log_popup = None
+                self._close_log_live()
         win = tk.Toplevel(self)
         win.title("Search log")
         win.geometry("980x560")
@@ -2745,7 +2822,7 @@ class BookCatalogApp(tk.Tk):
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Each Search is a separate log. The Performance block at the top shows time and counts per catalog: books, new, duplicates, and field updates. Publisher lookups from More are logged the same way. Progress lines such as listing book 48 are rewritten in place.",
+            text="Each Search is a separate log. The Performance block at the top shows time and counts per catalog: books, new, duplicates, and field updates. Publisher lookups from More are logged the same way. The strip under this window shows the book being scanned right now and is not saved in the log.",
             wraplength=940,
         ).pack(anchor="w", pady=(0, 8))
         split = ttk.Panedwindow(body, orient="horizontal")
@@ -2779,9 +2856,11 @@ class BookCatalogApp(tk.Tk):
                 self._show_selected_log()
 
         listbox.bind("<<ListboxSelect>>", on_select)
+        self._log_shown_id = ""
 
         def close() -> None:
             self._stop_log_refresh()
+            self._close_log_live()
             self._log_popup = None
             self._log_list = None
             self._log_view = None
@@ -2789,8 +2868,170 @@ class BookCatalogApp(tk.Tk):
 
         win.protocol("WM_DELETE_WINDOW", close)
         ttk.Button(body, text="Close", command=close).pack(anchor="e", pady=(8, 0))
+        self._open_log_live(win)
+        win.bind("<Configure>", lambda _e: self._sync_log_live_geom(), add="+")
+        win.bind("<Map>", lambda _e: self._on_log_visibility(), add="+")
+        win.bind("<Unmap>", lambda _e: self._on_log_visibility(), add="+")
         self._reload_log_list()
         self._start_log_refresh()
+        self.after_idle(self._sync_log_live_geom)
+
+    def _open_log_live(self, log_win: tk.Toplevel) -> None:
+        self._close_log_live()
+        live = tk.Toplevel(log_win)
+        live.title("Now")
+        live.transient(log_win)
+        live.resizable(True, False)
+        live.minsize(320, 72)
+        live.configure(bg=WHITE)
+        self._log_live_popup = live
+        self._log_live_geom = ""
+        summary = tk.StringVar(value=self.scan_live.get() or self.status.get() or "Idle.")
+        detail = tk.StringVar(value=self._live_latest or self._scan_book or "")
+        self._log_live_summary = summary
+        self._log_live_detail = detail
+        inner = tk.Frame(live, bg=WHITE, padx=10, pady=8)
+        inner.pack(fill="both", expand=True)
+        tk.Label(
+            inner,
+            text="Now",
+            bg=WHITE,
+            fg=NAVY,
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        summary_label = tk.Label(
+            inner,
+            textvariable=summary,
+            bg=WHITE,
+            fg=NAVY,
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=900,
+        )
+        summary_label.pack(fill="x", pady=(2, 0))
+        detail_label = tk.Label(
+            inner,
+            textvariable=detail,
+            bg=WHITE,
+            fg="#6B5A3E",
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=900,
+        )
+        detail_label.pack(fill="x")
+        self._log_live_summary_label = summary_label
+        self._log_live_detail_label = detail_label
+        try:
+            live.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        live.protocol("WM_DELETE_WINDOW", lambda: None)
+        live.bind("<Configure>", lambda _e: self._fit_log_live_wrap(), add="+")
+        self._sync_log_live_geom()
+        log_win.focus_force()
+
+    def _close_log_live(self) -> None:
+        live = self._log_live_popup
+        self._log_live_popup = None
+        self._log_live_summary = None
+        self._log_live_detail = None
+        self._log_live_summary_label = None
+        self._log_live_detail_label = None
+        self._log_live_geom = ""
+        if live is None:
+            return
+        try:
+            live.destroy()
+        except tk.TclError:
+            pass
+
+    def _lift_log_live(self) -> None:
+        live = self._log_live_popup
+        if live is None:
+            return
+        try:
+            if live.winfo_exists():
+                live.lift()
+                self._sync_log_live_geom()
+        except tk.TclError:
+            self._close_log_live()
+
+    def _on_log_visibility(self) -> None:
+        log = self._log_popup
+        live = self._log_live_popup
+        if log is None or live is None:
+            return
+        try:
+            if not log.winfo_exists():
+                self._close_log_live()
+                return
+            mapped = bool(log.winfo_ismapped()) and str(log.state()) != "iconic"
+            if mapped:
+                live.deiconify()
+                self._sync_log_live_geom()
+            else:
+                live.withdraw()
+        except tk.TclError:
+            self._close_log_live()
+
+    def _sync_log_live_geom(self) -> None:
+        log = self._log_popup
+        live = self._log_live_popup
+        if log is None or live is None:
+            return
+        try:
+            if not log.winfo_exists() or not live.winfo_exists():
+                return
+            if not log.winfo_ismapped() or str(log.state()) == "iconic":
+                live.withdraw()
+                return
+            log.update_idletasks()
+            width = max(320, int(log.winfo_width()))
+            height = 90
+            x = int(log.winfo_rootx())
+            y = int(log.winfo_rooty()) + int(log.winfo_height())
+            geom = f"{width}x{height}+{x}+{y}"
+            if geom == self._log_live_geom:
+                return
+            self._log_live_geom = geom
+            live.deiconify()
+            live.geometry(geom)
+            self._fit_log_live_wrap(width)
+        except tk.TclError:
+            pass
+
+    def _fit_log_live_wrap(self, width: int | None = None) -> None:
+        live = self._log_live_popup
+        if live is None:
+            return
+        try:
+            wrap = max(240, int(width or live.winfo_width()) - 28)
+            if self._log_live_summary_label is not None:
+                self._log_live_summary_label.configure(wraplength=wrap)
+            if self._log_live_detail_label is not None:
+                self._log_live_detail_label.configure(wraplength=wrap)
+        except tk.TclError:
+            pass
+
+    def _apply_log_live(self, detail: str = "") -> None:
+        summary = self._log_live_summary
+        detail_var = self._log_live_detail
+        if summary is None and detail_var is None:
+            return
+        headline = self.scan_live.get().strip() or self.status.get().strip() or "Idle."
+        line = (detail or self._live_latest or self._scan_book or "").strip()
+        if line == headline:
+            line = self._scan_book or ""
+        try:
+            if summary is not None:
+                summary.set(headline)
+            if detail_var is not None:
+                detail_var.set(line)
+        except tk.TclError:
+            pass
 
     def _reload_log_list(self, *, keep_selection: bool = False) -> None:
         box = self._log_list
@@ -2820,14 +3061,27 @@ class BookCatalogApp(tk.Tk):
             return
         at_end = False
         view = self._log_view
+        first = 0.0
         if view is not None:
             try:
-                at_end = float(view.yview()[1]) >= 0.98
+                first, last = view.yview()
+                first = float(first)
+                at_end = float(last) >= 0.98
             except tk.TclError:
-                at_end = True
-        self._set_log_view(self._activity.render_run(run_id), stick_to_end=at_end or run_id == self._activity.current_id())
+                at_end = False
+        first_show = getattr(self, "_log_shown_id", "") != run_id
+        self._log_shown_id = run_id
+        # A short/unexpanded view reports last≈1.0 even at the top. Only follow
+        # the bottom after the user has scrolled away from the start.
+        following = at_end and first > 0.01
+        stick = following and not first_show
+        self._set_log_view(
+            self._activity.render_run(run_id),
+            stick_to_end=stick,
+            restore_top=None if stick or first_show else first,
+        )
 
-    def _set_log_view(self, text: str, *, stick_to_end: bool = True) -> None:
+    def _set_log_view(self, text: str, *, stick_to_end: bool = False, restore_top: float | None = None) -> None:
         view = self._log_view
         if view is None:
             return
@@ -2837,6 +3091,13 @@ class BookCatalogApp(tk.Tk):
         view.configure(state="disabled")
         if stick_to_end:
             view.see("end")
+        elif restore_top is not None:
+            try:
+                view.yview_moveto(max(0.0, min(1.0, float(restore_top))))
+            except (tk.TclError, TypeError, ValueError):
+                view.yview_moveto(0.0)
+        else:
+            view.yview_moveto(0.0)
 
     def _start_log_refresh(self) -> None:
         self._stop_log_refresh()
@@ -2854,13 +3115,16 @@ class BookCatalogApp(tk.Tk):
     def _refresh_log_window(self) -> None:
         self._log_refresh_job = None
         if self._log_popup is None:
+            self._close_log_live()
             return
         try:
             if not self._log_popup.winfo_exists():
                 self._log_popup = None
+                self._close_log_live()
                 return
         except tk.TclError:
             self._log_popup = None
+            self._close_log_live()
             return
         current = self._activity.current_id()
         if self._log_selected_id == current or not self._log_selected_id:
@@ -2941,11 +3205,15 @@ class BookCatalogApp(tk.Tk):
 
     def _drain_queue(self) -> None:
         processed = 0
+        latest_live = None
         while processed < 8:
             try:
                 kind, payload = self._ui_queue.get_nowait()
             except queue.Empty:
                 break
+            if kind == "live":
+                latest_live = self._live_latest or str(payload or "")
+                continue
             processed += 1
             if kind == "status":
                 self._set_status(str(payload))
@@ -2982,7 +3250,10 @@ class BookCatalogApp(tk.Tk):
                 self._on_update_error(bool(silent), str(text))
             elif kind == "update_applied":
                 self._finish_self_update()
-        self.after(20 if processed >= 8 else 80, self._drain_queue)
+        if latest_live is not None:
+            self._live_queued = False
+            self._apply_log_live(latest_live)
+        self.after(20 if processed >= 8 or latest_live is not None else 80, self._drain_queue)
 
     def _finish_search(
         self,
@@ -3017,6 +3288,8 @@ class BookCatalogApp(tk.Tk):
         report.matched = max(int(report.matched or 0), len(self.books))
         self._list_report = asdict(report)
         self._persist_working(self._list_report)
+        if self._list_has_name() and not self._list_locked:
+            self._remember_named_list()
         year = self.year.get().strip() or "any year"
         list_failed = failed or bool(report.error and not self.books and not cancelled)
         dup_note = self._scan_duplicate_status(report)
@@ -3049,6 +3322,7 @@ class BookCatalogApp(tk.Tk):
             self._update_workflow_buttons(self._selected_book)
         self._refresh_list_status()
         self._refresh_selection_label()
+        self._apply_log_live(self.status.get())
 
     def _scan_duplicate_status(self, report: CrawlReport) -> str:
         found = int(report.duplicates_found or 0)
@@ -3353,6 +3627,8 @@ class BookCatalogApp(tk.Tk):
         title = str(payload.get("title") or "")
         if total:
             self._lookup_step.set(f"Book {index} of {total}\n{title}")
+            self._live_latest = f"Book {index} of {total}  ·  {title}".strip()
+            self._apply_log_live(self._live_latest)
         if self._lookup_bar is not None and str(self._lookup_bar.cget("mode")) == "determinate":
             self._lookup_bar["value"] = index
 
@@ -4563,6 +4839,7 @@ class BookCatalogApp(tk.Tk):
         if self._scan_book:
             parts.append(self._scan_book)
         self.scan_live.set("  ·  ".join(parts))
+        self._apply_log_live(self._live_latest or self._scan_book)
         if self._busy and total_count:
             self._set_progress_count(checking_count, total_count)
             self.work_hint.set(f"{checking_count:,} / {total_count:,}")

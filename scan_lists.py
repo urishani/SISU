@@ -60,8 +60,10 @@ def _write_json(path: Path, data: dict[str, Any]) -> Path:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as exc:
+            raise OSError(f"Could not save list file {path}: {exc}") from exc
+    if not path.exists():
+        raise OSError(f"Could not save list file {path}.")
     return path
 
 
@@ -153,6 +155,50 @@ def _index() -> dict[str, Any]:
     if not isinstance(lists, list):
         lists = []
     data["lists"] = lists
+    return _heal_index(data)
+
+
+def _heal_index(data: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild Lists from named files if index.json was lost or fell behind."""
+    _ensure_dirs()
+    lists = data.setdefault("lists", [])
+    by_id = {str(item.get("id") or ""): item for item in lists if str(item.get("id") or "").strip()}
+    changed = False
+    for path in NAMED_DIR.glob("*.json"):
+        list_id = path.stem
+        payload = _read_json(path)
+        if not payload:
+            continue
+        payload["id"] = str(payload.get("id") or list_id)
+        item = {
+            "id": payload["id"],
+            "title": payload.get("title") or "Untitled",
+            "created_at": payload.get("created_at") or "",
+            "updated_at": payload.get("updated_at") or "",
+            "locked": bool(payload.get("locked")),
+            "archived": bool(payload.get("archived")),
+            "year": payload.get("year") or "",
+            "book_count": len(payload.get("books") or []),
+        }
+        existing = by_id.get(list_id) or by_id.get(payload["id"])
+        if existing != item:
+            if existing is None:
+                lists.append(item)
+            else:
+                existing.update(item)
+            changed = True
+            by_id[item["id"]] = item
+    keep_ids = set(by_id)
+    for path in NAMED_DIR.glob("*.json"):
+        keep_ids.add(path.stem)
+    filtered = [item for item in lists if str(item.get("id") or "") in keep_ids and _named_path(str(item.get("id") or "")).exists()]
+    if len(filtered) != len(lists):
+        data["lists"] = filtered
+        changed = True
+    if changed:
+        lists = data["lists"]
+        lists.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+        _save_index(data)
     return data
 
 

@@ -103,6 +103,16 @@ def site_error_message(html: str, status: int | None = None, url: str = "") -> s
         heading = clean(paragraph.get_text(" ", strip=True) if paragraph else "")
     blob = f"{title}\n{heading}\n{(html or '')[:8000]}"
     lower = blob.casefold()
+    if status in {403, 503} and (
+        "checking your browser" in lower
+        or "just a moment" in lower
+        or "cf-browser-verification" in lower
+        or "enable javascript and cookies to continue" in lower
+    ):
+        return (
+            "This catalog is behind a browser check, so SISU cannot read the web page. "
+            "National Library searches use the Open Library API instead."
+        )
     wp_title = ("wordpress" in title.casefold() and "error" in title.casefold()) or (
         "וורדפרס" in title and "שגיאה" in title
     )
@@ -4022,6 +4032,45 @@ class BookCrawler:
 
         def keep_listed(book: Book) -> None:
             take_listed(book.url, book)
+
+        if is_nli_host(start_url):
+            from nli_catalog import NliCatalogError, search_year_books
+
+            try:
+                from app_config import load_config
+
+                api_key = str((load_config() or {}).get("nli_api_key") or "")
+            except Exception:
+                api_key = ""
+            nli_pages = page_cap if page_cap < UNLIMITED_LISTING_PAGES else 400
+
+            def nli_page(current: int, total: int) -> None:
+                self.report.listing_pages += 1
+                note_pages(current, total)
+
+            try:
+                search_year_books(
+                    self.session,
+                    year=year,
+                    catalog_url=start_url,
+                    api_key=api_key,
+                    max_books=max_products if max_products > 0 else 50_000,
+                    include_unknown_year=include_unknown_year,
+                    page_limit=nli_pages,
+                    cancelled=self.cancelled,
+                    progress=self.progress,
+                    on_listed=keep_listed,
+                    on_page=nli_page,
+                )
+            except NliCatalogError as exc:
+                self.report.listing_failed += 1
+                message = str(exc)
+                self.last_site_error = message
+                if start_error:
+                    self.report.error = message
+                self.progress(message)
+            _safe_flush_scan_files()
+            return results
 
         try:
             html, final_url = self.fetch(start_url)

@@ -89,6 +89,7 @@ def _defaults() -> dict:
         "publishers": {},
         "search_sites": _default_search_sites(),
         "excel_dir": "",
+        "nli_api_key": "",
         "llm": _llm_defaults(),
     }
 
@@ -148,6 +149,7 @@ def _normalize(raw: dict) -> dict:
     data["browser_path"] = str(raw.get("browser_path") or "").strip()
     excel_dir = str(raw.get("excel_dir") or "").strip()
     data["excel_dir"] = excel_dir
+    data["nli_api_key"] = str(raw.get("nli_api_key") or "").strip()
     publishers: dict[str, str] = {}
     incoming = raw.get("publishers") or {}
     if isinstance(incoming, dict):
