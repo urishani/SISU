@@ -166,6 +166,14 @@ def load_aliases() -> dict[str, str]:
 
 _cover_values: dict[str, str] | None = None
 
+COVER_DISPLAY = {
+    "S": "Soft",
+    "H": "Hard",
+    "BB": "Board",
+    "E": "Electronic",
+}
+COVER_CODES = tuple(COVER_DISPLAY)
+
 
 def load_cover_values() -> dict[str, str]:
     global _cover_values
@@ -182,7 +190,7 @@ def load_cover_values() -> dict[str, str]:
             for label, code in mapping.items():
                 key = normalize_label(str(label))
                 value = str(code or "").strip().upper()
-                if key and value in {"S", "H", "BB"}:
+                if key and value in COVER_DISPLAY:
                     values[key] = value
     _cover_values = values
     return values
@@ -203,14 +211,6 @@ def isolate_language(value: str | None) -> str:
     if len(text) > 40:
         text = text.split()[0]
     return text
-
-
-COVER_DISPLAY = {
-    "S": "Soft",
-    "H": "Hard",
-    "BB": "Board",
-    "E": "Electronic",
-}
 
 
 def cover_code(text: str | None) -> str:

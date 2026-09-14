@@ -65,7 +65,14 @@ from book_crawler import (
 )
 from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
-from field_map import ALIASES_PATH, EXCEL_TARGETS, format_cover_type, reload_aliases, write_field_report
+from field_map import (
+    ALIASES_PATH,
+    COVER_CODES,
+    EXCEL_TARGETS,
+    format_cover_type,
+    reload_aliases,
+    write_field_report,
+)
 from hebrew_view import HebrewDescription
 from publisher_sites import publishers_match, resolve_publisher_site
 from scanner_registry import attach_book, attach_books, persist_book_state
@@ -2071,7 +2078,7 @@ class BookCatalogApp(tk.Tk):
 
         ttk.Label(
             aliases_tab,
-            text="Cover type words (S = soft, H = hard, BB = board).",
+            text="Cover type words (S = soft, H = hard, BB = board, E = electronic).",
             wraplength=740,
         ).pack(anchor="w", pady=(10, 0))
         cover_wrap = ttk.Frame(aliases_tab)
@@ -2087,7 +2094,7 @@ class BookCatalogApp(tk.Tk):
             code_combo = ttk.Combobox(
                 cover_inner,
                 textvariable=code_var,
-                values=("S", "H", "BB"),
+                values=COVER_CODES,
                 width=8,
                 font=("Segoe UI", 10),
             )
@@ -2375,8 +2382,11 @@ class BookCatalogApp(tk.Tk):
                 code = str(code or "").strip().upper()
                 if not word:
                     continue
-                if code not in {"S", "H", "BB"}:
-                    messagebox.showerror("Field aliases", f"Cover code for “{word}” must be S, H, or BB.")
+                if code not in COVER_CODES:
+                    messagebox.showerror(
+                        "Field aliases",
+                        f"Cover code for “{word}” must be S, H, BB, or E.",
+                    )
                     return False
                 covers[word] = code
             payload = {
