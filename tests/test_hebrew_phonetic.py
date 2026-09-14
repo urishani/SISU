@@ -29,4 +29,12 @@ def test_keeps_latin_words() -> None:
 if __name__ == "__main__":
     test_known_titles()
     test_keeps_latin_words()
+    from book_crawler import Book
+
+    book = Book(url="https://example.com/book", title="ילד אהוב", title_phonetic="Yld Ahov")
+    book.extra["phonetic_source"] = "algorithm"
+    assert not book.ensure_phonetic()
+    assert book.title_phonetic == "Yld Ahov"
+    assert book.ensure_phonetic(replace=True)
+    assert book.title_phonetic == "Yeled Ahuv"
     print("ok")

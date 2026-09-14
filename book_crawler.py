@@ -921,14 +921,19 @@ class Book:
         self.title_phonetic = phonetic
         return self.ensure_phonetic(allow_llm=allow_llm)
 
-    def ensure_phonetic(self, *, allow_llm: bool = False) -> bool:
-        """Fill a missing phonetic title from Hebrew. Does not change the updated date."""
+    def ensure_phonetic(self, *, allow_llm: bool = False, replace: bool = False) -> bool:
+        """Fill a missing phonetic title from Hebrew. Does not change the updated date.
+
+        Existing Latin spellings stay unless replace=True. LLM and manual spellings are never replaced.
+        """
         from hebrew_text import hebrew_phonetic, split_hebrew_latin
 
         current = (self.title_phonetic or "").strip()
         source_tag = (self.extra.get("phonetic_source") or "").strip()
         locked = source_tag in {"llm", "manual"}
-        if current and not has_hebrew(current) and locked and not allow_llm:
+        if current and not has_hebrew(current) and locked:
+            return False
+        if current and not has_hebrew(current) and not replace and not allow_llm:
             return False
         hebrew, _latin = split_hebrew_latin(self.title)
         source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
@@ -954,6 +959,8 @@ class Book:
                 self.extra["phonetic_source"] = "model"
             return False
         if locked:
+            return False
+        if current and not has_hebrew(current) and not replace:
             return False
         self.title_phonetic = generated
         self.extra["phonetic_source"] = "model"
@@ -1960,6 +1967,8 @@ def fill_missing_phonetics(books: list[Book], *, use_llm: bool = True) -> int:
             if not text or title_has_hebrew(text):
                 continue
             was_missing = not (book.title_phonetic or "").strip() or title_has_hebrew(book.title_phonetic)
+            if not was_missing:
+                continue
             book.title_phonetic = text
             if offset in llm_set:
                 book.extra["phonetic_source"] = "llm"
@@ -1967,6 +1976,15 @@ def fill_missing_phonetics(books: list[Book], *, use_llm: bool = True) -> int:
                 book.extra["phonetic_source"] = "model"
             if was_missing:
                 filled += 1
+    return filled
+
+
+def reapply_model_phonetics(books: list[Book]) -> int:
+    """Replace existing algorithm phonetics with the built-in model. Leaves LLM and manual spellings."""
+    filled = 0
+    for book in books:
+        if book.ensure_phonetic(replace=True):
+            filled += 1
     return filled
 
 

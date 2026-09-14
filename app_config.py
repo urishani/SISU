@@ -20,6 +20,9 @@ DEFAULT_SEARCH_URLS = (
 )
 PLACEHOLDER_URL_MARKERS = ("example.com", "example.org", "a.example")
 
+# Bump this if a later phonetic model should offer one more reapply of existing titles.
+PHONETIC_MODEL_PROMPT_ID = 1
+
 BROWSERS: tuple[tuple[str, str], ...] = (
     ("chrome", "Google Chrome"),
     ("edge", "Microsoft Edge"),
@@ -91,6 +94,7 @@ def _defaults() -> dict:
         "excel_dir": "",
         "nli_api_key": "",
         "llm": _llm_defaults(),
+        "phonetic_model_prompted_id": 0,
     }
 
 
@@ -164,6 +168,15 @@ def _normalize(raw: dict) -> dict:
     else:
         data["search_sites"] = _default_search_sites()
     data["llm"] = _normalize_llm(raw.get("llm") if isinstance(raw.get("llm"), dict) else {})
+    previous = _cache if isinstance(_cache, dict) else {}
+    if "phonetic_model_prompted_id" in raw:
+        prompted_raw = raw.get("phonetic_model_prompted_id")
+    else:
+        prompted_raw = previous.get("phonetic_model_prompted_id")
+    try:
+        data["phonetic_model_prompted_id"] = max(0, int(prompted_raw or 0))
+    except (TypeError, ValueError):
+        data["phonetic_model_prompted_id"] = 0
     return data
 
 
@@ -250,6 +263,21 @@ def _normalize_llm(raw: dict) -> dict:
 def llm_config() -> dict:
     value = load_config().get("llm") or {}
     return value if isinstance(value, dict) else _llm_defaults()
+
+
+def phonetic_model_prompt_pending() -> bool:
+    data = load_config()
+    try:
+        prompted = int(data.get("phonetic_model_prompted_id") or 0)
+    except (TypeError, ValueError):
+        prompted = 0
+    return prompted < PHONETIC_MODEL_PROMPT_ID
+
+
+def mark_phonetic_model_prompted() -> None:
+    data = load_config()
+    data["phonetic_model_prompted_id"] = PHONETIC_MODEL_PROMPT_ID
+    save_config(data)
 
 
 def update_llm_config(**changes: object) -> dict:

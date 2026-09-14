@@ -33,8 +33,10 @@ from app_config import (
     browser_label,
     enabled_search_urls,
     load_config,
+    mark_phonetic_model_prompted,
     merged_publisher_rows,
     normalize_site_url,
+    phonetic_model_prompt_pending,
     save_config,
     search_sites,
     update_search_sites,
@@ -55,6 +57,7 @@ from book_crawler import (
     format_price,
     listing_url_key,
     merge_later_into,
+    reapply_model_phonetics,
     site_display_name,
     site_host,
     SourceStats,
@@ -85,6 +88,7 @@ from scan_lists import (
     stash_exists,
     stash_has_data,
     stash_summary,
+    stored_book_count,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -102,6 +106,8 @@ WATCHED_FILES = (
     "scanner_registry.py",
     "scan_lists.py",
     "nli_catalog.py",
+    "hebrew_text.py",
+    "hebrew_phonetic_model.py",
 )
 APP_NAME = "SISU Book Catalog Filler"
 
@@ -312,6 +318,7 @@ class BookCatalogApp(tk.Tk):
         self.after(120, self._drain_queue)
         self.after(900, self._watch_for_reload)
         self.after(UPDATE_CHECK_FIRST_MS, self._periodic_update_check)
+        self.after(500, self._offer_phonetic_model_reapply)
 
     def _setup_style(self) -> None:
         style = ttk.Style(self)
@@ -494,20 +501,22 @@ class BookCatalogApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
             anchor="w",
         )
-        self.site_share_btn = ttk.Button(site_header, text="Share", command=self.share_site_urls, width=7)
-        self.site_share_btn.pack(side="right", padx=(0, 6), pady=2)
-        self._callout(
-            self.site_share_btn,
-            "Email or WhatsApp the catalog sites that are checked, so someone else can add them in SISU.",
-        )
-        self.site_edit_btn = ttk.Button(
+        self.site_share_btn = self._site_header_icon(
             site_header,
-            text="Edit…",
-            command=lambda: self.open_settings(focus_tab="sites"),
-            width=7,
+            glyph="\uE72D",
+            fallback="⤴",
+            command=self.share_site_urls,
+            tip="Share the checked catalog sites by email or WhatsApp so someone else can add them in SISU.",
         )
-        self.site_edit_btn.pack(side="right", padx=(0, 4), pady=2)
-        self._callout(self.site_edit_btn, "Add, remove, or reorder catalog sites in Settings.")
+        self.site_share_btn.pack(side="right", padx=(0, 6), pady=2)
+        self.site_edit_btn = self._site_header_icon(
+            site_header,
+            glyph="\uE70F",
+            fallback="✎",
+            command=lambda: self.open_settings(focus_tab="sites"),
+            tip="Add, remove, or reorder catalog sites in Settings.",
+        )
+        self.site_edit_btn.pack(side="right", padx=(0, 2), pady=2)
         site_header_label.pack(side="left", fill="x", expand=True, padx=(2, 8), pady=4)
         site_all_mark.bind("<Button-1>", lambda _e: self._toggle_all_sites())
         site_all_mark.bind("<MouseWheel>", self._on_site_list_wheel)
@@ -829,6 +838,47 @@ class BookCatalogApp(tk.Tk):
     def _callout(self, widget: tk.Misc, text: str) -> None:
         HoverTip(widget, text)
 
+    def _site_icon_font(self) -> tuple[str, int]:
+        families = {name.casefold() for name in tkfont.families(self)}
+        for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"):
+            if name.casefold() in families:
+                return (name, 12)
+        return ("Segoe UI Symbol", 12)
+
+    def _site_header_icon(self, parent: tk.Misc, *, glyph: str, fallback: str, command, tip: str) -> tk.Label:
+        families = {name.casefold() for name in tkfont.families(self)}
+        use_mdl = any(name.casefold() in families for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"))
+        btn = tk.Label(
+            parent,
+            text=glyph if use_mdl else fallback,
+            bg="#EDE6DA",
+            fg=NAVY,
+            font=self._site_icon_font(),
+            cursor="hand2",
+            padx=7,
+            pady=2,
+        )
+        btn._icon_enabled = True
+
+        def on_click(_event=None) -> None:
+            if not getattr(btn, "_icon_enabled", True):
+                return
+            command()
+
+        btn.bind("<Button-1>", on_click)
+        self._callout(btn, tip)
+        return btn
+
+    def _set_site_icon_enabled(self, widget: tk.Misc, enabled: bool) -> None:
+        widget._icon_enabled = bool(enabled)
+        try:
+            widget.configure(
+                fg=NAVY if enabled else "#A89B8C",
+                cursor="hand2" if enabled else "arrow",
+            )
+        except tk.TclError:
+            pass
+
     def _focus_is_text_field(self) -> bool:
         widget = self.focus_get()
         if widget is None:
@@ -875,7 +925,7 @@ class BookCatalogApp(tk.Tk):
             texts = [str(row.get("url") or "") for row in self._site_rows if row.get("url")]
             if not texts:
                 texts = ["https://www.booknet.co.il/"]
-            width_px = max(url_font.measure(text) for text in texts) + 200
+            width_px = max(url_font.measure(text) for text in texts) + 96
             width_px = max(420, min(720, width_px))
             visible = max(1, min(4, len(self._site_rows) or 1))
             row_h = 28
@@ -1024,7 +1074,11 @@ class BookCatalogApp(tk.Tk):
             return selected
         return [self._canonical_search_url(url) for url in enabled_search_urls() if self._canonical_search_url(url)]
 
-    def _rebuild_site_url_list(self, selected: list[str] | None = None) -> None:
+    def _rebuild_site_url_list(
+        self,
+        selected: list[str] | None = None,
+        catalog: list[dict] | None = None,
+    ) -> None:
         inner = getattr(self, "_site_list_inner", None)
         if inner is None:
             return
@@ -1038,7 +1092,10 @@ class BookCatalogApp(tk.Tk):
         for child in inner.winfo_children():
             child.destroy()
         self._site_rows = []
-        catalog = search_sites() or [{"url": url, "enabled": True} for url in DEFAULT_SEARCH_URLS]
+        if catalog is None:
+            catalog = search_sites()
+        if catalog is None:
+            catalog = []
         for item in catalog:
             url = self._canonical_search_url(str(item.get("url") or ""))
             if not url:
@@ -1082,7 +1139,7 @@ class BookCatalogApp(tk.Tk):
         if not self._site_rows:
             empty = tk.Label(
                 inner,
-                text="No catalog sites yet. Use Edit… to add them in Settings.",
+                text="No catalog sites yet. Use the pencil to add them in Settings.",
                 bg=WHITE,
                 fg=NAVY,
                 anchor="w",
@@ -1095,8 +1152,27 @@ class BookCatalogApp(tk.Tk):
         self._site_list_updating = False
         self._sync_site_all_mark()
         self._fit_search_fields()
-        self.after_idle(self._fit_search_fields)
+        self._refresh_site_list_canvas()
+        self.after_idle(self._refresh_site_list_canvas)
         self._set_site_list_enabled(not (self._list_locked or self._busy))
+
+    def _refresh_site_list_canvas(self) -> None:
+        self._fit_search_fields()
+        canvas = getattr(self, "_site_list_canvas", None)
+        inner = getattr(self, "_site_list_inner", None)
+        window_id = getattr(self, "_site_list_window_id", None)
+        if canvas is None or inner is None or window_id is None:
+            return
+        try:
+            inner.update_idletasks()
+            width = int(canvas.winfo_width() or 0)
+            if width > 20:
+                canvas.itemconfigure(window_id, width=width)
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+        except tk.TclError:
+            pass
 
     def _set_site_list_enabled(self, on: bool) -> None:
         self._site_list_enabled = bool(on)
@@ -1308,6 +1384,11 @@ class BookCatalogApp(tk.Tk):
             total = len(urls)
             for index, url in enumerate(urls):
                 last_entry = _append_site_row(url, index=index, total=total)
+            _suspend_settings_table(site_inner, False)
+            try:
+                site_inner.update_idletasks()
+            except tk.TclError:
+                pass
             _suspend_settings_table(site_inner, False)
             if focus_last and last_entry is not None:
                 last_entry.focus_set()
@@ -1918,14 +1999,20 @@ class BookCatalogApp(tk.Tk):
                     "excel_dir": current.get("excel_dir") or "",
                     "nli_api_key": nli_key.get().strip(),
                     "llm": current_llm,
+                    "phonetic_model_prompted_id": current.get("phonetic_model_prompted_id") or 0,
                 }
             )
+            saved_sites = update_search_sites(sites)
             if not save_aliases():
                 show_tab("aliases")
                 return
             close()
-            selected = [item["url"] for item in sites if item.get("enabled")]
-            self._rebuild_site_url_list(selected=selected)
+            selected = [str(item.get("url") or "") for item in saved_sites if item.get("enabled")]
+            self._rebuild_site_url_list(selected=selected, catalog=saved_sites)
+            if getattr(self, "_list_actions_ready", False):
+                self._persist_working()
+                if self._list_has_name() and not self._list_locked:
+                    self._remember_named_list()
             extra = ""
             if llm_fields.get("enabled") and self.books:
                 extra = self._refill_phonetics_with_llm()
@@ -2114,7 +2201,7 @@ class BookCatalogApp(tk.Tk):
         if not urls:
             messagebox.showinfo(
                 "Share sites",
-                "Check the catalog sites you want to share, then click Share.",
+                "Check the catalog sites you want to share, then click the share icon.",
             )
             return
         method = self._ask_share_method(len(urls))
@@ -2384,7 +2471,7 @@ class BookCatalogApp(tk.Tk):
         self.unknown_check.configure(state=edit_state)
         self._sync_page_limit_state()
         self.list_title_entry.configure(state=edit_state)
-        self.site_edit_btn.configure(state=edit_state)
+        self._set_site_icon_enabled(self.site_edit_btn, not self._list_locked)
         folder_state = "disabled" if self._list_locked else "normal"
         self.excel_folder_btn.configure(state=folder_state)
         if self._list_locked:
@@ -4598,6 +4685,103 @@ class BookCatalogApp(tk.Tk):
         attach_books(books)
         self._sync_books_from_list_excel(books)
         return phonetic_filled
+
+    def _offer_phonetic_model_reapply(self) -> None:
+        if not phonetic_model_prompt_pending():
+            return
+        if stored_book_count() <= 0:
+            mark_phonetic_model_prompted()
+            return
+        choice = self._ask_phonetic_reapply()
+        mark_phonetic_model_prompted()
+        if not choice:
+            self._set_status(
+                "Kept existing phonetic titles. New books will use the built-in phonetic model."
+            )
+            return
+        self._set_status("Updating phonetic titles with the built-in model…")
+        self.update_idletasks()
+        updated = self._reapply_phonetics_to_all_lists()
+        self.table.set_books(self.books, keep_checks=True)
+        if self._selected_book:
+            self.table.select_book(self._selected_book)
+            self.show_book(self._selected_book)
+        if updated:
+            self._set_status(
+                f"Updated phonetic titles for {updated:,} book(s). New books will use the built-in model."
+            )
+        else:
+            self._set_status("Phonetic titles already matched the built-in model. New books will use it too.")
+
+    def _ask_phonetic_reapply(self) -> bool:
+        win = tk.Toplevel(self)
+        win.title("Phonetic titles")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(False, False)
+        result = {"choice": False}
+
+        def choose(update: bool) -> None:
+            result["choice"] = update
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=(
+                "This version spells Hebrew book names in phonetic English with a built-in model "
+                "(not a translation, and not the online LLM).\n\n"
+                "Reapply that spelling once to the books already in your lists? "
+                "After this, only new books are spelled automatically."
+            ),
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w")
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor="e", pady=(16, 0))
+        ttk.Button(buttons, text="Keep current", command=lambda: choose(False)).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Update existing", command=lambda: choose(True), style="Accent.TButton").pack(
+            side="left"
+        )
+        win.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.wait_window()
+        return bool(result["choice"])
+
+    def _reapply_phonetics_to_all_lists(self) -> int:
+        updated = reapply_model_phonetics(self.books)
+        self._persist_working()
+        current_id = str(self._list_id or "").strip()
+        if current_id:
+            save_named(self._current_payload())
+        for item in list_summaries(include_archived=True):
+            list_id = str(item.get("id") or "").strip()
+            if not list_id or list_id == current_id:
+                continue
+            payload = load_named(list_id)
+            if not payload:
+                continue
+            books = books_from_payload(payload)
+            changed = reapply_model_phonetics(books)
+            if not changed:
+                continue
+            payload["books"] = [asdict(book) for book in books]
+            save_named(payload)
+            updated += changed
+        stash = load_stash()
+        if stash:
+            books = books_from_payload(stash)
+            changed = reapply_model_phonetics(books)
+            if changed:
+                stash["books"] = [asdict(book) for book in books]
+                save_stash(stash)
+                updated += changed
+        return updated
 
     def _phonetic_fill_message(self, filled: int) -> str:
         import llm_client

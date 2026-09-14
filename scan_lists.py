@@ -245,6 +245,16 @@ def list_summaries(*, include_archived: bool = False) -> list[dict[str, Any]]:
     return rows
 
 
+def stored_book_count() -> int:
+    total = _book_count(load_working()) + _book_count(load_stash())
+    for item in list_summaries(include_archived=True):
+        list_id = str(item.get("id") or "").strip()
+        if not list_id:
+            continue
+        total += _book_count(load_named(list_id))
+    return total
+
+
 def load_named(list_id: str) -> dict[str, Any] | None:
     return _read_json(_named_path(list_id))
 
