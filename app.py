@@ -3773,9 +3773,9 @@ class BookCatalogApp(tk.Tk):
         self._lookup_stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search)
         self._lookup_stop_btn.pack(side="right")
         self._lookup_close_btn = ttk.Button(buttons, text="Close", command=self._close_lookup_popup)
-        self._lookup_title.set("Crawling the publisher site…")
-        self._lookup_step.set(f"Book 1 of {total}" if total else "Starting…")
-        self._lookup_status.set("Opening the publisher catalog…")
+        self._lookup_title.set("Crawling the publisher catalog…")
+        self._lookup_step.set(f"Catalog, then {total} book(s)" if total else "Starting…")
+        self._lookup_status.set("Opening the publisher catalog, then book pages in parallel…")
         self._lookup_hint.set("This window stays open so you can read the crawl results.")
         self.update_idletasks()
         width, height = 580, 520
@@ -3962,19 +3962,23 @@ class BookCatalogApp(tk.Tk):
         )
         crawler._current_source = stats
         try:
-            for index, book in enumerate(books, start=1):
+            keys = {id(book): book.key() for book in books}
+
+            def on_book(index: int, total: int, book: Book, filled: list[str]) -> None:
+                nonlocal updated, errors
                 self._ui_queue.put(
-                    ("lookup_step", {"index": index, "total": len(books), "title": book.display_title()})
+                    ("lookup_step", {"index": index, "total": total, "title": book.display_title()})
                 )
-                crawler.progress(f"{index}/{len(books)}  {book.display_title()}")
-                old_key = book.key()
-                filled = crawler.enrich_one_book(book)
+                old_key = keys.get(id(book), book.key())
                 if old_key != book.key():
                     remap[old_key] = book.key()
                 if book.extra.get("lookup_error"):
                     errors += 1
                 elif filled:
                     updated += 1
+
+            crawler.progress(f"Publisher catalog lookup for {len(books)} book(s) from {publisher}.")
+            crawler.enrich_publisher_books(books, on_book=on_book)
             save_working(self._current_payload())
             try:
                 write_field_report(self.excel_path.get().strip() or None)

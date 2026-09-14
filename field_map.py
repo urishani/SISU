@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,7 @@ NOISE_LABELS = {
 _alias_index: dict[str, str] | None = None
 _candidates: dict[str, dict[str, Any]] | None = None
 _dirty = 0
+_store_lock = threading.RLock()
 
 
 def normalize_label(text: str) -> str:
@@ -561,75 +563,78 @@ def collect_extra_pairs(soup: BeautifulSoup, html: str) -> dict[str, str]:
 
 def remember_candidates(pairs: dict[str, str], url: str) -> None:
     global _dirty
-    store = _load_candidates()
-    host = site_host(url)
-    for label, value in pairs.items():
-        if _noise(label, value):
-            continue
-        key = normalize_label(label)
-        if not key:
-            continue
-        entry = store.setdefault(
-            key,
-            {
-                "label": label,
-                "count": 0,
-                "hosts": {},
-                "samples": [],
-                "urls": [],
-                "matched_field": resolve_label(label) or "",
-            },
-        )
-        entry["count"] = int(entry.get("count") or 0) + 1
-        if len(label) > len(str(entry.get("label") or "")):
-            entry["label"] = label
-        hosts = entry.setdefault("hosts", {})
-        hosts[host] = int(hosts.get(host) or 0) + 1
-        samples: list[str] = entry.setdefault("samples", [])
-        snippet = value[:120]
-        if snippet not in samples and len(samples) < 8:
-            samples.append(snippet)
-        urls: list[str] = entry.setdefault("urls", [])
-        if url and url not in urls and len(urls) < 6:
-            urls.append(url)
-        if not entry.get("matched_field"):
-            entry["matched_field"] = resolve_label(label) or ""
-        _dirty += 1
-    if _dirty >= 25:
-        flush_candidates()
+    with _store_lock:
+        store = _load_candidates()
+        host = site_host(url)
+        for label, value in pairs.items():
+            if _noise(label, value):
+                continue
+            key = normalize_label(label)
+            if not key:
+                continue
+            entry = store.setdefault(
+                key,
+                {
+                    "label": label,
+                    "count": 0,
+                    "hosts": {},
+                    "samples": [],
+                    "urls": [],
+                    "matched_field": resolve_label(label) or "",
+                },
+            )
+            entry["count"] = int(entry.get("count") or 0) + 1
+            if len(label) > len(str(entry.get("label") or "")):
+                entry["label"] = label
+            hosts = entry.setdefault("hosts", {})
+            hosts[host] = int(hosts.get(host) or 0) + 1
+            samples: list[str] = entry.setdefault("samples", [])
+            snippet = value[:120]
+            if snippet not in samples and len(samples) < 8:
+                samples.append(snippet)
+            urls: list[str] = entry.setdefault("urls", [])
+            if url and url not in urls and len(urls) < 6:
+                urls.append(url)
+            if not entry.get("matched_field"):
+                entry["matched_field"] = resolve_label(label) or ""
+            _dirty += 1
+        if _dirty >= 25:
+            flush_candidates()
 
 
 def flush_candidates() -> None:
     global _dirty, _candidates
-    if _candidates is None:
-        return
-    try:
-        from book_cache import _write_text_atomic
+    with _store_lock:
+        if _candidates is None:
+            return
+        try:
+            from book_cache import _write_text_atomic
 
-        CANDIDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(
-            CANDIDATES_PATH,
-            json.dumps({"labels": _candidates}, ensure_ascii=False, indent=2) + "\n",
-        )
-        _dirty = 0
-    except OSError:
-        return
+            CANDIDATES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _write_text_atomic(
+                CANDIDATES_PATH,
+                json.dumps({"labels": _candidates}, ensure_ascii=False, indent=2) + "\n",
+            )
+            _dirty = 0
+        except OSError:
+            return
 
 
 def _load_candidates() -> dict[str, dict[str, Any]]:
     global _candidates
-    if _candidates is not None:
+    with _store_lock:
+        if _candidates is not None:
+            return _candidates
+        if CANDIDATES_PATH.exists():
+            try:
+                raw = json.loads(CANDIDATES_PATH.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raw = {}
+            labels = raw.get("labels") if isinstance(raw, dict) else {}
+            _candidates = labels if isinstance(labels, dict) else {}
+        else:
+            _candidates = {}
         return _candidates
-    if CANDIDATES_PATH.exists():
-        try:
-            raw = json.loads(CANDIDATES_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = {}
-        labels = raw.get("labels") if isinstance(raw, dict) else {}
-        _candidates = labels if isinstance(labels, dict) else {}
-    else:
-        _candidates = {}
-    return _candidates
 
 
 def write_field_report(excel_path: str | Path | None = None) -> Path:

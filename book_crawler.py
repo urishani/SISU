@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from typing import Any, Callable, Iterable
@@ -429,6 +431,20 @@ CATALOG_HOME_PATHS = {
     "kinbooks.co.il": "/ספרים-חדשים",
     "nli.org.il": "/he/search?materialType=books",
 }
+PUBLISHER_WORKERS = 10
+PUBLISHER_FETCH_TIMEOUT = 8
+PUBLISHER_GUESS_TIMEOUT = 4
+PUBLISHER_POOL_DELAY = 0.05
+PUBLISHER_LISTING_PAGES = 80
+PUBLISHER_MAX_PRODUCTS = 8000
+PUBLISHER_UNTITLED_FETCH_CAP = 400
+PUBLISHER_CATALOG_PATHS = (
+    "/collections/all",
+    "/collections/newest-products",
+    "/catalog",
+    "/ספרים",
+    "/books",
+)
 HOST_PUBLISHERS = {
     "ybook.co.il": "ידיעות ספרים",
     "modan.co.il": "מודן",
@@ -1700,6 +1716,23 @@ def books_match(left: Book, right: Book) -> bool:
             return len(left_title) >= 8 and len(right_title) >= 8
         return authors_match(left_author, right_author)
     return False
+
+
+def assign_listed_matches(pending: list[Book], listed: list[Book]) -> tuple[list[tuple[Book, Book]], list[Book]]:
+    """Pair SISU books to publisher catalog cards. Each listed card is used at most once."""
+    remaining = list(pending)
+    pairs: list[tuple[Book, Book]] = []
+    used: set[int] = set()
+    for listed_book in listed:
+        if id(listed_book) in used:
+            continue
+        hit = next((book for book in remaining if books_match(book, listed_book)), None)
+        if hit is None:
+            continue
+        pairs.append((hit, listed_book))
+        used.add(id(listed_book))
+        remaining = [book for book in remaining if book is not hit]
+    return pairs, remaining
 
 
 def merge_catalog(primary: list[Book], extras: list[Book]) -> int:
@@ -3758,6 +3791,8 @@ class BookCrawler:
         self._duplicate_ids: set[int] = set()
         self._duplicate_updated_ids: set[int] = set()
         self._current_source: SourceStats | None = None
+        self._tls = threading.local()
+        self._report_lock = threading.Lock()
         self.session = requests.Session()
         retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
@@ -3810,10 +3845,38 @@ class BookCrawler:
             },
         )
 
-    def fetch(self, url: str) -> tuple[str, str]:
+    def _in_pool(self) -> bool:
+        return bool(getattr(self._tls, "in_pool", False))
+
+    def _inc_report(self, attr: str, n: int = 1) -> None:
+        with self._report_lock:
+            setattr(self.report, attr, getattr(self.report, attr) + n)
+
+    def _request_session(self) -> requests.Session:
+        if not self._in_pool():
+            return self.session
+        session = getattr(self._tls, "session", None)
+        if session is None:
+            session = requests.Session()
+            retry = Retry(total=1, backoff_factor=0.15, status_forcelist=(429, 502, 503, 504))
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            session.headers.update(self.session.headers)
+            self._tls.session = session
+        return session
+
+    def fetch(self, url: str, timeout: float | tuple[float, float] | None = None) -> tuple[str, str]:
         self._check_cancel()
+        if timeout is None:
+            timeout = getattr(self._tls, "timeout", None)
+        if timeout is None:
+            timeout = self.timeout
+        if self._in_pool() and isinstance(timeout, (int, float)):
+            timeout = (3.05, float(timeout))
+        delay = PUBLISHER_POOL_DELAY if self._in_pool() else self.delay_seconds
         try:
-            response = self.session.get(url, timeout=self.timeout)
+            response = self._request_session().get(url, timeout=timeout)
         except requests.RequestException as exc:
             raise SiteError(request_failure_message(exc, url), url=url) from exc
         html = decode_http_text(response)
@@ -3824,7 +3887,8 @@ class BookCrawler:
             raise SiteError(http_status_message(response.status_code, response.url or url), url=response.url or url)
         path_l = urlparse(url).path.lower()
         if "/api/" not in path_l and not path_l.endswith(".js") and not path_l.endswith("products.json"):
-            time.sleep(self.delay_seconds)
+            if delay:
+                time.sleep(delay)
         return html, response.url
 
     def _evrit_json(self, url: str) -> dict[str, Any] | None:
@@ -3974,16 +4038,17 @@ class BookCrawler:
             elif "/products/" in urlparse(product_url).path.lower():
                 self.apply_shopify_product_json(cached, cached.url or product_url)
                 remember_page_book(cached)
-            self.report.product_cached += 1
+            self._inc_report("product_cached")
             return cached, "", cached.url
         html, resolved = self.fetch(product_url)
         book = extract_book_from_html(html, resolved)
         self.apply_evrit_product_apis(book, resolved or product_url)
         self.apply_shopify_product_json(book, resolved or product_url)
-        self.report.product_fetched += 1
+        self._inc_report("product_fetched")
         if remember and book.title and not is_query_listing_url(resolved):
             remember_page_book(book)
-            save_page_cache()
+            if not self._in_pool():
+                save_page_cache()
         return book, html, resolved
 
     def _book_from_url(self, product_url: str, remember: bool = True) -> Book | None:
@@ -4470,7 +4535,13 @@ class BookCrawler:
             save_page_cache()
         return matched
 
-    def find_matching_product(self, site_url: str, book: Book, try_slugs: bool = False) -> Book | None:
+    def find_matching_product(
+        self,
+        site_url: str,
+        book: Book,
+        try_slugs: bool = False,
+        skip_home: bool = False,
+    ) -> Book | None:
         from book_cache import cached_books_for_host, remember_page_book, save_page_cache
 
         parsed = urlparse(site_url if "://" in site_url else "https://" + site_url)
@@ -4500,18 +4571,19 @@ class BookCrawler:
 
         home_html = ""
         home_url = origin.rstrip("/") + "/"
-        try:
-            home_html, home_url = self.fetch(home_url)
-            seen.add(_url_key(home_url))
-        except SiteError:
-            raise
-        except requests.RequestException:
-            home_html = ""
+        if not skip_home:
+            try:
+                home_html, home_url = self.fetch(home_url)
+                seen.add(_url_key(home_url))
+            except SiteError:
+                raise
+            except requests.RequestException:
+                home_html = ""
 
         def consider(product_url: str, remember: bool) -> Book | None:
             return self._consider_book_page(product_url, book, seen, remember=remember)
 
-        if try_slugs:
+        if try_slugs and not skip_home:
             for product_url in self._slug_urls_for_book(site_url, book):
                 found = consider(product_url, remember=False)
                 if found:
@@ -4528,8 +4600,15 @@ class BookCrawler:
                         self.progress("Opened the matching book page.")
                         return found
         queries = [value for value in (book.isbn, book.display_title(), f"{book.title} {book.author}") if value]
+        if skip_home:
+            queries = [value for value in (book.isbn, book.display_title()) if value]
+        product_limit = 4 if skip_home else 16
+        search_limit = 2 if skip_home else 0
         for query in queries:
-            for search_url in self.search_urls_for_query(site_url, query):
+            search_urls = self.search_urls_for_query(site_url, query)
+            if search_limit:
+                search_urls = search_urls[:search_limit]
+            for search_url in search_urls:
                 key = _url_key(search_url)
                 if key in seen:
                     continue
@@ -4546,7 +4625,7 @@ class BookCrawler:
                         product_urls = [url for url, _title in collect_cover_picture_links(soup, final_url)]
                     if not product_urls:
                         product_urls = collect_product_links(soup, final_url)
-                    for product_url in product_urls[:16]:
+                    for product_url in product_urls[:product_limit]:
                         found = consider(product_url, remember=False)
                         if found:
                             self.progress("Opened the matching book page.")
@@ -4571,27 +4650,527 @@ class BookCrawler:
                     for extra in collect_matching_links(soup, final_url, book):
                         if extra not in product_urls:
                             product_urls.append(extra)
-                for product_url in product_urls[:8]:
+                for product_url in product_urls[: 4 if skip_home else 8]:
                     found = consider(product_url, remember=False)
                     if found:
                         self.progress("Opened the matching book page.")
                         return found
         return None
 
-    def enrich_one_book(self, book: Book) -> list[str]:
+    def _publisher_listing_starts(self, publisher_url: str) -> list[str]:
+        raw = publisher_url.strip()
+        if raw and not raw.startswith(("http://", "https://")):
+            raw = "https://" + raw
+        parsed = urlparse(raw)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        starts: list[str] = []
+        for url in (catalog_listing_url(raw), raw, origin + "/"):
+            value = (url or "").strip()
+            if value and value not in starts:
+                starts.append(value)
+        home = CATALOG_HOME_PATHS.get(site_host(raw), "")
+        if home:
+            if "?" in home:
+                path, query = home.split("?", 1)
+            else:
+                path, query = home, ""
+            extra = urlunparse(parsed._replace(path=path, query=query, fragment=""))
+            if extra not in starts:
+                starts.append(extra)
+        for path in PUBLISHER_CATALOG_PATHS:
+            extra = origin.rstrip("/") + path
+            if extra not in starts:
+                starts.append(extra)
+        return starts
+
+    def _shopify_json_catalog(self, origin: str, api_base: str, max_products: int) -> list[Book] | None:
+        books: list[Book] = []
+        seen: set[str] = set()
+        page = 1
+        take = 250
+        while len(books) < max_products and page < 400:
+            self._check_cancel()
+            payload = self._load_json(f"{api_base}?page={page}&limit={take}")
+            self._inc_report("listing_pages")
+            if not isinstance(payload, dict):
+                return None if page == 1 and not books else books
+            items = payload.get("products")
+            if not isinstance(items, list):
+                return None if page == 1 and not books else books
+            if not items:
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                listed = Book(url="")
+                fill_from_shopify_payload(listed, item, origin, cents=False)
+                listed.refresh_text_fields()
+                if not listed.url or listed.url in seen:
+                    continue
+                seen.add(listed.url)
+                listed.append_scan_log("Found in the publisher catalog feed.")
+                listed.refresh_scan_status()
+                books.append(listed)
+                if len(books) >= max_products:
+                    break
+            if len(items) < take or len(books) >= max_products:
+                break
+            page += 1
+        return books or None
+
+    def _shopify_publisher_listings(self, origin: str, publisher_url: str) -> list[Book]:
+        handle = shopify_collection_handle(publisher_url)
+        bases: list[str] = []
+        if handle:
+            bases.append(f"{origin}/collections/{quote(handle)}/products.json")
+        if is_ybook_host(origin):
+            bases.append(f"{origin}/collections/newest-products/products.json")
+        bases.append(f"{origin}/products.json")
+        bases.append(f"{origin}/collections/all/products.json")
+        seen: set[str] = set()
+        for base in bases:
+            if base in seen:
+                continue
+            seen.add(base)
+            found = self._shopify_json_catalog(origin, base, PUBLISHER_MAX_PRODUCTS)
+            if found:
+                return found
+        return []
+
+    def _html_publisher_listings(self, start_url: str) -> list[Book]:
+        try:
+            html, final_url = self.fetch(start_url)
+            self._inc_report("listing_pages")
+        except SiteError:
+            return []
+        soup = parse_html(html)
+        if is_product_page(soup, final_url):
+            book = extract_book_from_html(html, final_url)
+            self.apply_evrit_product_apis(book, final_url)
+            self.apply_shopify_product_json(book, final_url)
+            return [book] if book.url or book.title else []
+
+        listing_pages = [final_url]
+        visited: set[str] = set()
+        books: list[Book] = []
+        seen: set[str] = set()
+        page_cap = listing_page_cap(PUBLISHER_LISTING_PAGES)
+        known_total = 0
+
+        def take(listed: Book) -> None:
+            url = (listed.url or "").strip()
+            if not url or url in seen or is_asset_url(url) or not same_domain(start_url, url):
+                return
+            seen.add(url)
+            listed.refresh_text_fields()
+            books.append(listed)
+
+        for listing_url in listing_pages:
+            self._check_cancel()
+            if listing_url in visited or len(visited) >= page_cap or len(books) >= PUBLISHER_MAX_PRODUCTS:
+                continue
+            visited.add(listing_url)
+            if listing_url != final_url:
+                try:
+                    html, listing_url = self.fetch(listing_url)
+                    self._inc_report("listing_pages")
+                    soup = parse_html(html)
+                except SiteError:
+                    self._inc_report("listing_failed")
+                    continue
+            discovered = last_listing_page(soup, listing_url)
+            if discovered > known_total:
+                known_total = discovered
+            page_n = len(visited)
+            if known_total:
+                self.progress(f"Reading publisher catalog page {page_n} of {known_total}…")
+            else:
+                self.progress(f"Reading publisher catalog page {page_n}…")
+            listed_books = collect_listing_books(soup, listing_url)
+            if listed_books:
+                for listed in listed_books:
+                    take(listed)
+            else:
+                for product_url, listing_title in collect_product_entries(soup, listing_url):
+                    take(Book(url=product_url, title=listing_title))
+            next_cap = min(page_cap, known_total) if known_total else page_cap
+            if len(visited) < next_cap:
+                for page_url in collect_pagination_links(soup, listing_url, next_cap):
+                    if same_domain(start_url, page_url) and page_url not in listing_pages:
+                        listing_pages.append(page_url)
+            if len(books) >= PUBLISHER_MAX_PRODUCTS:
+                break
+        return books
+
+    def _list_publisher_catalog(self, publisher_url: str) -> list[Book]:
+        parsed = urlparse(publisher_url if "://" in publisher_url else "https://" + publisher_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        shopify = self._shopify_publisher_listings(origin, publisher_url)
+        if shopify:
+            host = site_display_name(origin)
+            self.progress(f"Read {len(shopify):,} book(s) from the {host} catalog feed.")
+            return shopify
+        best: list[Book] = []
+        for start in self._publisher_listing_starts(publisher_url):
+            self._check_cancel()
+            found = self._html_publisher_listings(start)
+            if len(found) > len(best):
+                best = found
+            if len(best) >= 8:
+                break
+        return best
+
+    def _pool_fetch_page(self, url: str) -> Book | None:
+        self._tls.in_pool = True
+        try:
+            if self.cancelled():
+                return None
+            book, _html, _resolved = self._book_and_html(url, remember=True)
+            return book
+        except CrawlCancelled:
+            return None
+        except (SiteError, requests.RequestException):
+            return None
+        finally:
+            self._tls.in_pool = False
+
+    def _with_publisher_pool(self, work: Callable[[], Any]) -> Any:
+        outer = self.progress
+
+        def gated(msg: str) -> None:
+            if self._in_pool():
+                return
+            outer(msg)
+
+        self.progress = gated
+        try:
+            return work()
+        finally:
+            self.progress = outer
+
+    def _apply_publisher_page(self, book: Book, match: Book | None, publisher_url: str, host: str) -> list[str]:
+        def note_msg(msg: str) -> None:
+            book.append_scan_log(msg)
+            self.progress(msg)
+
+        if match is None:
+            note = f"No matching book page found on {host}."
+            note_msg(note)
+            book.mark_publisher_lookup(publisher_url, note=note)
+            book.refresh_scan_status()
+            return []
+        added = book.merge_missing(match)
+        findings = match.publisher_found_fields() or match._load_field_rows("found_fields")
+        if findings:
+            book.extra["publisher_found"] = json.dumps(findings, ensure_ascii=False)
+            note_msg("Fields found on the publisher book page:")
+            for item in findings:
+                mapped = item.get("field") or "not mapped"
+                note_msg(f"  {item['label']}: {item['value']}  [{mapped}]")
+        stats = self._current_source
+        if stats is not None and stats.kind == "publisher" and added:
+            stats.publisher_updated += 1
+        if added:
+            note = f"New from {host}: {', '.join(added)}"
+            note_msg(note)
+            self._inc_report("enriched")
+        else:
+            note = f"Found the book on {host}, but every fillable field was already set."
+            note_msg(note)
+        if match.url:
+            note_msg(f"Publisher book page: {match.url}")
+        book.mark_publisher_lookup(publisher_url, page=match.url, filled=added, note=note)
+        book.refresh_scan_status()
+        return added
+
+    def _notify_publisher_book(
+        self,
+        book: Book,
+        filled: list[str],
+        on_book: Callable[[int, int, Book, list[str]], None] | None,
+        counter: list[int],
+        total: int,
+    ) -> None:
+        counter[0] += 1
+        if on_book:
+            on_book(counter[0], total, book, filled)
+
+    def _fetch_matched_pages_parallel(
+        self,
+        jobs: list[tuple[Book, str]],
+        publisher_url: str,
+        host: str,
+        on_book: Callable[[int, int, Book, list[str]], None] | None,
+        counter: list[int],
+        total: int,
+    ) -> int:
+        if not jobs:
+            return 0
+        updated = 0
+        workers = min(PUBLISHER_WORKERS, len(jobs))
+
+        def run() -> None:
+            nonlocal updated
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sisu-pub") as pool:
+                futures = {pool.submit(self._pool_fetch_page, url): book for book, url in jobs}
+                done = 0
+                for fut in as_completed(futures):
+                    self._check_cancel()
+                    book = futures[fut]
+                    try:
+                        match = fut.result()
+                    except CrawlCancelled:
+                        raise
+                    except Exception:
+                        match = None
+                    done += 1
+                    self.progress(f"Opened publisher book {done} of {len(jobs)} on {host}: {book.display_title()}")
+                    filled = self._apply_publisher_page(book, match, publisher_url, host)
+                    if filled:
+                        updated += 1
+                    self._notify_publisher_book(book, filled, on_book, counter, total)
+
+        self._with_publisher_pool(run)
+        return updated
+
+    def _browse_catalog_for_leftovers(
+        self,
+        urls: list[str],
+        leftover: list[Book],
+        publisher_url: str,
+        host: str,
+        on_book: Callable[[int, int, Book, list[str]], None] | None,
+        counter: list[int],
+        total: int,
+    ) -> int:
+        remaining = list(leftover)
+        if not urls or not remaining:
+            return 0
+        updated = 0
+        queue = list(dict.fromkeys(url for url in urls if url))
+        workers = min(PUBLISHER_WORKERS, len(queue))
+        finished_ids: set[int] = set()
+
+        def run() -> None:
+            nonlocal updated
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sisu-pub") as pool:
+                in_flight: dict[Any, str] = {}
+
+                def submit_one() -> None:
+                    if not queue or not remaining:
+                        return
+                    url = queue.pop(0)
+                    in_flight[pool.submit(self._pool_fetch_page, url)] = url
+
+                for _ in range(min(workers, len(queue))):
+                    submit_one()
+                opened = 0
+                while in_flight:
+                    self._check_cancel()
+                    done, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        in_flight.pop(fut, None)
+                        try:
+                            page = fut.result()
+                        except Exception:
+                            page = None
+                        opened += 1
+                        if page and remaining:
+                            hit = next((book for book in remaining if books_match(book, page)), None)
+                            if hit is not None:
+                                filled = self._apply_publisher_page(hit, page, publisher_url, host)
+                                remaining[:] = [book for book in remaining if book is not hit]
+                                finished_ids.add(id(hit))
+                                if filled:
+                                    updated += 1
+                                self._notify_publisher_book(hit, filled, on_book, counter, total)
+                        self.progress(
+                            f"Browsed {opened} publisher catalog page(s) on {host}; "
+                            f"{len(remaining)} book(s) still unmatched."
+                        )
+                        if remaining:
+                            submit_one()
+
+        self._with_publisher_pool(run)
+        leftover[:] = [book for book in leftover if id(book) not in finished_ids]
+        return updated
+
+    def _search_leftovers_parallel(
+        self,
+        leftover: list[Book],
+        publisher_url: str,
+        host: str,
+        on_book: Callable[[int, int, Book, list[str]], None] | None,
+        counter: list[int],
+        total: int,
+    ) -> int:
+        if not leftover:
+            return 0
+        updated = 0
+        workers = min(PUBLISHER_WORKERS, len(leftover))
+
+        def search_one(book: Book) -> tuple[Book, Book | None]:
+            self._tls.in_pool = True
+            self._tls.timeout = PUBLISHER_GUESS_TIMEOUT
+            try:
+                if self.cancelled():
+                    return book, None
+                match = self.find_matching_product(publisher_url, book, try_slugs=False, skip_home=True)
+                return book, match
+            except CrawlCancelled:
+                return book, None
+            except (SiteError, requests.RequestException):
+                return book, None
+            finally:
+                self._tls.in_pool = False
+                self._tls.timeout = None
+
+        def run() -> None:
+            nonlocal updated
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sisu-pub") as pool:
+                futures = {pool.submit(search_one, book): book for book in leftover}
+                done = 0
+                for fut in as_completed(futures):
+                    self._check_cancel()
+                    book = futures[fut]
+                    try:
+                        _book, match = fut.result()
+                    except Exception:
+                        match = None
+                    done += 1
+                    self.progress(
+                        f"Leftover search {done} of {len(leftover)} on {host}: {book.display_title()}"
+                    )
+                    filled = self._apply_publisher_page(book, match, publisher_url, host)
+                    if filled:
+                        updated += 1
+                    self._notify_publisher_book(book, filled, on_book, counter, total)
+
+        self._with_publisher_pool(run)
+        return updated
+
+    def _enrich_publisher_group(
+        self,
+        books: list[Book],
+        publisher_url: str,
+        on_book: Callable[[int, int, Book, list[str]], None] | None,
+        counter: list[int],
+        total: int,
+    ) -> int:
+        host = urlparse(publisher_url).netloc
+        site_name = site_display_name(publisher_url)
+        stats = self._current_source
+        if stats is not None and stats.kind == "publisher":
+            stats.publisher_checked += len(books)
+            stats.url = publisher_url or stats.url
+            if not stats.name or stats.name == "Publisher sites":
+                stats.name = site_name or host
+        pending = [book for book in books if book.missing_fields()]
+        for book in pending:
+            book.mark_publisher_lookup(publisher_url, note=f"Looking on {host}…")
+        for book in books:
+            if book.missing_fields():
+                continue
+            self._notify_publisher_book(book, [], on_book, counter, total)
+        if not pending:
+            return 0
+
+        self.progress(f"Opening the {host} catalog for {len(pending)} book(s)…")
+        listed: list[Book] = []
+        try:
+            listed = self._list_publisher_catalog(publisher_url)
+        except CrawlCancelled:
+            raise
+        except SiteError as exc:
+            self.progress(str(exc))
+        if listed:
+            self.progress(f"Listed {len(listed):,} book(s) from {host}. Matching the current list…")
+
+        pairs, unmatched = assign_listed_matches(pending, listed)
+        updated = 0
+        fetch_jobs: list[tuple[Book, str]] = []
+        handled: set[int] = set()
+        for book, listed_book in pairs:
+            book.merge_missing(listed_book)
+            if listed_book.url:
+                book.extra["publisher_page"] = listed_book.url
+            if listed_book.url and book.missing_fields():
+                fetch_jobs.append((book, listed_book.url))
+                continue
+            filled = self._apply_publisher_page(book, listed_book, publisher_url, host)
+            handled.add(id(book))
+            if filled:
+                updated += 1
+            self._notify_publisher_book(book, filled, on_book, counter, total)
+
+        still = [(book, url) for book, url in fetch_jobs if id(book) not in handled]
+        if still:
+            self.progress(
+                f"Opening {len(still)} matching book page(s) on {host} "
+                f"({min(PUBLISHER_WORKERS, len(still))} at a time)…"
+            )
+            updated += self._fetch_matched_pages_parallel(still, publisher_url, host, on_book, counter, total)
+            handled.update(id(book) for book, _url in still)
+
+        leftover = [book for book in unmatched if id(book) not in handled and book.missing_fields()]
+        fetched_urls = {url for _book, url in still}
+        untitled_urls = [
+            listed_book.url
+            for listed_book in listed
+            if (listed_book.url or "").strip()
+            and not (listed_book.title or "").strip()
+            and listed_book.url not in fetched_urls
+        ]
+        if leftover and untitled_urls:
+            self.progress(
+                f"Catalog cards on {host} had no titles. "
+                f"Opening pages in parallel to find the remaining {len(leftover)} book(s)…"
+            )
+            updated += self._browse_catalog_for_leftovers(
+                untitled_urls[:PUBLISHER_UNTITLED_FETCH_CAP],
+                leftover,
+                publisher_url,
+                host,
+                on_book,
+                counter,
+                total,
+            )
+            leftover = [book for book in leftover if book.missing_fields()]
+
+        if leftover:
+            self.progress(f"Searching {len(leftover)} leftover book(s) on {host} by ISBN or title…")
+            updated += self._search_leftovers_parallel(leftover, publisher_url, host, on_book, counter, total)
+        return updated
+
+    def enrich_publisher_books(
+        self,
+        books: list[Book],
+        on_book: Callable[[int, int, Book, list[str]], None] | None = None,
+    ) -> int:
         from publisher_sites import resolve_publisher_site
 
-        filled: list[str] = []
-        previous = self.progress
-
-        def progress(msg: str) -> None:
-            book.append_scan_log(msg)
-            previous(msg)
-
-        self.progress = progress
-        try:
-            publisher_url = resolve_publisher_site(book.publisher)
+        prev_timeout = self.timeout
+        prev_delay = self.delay_seconds
+        self.timeout = PUBLISHER_FETCH_TIMEOUT
+        self.delay_seconds = PUBLISHER_POOL_DELAY
+        counter = [0]
+        updated = 0
+        titled = [book for book in books if (book.title or "").strip()]
+        total = len(titled)
+        groups: dict[str, list[Book]] = {}
+        order: list[str] = []
+        no_site: list[Book] = []
+        for book in titled:
+            publisher_url = resolve_publisher_site(book.publisher) or ""
             if not publisher_url:
+                no_site.append(book)
+                continue
+            if publisher_url not in groups:
+                groups[publisher_url] = []
+                order.append(publisher_url)
+            groups[publisher_url].append(book)
+        try:
+            for book in no_site:
                 note = (
                     f"No publisher website is known for {book.publisher}."
                     if book.publisher
@@ -4600,58 +5179,32 @@ class BookCrawler:
                 self.progress(note)
                 book.mark_publisher_lookup("", note=note)
                 book.refresh_scan_status()
-                return filled
-            host = urlparse(publisher_url).netloc
-            book.mark_publisher_lookup(publisher_url, note=f"Looking on {host}…")
-            self.progress(f"Looking on the publisher site {host} for “{book.display_title()}”…")
-            stats = self._current_source
-            if stats is not None and stats.kind == "publisher":
-                stats.publisher_checked += 1
-            try:
-                match = self.find_matching_product(publisher_url, book, try_slugs=True)
-            except CrawlCancelled:
-                raise
-            except SiteError as exc:
-                note = str(exc)
-                self.progress(note)
-                book.mark_publisher_lookup(publisher_url, note=note, error=True)
-                return filled
-            except requests.RequestException as exc:
-                note = request_failure_message(exc, publisher_url)
-                self.progress(note)
-                book.mark_publisher_lookup(publisher_url, note=note, error=True)
-                return filled
-            if not match:
-                note = f"No matching book page found on {host}."
-                self.progress(note)
-                book.mark_publisher_lookup(publisher_url, note=note)
-                book.refresh_scan_status()
-                return filled
-            added = book.merge_missing(match)
-            findings = match.publisher_found_fields() or match._load_field_rows("found_fields")
-            if findings:
-                book.extra["publisher_found"] = json.dumps(findings, ensure_ascii=False)
-                self.progress("Fields found on the publisher book page:")
-                for item in findings:
-                    mapped = item.get("field") or "not mapped"
-                    self.progress(f"  {item['label']}: {item['value']}  [{mapped}]")
-            stats = self._current_source
-            if stats is not None and stats.kind == "publisher" and added:
-                stats.publisher_updated += 1
-            if added:
-                note = f"New from {host}: {', '.join(added)}"
-                self.progress(note)
-                self.report.enriched += 1
-            else:
-                note = f"Found the book on {host}, but every fillable field was already set."
-                self.progress(note)
-            if match.url:
-                self.progress(f"Publisher book page: {match.url}")
-            book.mark_publisher_lookup(publisher_url, page=match.url, filled=added, note=note)
-            book.refresh_scan_status()
-            return added
+                self._notify_publisher_book(book, [], on_book, counter, total)
+            for publisher_url in order:
+                self._check_cancel()
+                updated += self._enrich_publisher_group(
+                    groups[publisher_url],
+                    publisher_url,
+                    on_book,
+                    counter,
+                    total,
+                )
+            return updated
         finally:
-            self.progress = previous
+            self.timeout = prev_timeout
+            self.delay_seconds = prev_delay
+            _safe_flush_scan_files()
+
+    def enrich_one_book(self, book: Book) -> list[str]:
+        filled: list[str] = []
+
+        def on_book(_index: int, _total: int, item: Book, added: list[str]) -> None:
+            if item is book:
+                filled.clear()
+                filled.extend(added)
+
+        self.enrich_publisher_books([book], on_book=on_book)
+        return filled
 
     def enrich_books(self, books: list[Book], extra_urls: list[str], max_searches: int = 24) -> int:
         from book_cache import cached_books_for_host
@@ -4743,24 +5296,17 @@ class BookCrawler:
             and not (book.extra.get("publisher_page") or "").strip()
             and book.missing_fields()
         ]
-        filled = 0
-        total = len(pending)
+        if not pending:
+            return 0
         started = time.perf_counter()
         pub_stats = SourceStats(name="Publisher sites", kind="publisher")
         previous = self._current_source
         self._current_source = pub_stats
         try:
-            for index, book in enumerate(pending, start=1):
-                self._check_cancel()
+            def on_book(index: int, total: int, book: Book, _added: list[str]) -> None:
                 publisher_url = resolve_publisher_site(book.publisher) or ""
                 host = urlparse(publisher_url).netloc
                 site_name = site_display_name(publisher_url) if publisher_url else host
-                if host and pub_stats.name == "Publisher sites":
-                    pub_stats.name = site_name or host
-                    pub_stats.url = publisher_url
-                self.progress(
-                    f"Filling publisher details {index} of {total} on {host}: {book.display_title()}"
-                )
                 self._emit("site", {"url": publisher_url, "name": site_name or host, "index": index, "total": total})
                 self._emit(
                     "fill",
@@ -4773,7 +5319,6 @@ class BookCrawler:
                         "url": publisher_url,
                     },
                 )
-                added = self.enrich_one_book(book)
                 self._emit(
                     "book",
                     {
@@ -4784,8 +5329,8 @@ class BookCrawler:
                         "url": publisher_url,
                     },
                 )
-                if added:
-                    filled += 1
+
+            return self.enrich_publisher_books(pending, on_book=on_book)
         finally:
             pub_stats.seconds = time.perf_counter() - started
             self.report.elapsed_publisher += pub_stats.seconds
@@ -4793,7 +5338,6 @@ class BookCrawler:
                 self.report.source_stats.append(pub_stats)
                 self.progress(pub_stats.line())
             self._current_source = previous
-        return filled
 
     def _finish_duplicate_stats(self, books: list[Book], started_with: int, notes: list[str]) -> None:
         cleanup = dedupe_book_list(books)
