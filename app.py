@@ -1088,7 +1088,6 @@ class BookCatalogApp(tk.Tk):
                 selected = [str(row.get("url") or "") for row in self._site_rows if row.get("var") and bool(row["var"].get())]
             else:
                 selected = enabled_search_urls() or all_search_urls()
-        selected_keys = {self._search_site_key(url) for url in selected if self._search_site_key(url)}
         for child in inner.winfo_children():
             child.destroy()
         self._site_rows = []
@@ -1096,6 +1095,7 @@ class BookCatalogApp(tk.Tk):
             catalog = search_sites()
         if catalog is None:
             catalog = []
+        selected_keys = self._catalog_selection_keys(selected, catalog)
         for item in catalog:
             url = self._canonical_search_url(str(item.get("url") or ""))
             if not url:
@@ -1206,28 +1206,49 @@ class BookCatalogApp(tk.Tk):
         if updated:
             update_search_sites(updated)
 
+    def _catalog_selection_keys(self, selected: list[str], catalog: list[dict]) -> set[str]:
+        """Match list URLs onto catalog rows. An edited site keeps the old row's check."""
+        catalog_entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in catalog:
+            url = self._canonical_search_url(str(item.get("url") or ""))
+            key = self._search_site_key(url)
+            if not url or not key or key in seen:
+                continue
+            seen.add(key)
+            catalog_entries.append((key, site_host(url)))
+        known = {key for key, _host in catalog_entries}
+        keys: set[str] = set()
+        for raw in selected:
+            key = self._search_site_key(raw)
+            if key in known:
+                keys.add(key)
+                continue
+            host = site_host(self._canonical_search_url(raw) or str(raw or ""))
+            matches = [entry_key for entry_key, entry_host in catalog_entries if host and entry_host == host]
+            if len(matches) == 1:
+                keys.add(matches[0])
+        return keys
+
     def _ingest_payload_sites(self, urls: list[str]) -> None:
+        del urls
         catalog = search_sites()
-        known = {self._search_site_key(str(item.get("url") or "")) for item in catalog}
-        added = False
-        for raw in urls:
+        canonical: list[dict] = []
+        seen: set[str] = set()
+        changed = False
+        for item in catalog:
+            raw = str(item.get("url") or "")
             url = self._canonical_search_url(raw)
             key = self._search_site_key(url)
-            if not url or not key or key in known:
+            if not url or not key or key in seen:
+                if raw or url:
+                    changed = True
                 continue
-            catalog.append({"url": url, "enabled": True})
-            known.add(key)
-            added = True
-        if added or any(self._canonical_search_url(str(item.get("url") or "")) != str(item.get("url") or "") for item in catalog):
-            canonical = []
-            seen: set[str] = set()
-            for item in catalog:
-                url = self._canonical_search_url(str(item.get("url") or ""))
-                key = self._search_site_key(url)
-                if not url or not key or key in seen:
-                    continue
-                seen.add(key)
-                canonical.append({"url": url, "enabled": bool(item.get("enabled", True))})
+            seen.add(key)
+            if url != raw:
+                changed = True
+            canonical.append({"url": url, "enabled": bool(item.get("enabled", True))})
+        if changed:
             update_search_sites(canonical)
 
     def _current_publishers(self) -> list[str]:
@@ -1367,12 +1388,14 @@ class BookCatalogApp(tk.Tk):
         site_wrap.pack(fill="both", expand=True, pady=(8, 6))
         site_inner = _settings_scroll_table(site_wrap, columns=(0,))
         site_vars: list[tk.StringVar] = []
+        original_site_urls: list[str] = []
 
         def _fill_site_rows(urls: list[str], focus_last: bool = False) -> None:
             _suspend_settings_table(site_inner, True)
             for child in site_inner.winfo_children():
                 child.destroy()
             site_vars.clear()
+            original_site_urls[:] = list(urls)
             ttk.Label(site_inner, text="Catalog URL", font=("Segoe UI", 9, "bold")).grid(
                 row=0, column=0, sticky="w"
             )
@@ -1974,13 +1997,16 @@ class BookCatalogApp(tk.Tk):
                 previous_enabled[self._search_site_key(str(row.get("url") or ""))] = bool(row["var"].get())
             sites: list[dict] = []
             seen_sites: set[str] = set()
-            for var in site_vars:
+            for index, var in enumerate(site_vars):
                 url = self._canonical_search_url(var.get())
                 key = self._search_site_key(url)
                 if not url or not key or key in seen_sites:
                     continue
                 seen_sites.add(key)
-                sites.append({"url": url, "enabled": previous_enabled.get(key, True)})
+                old_url = original_site_urls[index] if index < len(original_site_urls) else ""
+                old_key = self._search_site_key(old_url)
+                enabled = previous_enabled.get(old_key, True) if old_key else True
+                sites.append({"url": url, "enabled": enabled})
             try:
                 llm_fields = _llm_fields()
             except ValueError as exc:
