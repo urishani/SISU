@@ -74,9 +74,14 @@ CORE_FIELDS = {
     "year",
     "pages",
     "isbn",
+    "isbn_old",
     "danacode",
+    "cat_number",
     "upc",
     "cover_type",
+    "item_type",
+    "language",
+    "translated",
     "weight_kg",
     "height_cm",
     "width_cm",
@@ -198,14 +203,32 @@ def isolate_language(value: str | None) -> str:
     return text
 
 
+COVER_DISPLAY = {
+    "S": "Soft",
+    "H": "Hard",
+    "BB": "Board",
+    "E": "Electronic",
+}
+
+
 def cover_code(text: str | None) -> str:
     compact = normalize_label(text or "")
     if compact:
         mapped = load_cover_values().get(compact)
         if mapped:
             return mapped
+        if compact.upper() in COVER_DISPLAY:
+            return compact.upper()
+        for code, label in COVER_DISPLAY.items():
+            if compact == normalize_label(label):
+                return code
     value = (text or "").lower().strip()
     hebrew = (text or "").strip()
+    if any(
+        token in value
+        for token in ("ebook", "e-book", "e book", "electronic", "kindle", "epub")
+    ) or "אלקטרונ" in hebrew or "דיגיטל" in hebrew:
+        return "E"
     if hebrew in {"רכה", "רך", "כריכה רכה"} or "כריכה רכה" in hebrew or any(
         word in value for word in ("paperback", "softcover", "soft cover")
     ):
@@ -217,6 +240,14 @@ def cover_code(text: str | None) -> str:
     if "board book" in value or "קרטון" in hebrew:
         return "BB"
     return ""
+
+
+def format_cover_type(text: str | None) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    code = cover_code(raw) or raw.upper()
+    return COVER_DISPLAY.get(code) or COVER_DISPLAY.get(raw.upper()) or raw
 
 
 def reload_aliases() -> None:
@@ -302,6 +333,10 @@ def apply_field(book: Any, field: str, value: str) -> bool:
         return bool(book.author)
     if field in {"author_en", "author_he"}:
         formatted = format_person_name(value, hebrew=(field == "author_he")) or value
+        if formatted and empty(field):
+            setattr(book, field, formatted)
+            book.set_captured(field, formatted)
+            return True
         captured = book.captured_fields()
         if formatted and not captured.get(field):
             book.set_captured(field, formatted)
@@ -327,6 +362,16 @@ def apply_field(book: Any, field: str, value: str) -> bool:
         from book_crawler import remember_danacode
 
         return bool(remember_danacode(book, value))
+    if field in {"cat_number", "danacode_short"}:
+        digits = re.sub(r"\D", "", value)
+        long_code = re.sub(r"\D", "", getattr(book, "danacode", "") or "")
+        code = digits or value
+        if not code or (digits and digits == long_code) or not empty("cat_number"):
+            return False
+        book.cat_number = code
+        book.extra["danacode_short"] = digits or code
+        book.set_captured("cat_number", digits or code)
+        return True
     if field == "upc" and empty("upc"):
         book.upc = re.sub(r"\D", "", value)
         return bool(book.upc)
@@ -398,18 +443,28 @@ def apply_field(book: Any, field: str, value: str) -> bool:
         value = isolate_language(value)
         if not value:
             return False
+        if empty("language"):
+            book.language = value
         captured = book.captured_fields()
         current = captured.get("language") or ""
         cleaned = isolate_language(current)
-        if current and current == cleaned:
-            return False
+        if current and current == cleaned and not empty("language"):
+            return bool(book.language)
         captured["language"] = value
         book._save_map("captured", captured)
+        return True
+    from book_crawler import STORED_CATALOG_FIELDS
+
+    if field in STORED_CATALOG_FIELDS and empty(field) and field not in {"cat_number", "language"}:
+        setattr(book, field, value)
+        book.set_captured(field, value)
         return True
     if field in EXCEL_TARGETS and field not in CORE_FIELDS:
         captured = book.captured_fields()
         if value and not captured.get(field):
             book.set_captured(field, value)
+            if field in STORED_CATALOG_FIELDS and empty(field):
+                setattr(book, field, value)
             return True
     return False
 

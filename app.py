@@ -61,7 +61,7 @@ from book_crawler import (
 )
 from book_table import ROW_STATUSES, BookTable
 from catalog_excel import CatalogWorkbook, ensure_list_workbook, list_excel_filename
-from field_map import ALIASES_PATH, EXCEL_TARGETS, reload_aliases, write_field_report
+from field_map import ALIASES_PATH, EXCEL_TARGETS, format_cover_type, reload_aliases, write_field_report
 from hebrew_view import HebrewDescription
 from publisher_sites import publishers_match, resolve_publisher_site
 from scanner_registry import attach_book, attach_books, persist_book_state
@@ -4296,38 +4296,70 @@ class BookCatalogApp(tk.Tk):
         add_field("title_phonetic", "Title (phonetics)", title_phonetic)
         shown.update({"title", "title_he", "title_en", "title_phonetic"})
 
+        def field_value(key: str) -> str:
+            value = fields.get(key, "") if key else ""
+            if not value:
+                value = captured.get(key, "")
+            if key == "cat_number":
+                value = book.danacode_short() or value
+            if key == "cover_type":
+                return format_cover_type(value or book.cover_type)
+            if key == "price_ils":
+                return format_price(value)
+            if key == "language":
+                from field_map import isolate_language
+
+                return isolate_language(value or book.language)
+            return value
+
+        core_details = (
+            ("publisher", "Publisher"),
+            ("author_he", "Author (Hebrew)"),
+            ("author_en", "Author (English)"),
+            ("isbn", "ISBN"),
+            ("isbn_old", "ISBN (old)"),
+            ("danacode", "Danacode (long)"),
+            ("cat_number", "Danacode (short)"),
+            ("upc", "UPC"),
+            ("year", "Copyright year"),
+            ("pages", "Number of pages"),
+            ("cover_type", "Cover type"),
+            ("item_type", "Item type"),
+            ("language", "Language"),
+            ("translated", "Translated"),
+            ("price_ils", "Israeli price (Shekel)"),
+        )
+        for key, label in core_details:
+            add_field(key, label, field_value(key))
+            shown.add(key)
+
         columns = self.excel_columns or []
         if columns:
             for col in columns:
                 field = col.get("field") or ""
                 header = str(col.get("header") or "")
-                if field in {"description_he", "scanner_id", "title", "title_he", "title_en", "title_phonetic"}:
-                    shown.add(field)
+                if field in shown or field in {"description_he", "scanner_id", "title", "title_he", "title_en", "title_phonetic"}:
+                    if field:
+                        shown.add(field)
                     continue
-                value = fields.get(field, "") if field else ""
-                if not value and field:
-                    value = captured.get(field, "")
-                if field == "price_ils":
-                    value = format_price(value)
-                if field == "language":
-                    from field_map import isolate_language
-
-                    value = isolate_language(value)
+                value = field_value(field) if field else ""
+                if field == "danacode":
+                    header = "Danacode (long)"
+                if field == "cat_number":
+                    header = "Danacode (short)"
+                if field == "cover_type":
+                    header = "Cover type"
                 add_field(field or header, header, value)
                 if field:
                     shown.add(field)
-        else:
-            add_field("publisher", "Publisher", fields.get("publisher", ""))
-            add_field("isbn", "ISBN", fields.get("isbn", ""))
-            add_field("year", "Copyright year", fields.get("year", ""))
-            add_field("pages", "Number of pages", fields.get("pages", ""))
-            add_field("price_ils", "Israeli price (Shekel)", format_price(fields.get("price_ils", "")))
         extra_rows: list[tuple[str, str, str]] = []
         for col in self.excel_all_columns:
             field = col.get("field") or ""
             if col.get("colored") or not field or field in shown:
                 continue
             value = fields.get(field) or captured.get(field) or ""
+            if field == "cover_type":
+                value = format_cover_type(value or book.cover_type)
             if field == "language":
                 from field_map import isolate_language
 
@@ -4351,9 +4383,15 @@ class BookCatalogApp(tk.Tk):
         if short and "cat_number" not in shown:
             extra_rows.append(("cat_number", "Danacode (short)", short))
             shown.add("cat_number")
+        if book.danacode and "danacode" not in shown:
+            extra_rows.append(("danacode", "Danacode (long)", book.danacode))
+            shown.add("danacode")
         if extra_rows:
             self._add_detail_section("Other catalog fields")
             for key, header, value in extra_rows:
+                if key == "cover_type":
+                    header = "Cover type"
+                    value = format_cover_type(value)
                 add_field(key, header, value)
 
         leftover = book.unmatched_page_fields()
@@ -4845,6 +4883,7 @@ class BookCatalogApp(tk.Tk):
             self.work_hint.set(f"{checking_count:,} / {total_count:,}")
 
     def _prepare_one_book(self, book: Book) -> None:
+        book.hydrate_catalog_fields()
         book.refresh_text_fields()
         book.stamp_created()
         if book.author:

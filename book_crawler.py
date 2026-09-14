@@ -268,6 +268,30 @@ FILLABLE_FIELDS = (
     "marc",
     "ddc",
 )
+# Catalog columns SISU used to keep only in extra/captured — now first-class book fields.
+STORED_CATALOG_FIELDS = (
+    "cat_number",
+    "isbn_old",
+    "item_type",
+    "language",
+    "translated",
+    "spine_color",
+    "supplier",
+    "catalog_mom",
+    "category",
+    "category2",
+    "category3",
+    "keywords",
+    "comments",
+    "description_en",
+    "author_en",
+    "author_he",
+    "weight_lb",
+    "weight_oz",
+    "height_in",
+    "width_in",
+    "thickness_in",
+)
 LABEL_MAP: dict[str, tuple[str, ...]] = {
     "publisher": ("publisher", "הוצאה", "הוצאה לאור", "מוציא לאור", "הוצאת", "manufacturer"),
     "author": (
@@ -659,6 +683,14 @@ def fill_from_evrit_payload(book: Book, item: dict[str, Any]) -> None:
     price, kind = evrit_preferred_price(_evrit_pricing_block(item))
     if price and (kind == "print" or not book.price_ils):
         book.price_ils = price
+    if not book.cover_type:
+        for key in ("CoverType", "Binding", "BookFormat", "Format", "ProductFormat"):
+            mapped = map_cover(str(item.get(key) or ""))
+            if mapped:
+                book.cover_type = mapped
+                break
+        if not book.cover_type and kind == "digital":
+            book.cover_type = "E"
     if not book.description:
         book.description = _plain_markup_text(item.get("ShortDescription") or item.get("LongDescription") or "")
     image = evrit_image_url(item.get("ProductImage") or item.get("Image"))
@@ -724,6 +756,27 @@ class Book:
     illustrator: str = ""
     marc: str = ""
     ddc: str = ""
+    cat_number: str = ""
+    isbn_old: str = ""
+    item_type: str = ""
+    language: str = ""
+    translated: str = ""
+    spine_color: str = ""
+    supplier: str = ""
+    catalog_mom: str = ""
+    category: str = ""
+    category2: str = ""
+    category3: str = ""
+    keywords: str = ""
+    comments: str = ""
+    description_en: str = ""
+    author_en: str = ""
+    author_he: str = ""
+    weight_lb: str = ""
+    weight_oz: str = ""
+    height_in: str = ""
+    width_in: str = ""
+    thickness_in: str = ""
     extra: dict[str, str] = field(default_factory=dict)
     scanner_id: str = ""
     scan_status: str = ""
@@ -746,6 +799,7 @@ class Book:
         extra = data.get("extra") or {}
         if isinstance(extra, dict):
             book.extra = {str(key): str(value) for key, value in extra.items()}
+        book.hydrate_catalog_fields()
         return book
 
     def stamp_created(self, when: str = "") -> None:
@@ -1038,8 +1092,17 @@ class Book:
     def merge_missing(self, other: "Book", *, stamp: bool = True) -> list[str]:
         filled: list[str] = []
         filled.extend(remember_danacode(self, other.danacode, other.field_source_url("danacode") or other.url))
-        for name in FILLABLE_FIELDS:
-            if name == "danacode":
+        incoming_short = other.danacode_short() or str(other.cat_number or "").strip()
+        if incoming_short and not self.danacode_short():
+            digits = re.sub(r"\D", "", incoming_short)
+            long_code = re.sub(r"\D", "", self.danacode or "")
+            if digits and digits != long_code:
+                self.cat_number = digits
+                self.extra["danacode_short"] = digits
+                filled.append("cat_number")
+                self.record_field_source("cat_number", other.field_source_url("cat_number") or other.url)
+        for name in (*FILLABLE_FIELDS, *STORED_CATALOG_FIELDS):
+            if name in {"danacode", "cat_number"}:
                 continue
             current = str(getattr(self, name, "") or "").strip()
             incoming = str(getattr(other, name, "") or "").strip()
@@ -1083,6 +1146,7 @@ class Book:
                 self.record_field_source(name, other.field_source_url(name) or other.url)
         if captured:
             self._save_map("captured", captured)
+        self.hydrate_catalog_fields()
         captured_ph = str(captured.get("title_phonetic") or "").strip()
         current_ph = str(self.title_phonetic or "").strip()
         if (not current_ph or has_hebrew(current_ph)) and captured_ph and not has_hebrew(captured_ph):
@@ -1132,16 +1196,41 @@ class Book:
             return rows
         return self._load_field_rows("found_fields")
 
+    def hydrate_catalog_fields(self) -> None:
+        """Lift Dana codes and other catalog columns out of extra/captured onto the book."""
+        captured = self.captured_fields()
+        extra = self.extra or {}
+        if not str(self.cat_number or "").strip():
+            self.cat_number = str(
+                extra.get("danacode_short") or captured.get("cat_number") or extra.get("cat_number") or ""
+            ).strip()
+        if not str(self.description_en or "").strip():
+            self.description_en = str(captured.get("description_en") or "").strip()
+        for name in STORED_CATALOG_FIELDS:
+            if name == "cat_number":
+                continue
+            if str(getattr(self, name, "") or "").strip():
+                continue
+            incoming = str(captured.get(name) or extra.get(name) or "").strip()
+            if name == "language":
+                from field_map import isolate_language
+
+                incoming = isolate_language(incoming)
+            if incoming:
+                setattr(self, name, incoming)
+
     def danacode_short(self) -> str:
-        short = (
-            self.captured_fields().get("cat_number")
+        short = re.sub(
+            r"\D",
+            "",
+            self.cat_number
             or self.extra.get("danacode_short")
-            or ""
-        ).strip()
-        digits = re.sub(r"\D", "", short)
+            or self.captured_fields().get("cat_number")
+            or "",
+        )
         long_code = re.sub(r"\D", "", self.danacode or "")
-        if digits and digits != long_code:
-            return digits
+        if short and short != long_code:
+            return short
         return ""
 
     def _load_field_rows(self, key: str) -> list[dict[str, str]]:
@@ -1193,16 +1282,23 @@ class Book:
         return current == str(year).strip()
 
     def to_excel_fields(self) -> dict[str, str]:
+        self.hydrate_catalog_fields()
         title_he, title_en = split_lang(self.title)
         author_he, author_en = split_lang(self.author)
         desc_he, desc_en = split_lang(self.description)
         captured = self.captured_fields()
-        if captured.get("description_en"):
+        if (self.description_en or "").strip():
+            desc_en = self.description_en
+        elif captured.get("description_en"):
             desc_en = captured.get("description_en") or desc_en
         if (self.title_en or "").strip():
             title_en = self.title_en
         elif captured.get("title_en"):
             title_en = captured.get("title_en") or title_en
+        if (self.author_en or "").strip():
+            author_en = self.author_en
+        if (self.author_he or "").strip():
+            author_he = self.author_he
         if has_hebrew(self.title):
             title_he = self.title
         self.ensure_phonetic()
@@ -1216,15 +1312,32 @@ class Book:
             "author_he": author_he,
             "upc": clean(self.upc),
             "danacode": clean(self.danacode),
-            "cat_number": self.danacode_short() or captured.get("cat_number", ""),
+            "cat_number": self.danacode_short() or clean(self.cat_number) or captured.get("cat_number", ""),
             "isbn": clean(self.isbn),
+            "isbn_old": clean(self.isbn_old),
+            "item_type": clean(self.item_type),
+            "language": clean(self.language),
+            "translated": clean(self.translated),
+            "spine_color": clean(self.spine_color),
+            "supplier": clean(self.supplier),
+            "catalog_mom": clean(self.catalog_mom),
+            "category": clean(self.category),
+            "category2": clean(self.category2),
+            "category3": clean(self.category3),
+            "keywords": clean(self.keywords),
+            "comments": clean(self.comments),
             "year": clean(self.year),
             "pages": clean(self.pages),
             "cover_type": clean(self.cover_type),
             "weight_kg": clean(self.weight_kg),
+            "weight_lb": clean(self.weight_lb),
+            "weight_oz": clean(self.weight_oz),
             "height_cm": clean(self.height_cm),
             "width_cm": clean(self.width_cm),
             "thickness_cm": clean(self.thickness_cm),
+            "height_in": clean(self.height_in),
+            "width_in": clean(self.width_in),
+            "thickness_in": clean(self.thickness_in),
             "price_ils": format_price(self.price_ils),
             "description_he": desc_he,
             "description_en": desc_en,
@@ -1240,9 +1353,9 @@ class Book:
             "modified_at": clean(self.modified_at),
             "database_passed_at": clean(self.database_passed_at),
         }
-        if captured.get("author_en"):
+        if captured.get("author_en") and not fields.get("author_en"):
             author_en = captured.get("author_en") or author_en
-        if captured.get("author_he"):
+        if captured.get("author_he") and not fields.get("author_he"):
             author_he = captured.get("author_he") or author_he
         fields["author_en"] = format_person_name(author_en, hebrew=False)
         fields["author_he"] = format_person_name(author_he, hebrew=True)
@@ -1250,10 +1363,16 @@ class Book:
         if not fields["translator"] and _looks_like_person_name(legacy) and len(legacy.split()) >= 2:
             fields["translator"] = format_person_name(legacy)
             fields["translated"] = "Y"
+        if (self.translated or "").strip():
+            fields["translated"] = clean(self.translated)
         elif captured.get("translated"):
             fields["translated"] = legacy if not _looks_like_person_name(legacy) else "Y"
         if fields["translator"] and not fields.get("translated"):
             fields["translated"] = "Y"
+        if fields.get("language"):
+            from field_map import isolate_language
+
+            fields["language"] = isolate_language(fields["language"])
         for name, value in captured.items():
             if name in {"translated", "translator"}:
                 continue
@@ -1950,6 +2069,7 @@ def remember_danacode(book: Book, raw: str | None, source_url: str = "") -> list
         current_short = re.sub(r"\D", "", book.danacode_short() or book.extra.get("danacode_short") or "")
         if current_short == code:
             return
+        book.cat_number = code
         book.extra["danacode_short"] = code
         book.set_captured("cat_number", code)
         if url:
