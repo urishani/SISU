@@ -526,7 +526,7 @@ class BookCatalogApp(tk.Tk):
             command=self.share_site_urls,
             tip="Share the checked catalog sites by email or WhatsApp so someone else can add them in SISU.",
         )
-        self.site_share_btn.pack(side="right", padx=(0, 6), pady=2)
+        self.site_share_btn.pack(side="right", padx=(0, 8), pady=2)
         self.site_edit_btn = self._site_header_icon(
             site_header,
             glyph=ICON_EDIT,
@@ -534,7 +534,7 @@ class BookCatalogApp(tk.Tk):
             command=lambda: self.open_settings(focus_tab="sites"),
             tip="Add, remove, or reorder catalog sites in Settings.",
         )
-        self.site_edit_btn.pack(side="right", padx=(0, 2), pady=2)
+        self.site_edit_btn.pack(side="right", padx=(0, 12), pady=2)
         site_header_label.pack(side="left", fill="x", expand=True, padx=(2, 8), pady=4)
         site_all_mark.bind("<Button-1>", lambda _e: self._toggle_all_sites())
         site_all_mark.bind("<MouseWheel>", self._on_site_list_wheel)
@@ -869,11 +869,37 @@ class BookCatalogApp(tk.Tk):
 
     def _paint_share_nodes(self, canvas: tk.Canvas, *, color: str, bg: str) -> None:
         canvas.delete("all")
-        left, top, bot = (6, 11), (16, 5), (16, 17)
+        try:
+            width = max(int(canvas.cget("width") or 0), 22)
+            height = max(int(canvas.cget("height") or 0), 22)
+        except (tk.TclError, TypeError, ValueError):
+            width, height = 33, 33
+        scale = min(width, height) / 22
+        left = (6 * scale, 11 * scale)
+        top = (16 * scale, 5 * scale)
+        bot = (16 * scale, 17 * scale)
+        radius = max(4.0, 3 * scale)
+        line_w = max(2, round(2 * scale))
         for dest in (top, bot):
-            canvas.create_line(left[0], left[1], dest[0], dest[1], fill=color, width=2, capstyle=tk.ROUND)
+            canvas.create_line(
+                left[0],
+                left[1],
+                dest[0],
+                dest[1],
+                fill=color,
+                width=line_w,
+                capstyle=tk.ROUND,
+            )
         for x, y in (left, top, bot):
-            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=color, fill=bg, width=2)
+            canvas.create_oval(
+                x - radius,
+                y - radius,
+                x + radius,
+                y + radius,
+                outline=color,
+                fill=bg,
+                width=line_w,
+            )
 
     def _make_icon_button(
         self,
@@ -897,8 +923,8 @@ class BookCatalogApp(tk.Tk):
         if kind == "share_nodes":
             btn = tk.Canvas(
                 parent,
-                width=22,
-                height=22,
+                width=33,
+                height=33,
                 bg=bg,
                 highlightthickness=0,
                 cursor="hand2",
