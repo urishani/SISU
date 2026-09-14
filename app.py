@@ -100,6 +100,7 @@ from scan_lists import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
+DEEP_HISTORY_PATH = APP_DIR / "cache" / "publisher_lookup_history.json"
 WATCHED_FILES = (
     "app.py",
     "app_update.py",
@@ -278,6 +279,15 @@ class BookCatalogApp(tk.Tk):
         self._lookup_stop_btn: ttk.Button | None = None
         self._lookup_close_btn: ttk.Button | None = None
         self._lookup_running = False
+        self._deep_popup: tk.Toplevel | None = None
+        self._deep_tree: ttk.Treeview | None = None
+        self._deep_status = tk.StringVar(value="")
+        self._deep_start_btn: ttk.Button | None = None
+        self._deep_stop_btn: ttk.Button | None = None
+        self._deep_running = False
+        self._deep_rows: list[dict] = []
+        self._deep_history: dict[str, dict] = {}
+        self._deep_history_loaded = False
         self._found_popup: tk.Toplevel | None = None
         self._settings_popup: tk.Toplevel | None = None
         self._report_popup: tk.Toplevel | None = None
@@ -623,6 +633,12 @@ class BookCatalogApp(tk.Tk):
             self.search_btn,
             "Search the checked bookstore URLs, merge unique titles into one list, then fill catalog and publisher pages.",
         )
+        self.deep_btn = ttk.Button(buttons, text="Deep search", command=self.open_deep_search)
+        self.deep_btn.pack(side="left", padx=(0, 4))
+        self._callout(
+            self.deep_btn,
+            "Group this list by publisher, then crawl each publisher website that has a URL to fill missing book fields.",
+        )
         self.log_btn = ttk.Button(buttons, text="Show log", command=self.show_activity_log)
         self.log_btn.pack(side="left", padx=(0, 4))
         self._callout(
@@ -631,7 +647,7 @@ class BookCatalogApp(tk.Tk):
         )
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self.stop_btn.pack(side="left")
-        self._callout(self.stop_btn, "Stop the current search. Books found so far are kept.")
+        self._callout(self.stop_btn, "Stop the current Search or Deep search. Books found so far are kept.")
 
         self.colored_info_label = ttk.Label(form, textvariable=self.colored_info, wraplength=1, justify="left")
         self.colored_info_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -3025,6 +3041,11 @@ class BookCatalogApp(tk.Tk):
         search_state = "disabled" if (self._list_locked or self._busy) else "normal"
         edit_state = "disabled" if self._list_locked else "normal"
         self.search_btn.configure(state=search_state)
+        if getattr(self, "deep_btn", None):
+            if self._deep_running:
+                self.deep_btn.configure(state="normal")
+            else:
+                self.deep_btn.configure(state=search_state)
         self._set_site_list_enabled(not (self._list_locked or self._busy))
         self.year_entry.configure(state=edit_state)
         self.no_limit_check.configure(state=edit_state)
@@ -3043,6 +3064,8 @@ class BookCatalogApp(tk.Tk):
             self.more_btn.configure(state="normal")
             self._update_workflow_buttons(self._selected_book)
         self._update_list_action_buttons()
+        if getattr(self, "_deep_start_btn", None) or getattr(self, "_deep_stop_btn", None):
+            self._sync_deep_buttons()
 
     def _apply_payload(self, data: dict, *, status: str = "", as_saved: bool | None = None) -> None:
         self._list_id = str(data.get("id") or "")
@@ -3519,6 +3542,8 @@ class BookCatalogApp(tk.Tk):
     def stop_search(self) -> None:
         self._cancel.set()
         self._set_status("Stopping…")
+        if self._deep_running:
+            self._deep_status.set("Stopping…")
 
     def _crawl_progress(self, msg: str) -> None:
         text = str(msg or "").strip()
@@ -3556,7 +3581,7 @@ class BookCatalogApp(tk.Tk):
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Each Search is a separate log. The Performance block at the top shows time and counts per catalog: books, new, duplicates, and field updates. Publisher lookups from More are logged the same way. The strip under this window shows the book being scanned right now and is not saved in the log.",
+            text="Each Search or Deep search is a separate log. The Performance block at the top shows time and counts per catalog: books, new, duplicates, and field updates. Publisher lookups from More and Deep search are logged the same way. The strip under this window shows the book being scanned right now and is not saved in the log.",
             wraplength=940,
         ).pack(anchor="w", pady=(0, 8))
         split = ttk.Panedwindow(body, orient="horizontal")
@@ -3940,7 +3965,8 @@ class BookCatalogApp(tk.Tk):
     def _drain_queue(self) -> None:
         processed = 0
         latest_live = None
-        while processed < 8:
+        limit = 24 if self._deep_running else 8
+        while processed < limit:
             try:
                 kind, payload = self._ui_queue.get_nowait()
             except queue.Empty:
@@ -3976,6 +4002,13 @@ class BookCatalogApp(tk.Tk):
             elif kind == "more_error":
                 self._finish_more(None)
                 messagebox.showerror("Could not look up more details", str(payload))
+            elif kind == "deep_row":
+                self._on_deep_row(payload)
+            elif kind == "deep_done":
+                self._finish_deep_search(payload)
+            elif kind == "deep_error":
+                self._finish_deep_search({"error": str(payload)})
+                messagebox.showerror("Deep search failed", str(payload))
             elif kind == "update_result":
                 silent, info = payload
                 self._on_update_result(bool(silent), info)
@@ -3987,7 +4020,7 @@ class BookCatalogApp(tk.Tk):
         if latest_live is not None:
             self._live_queued = False
             self._apply_log_live(latest_live)
-        self.after(20 if processed >= 8 or latest_live is not None else 80, self._drain_queue)
+        self.after(20 if processed >= limit or latest_live is not None else 80, self._drain_queue)
 
     def _finish_search(
         self,
@@ -4505,6 +4538,521 @@ class BookCatalogApp(tk.Tk):
                 win.destroy()
             except tk.TclError:
                 pass
+
+    def _load_deep_history(self) -> dict[str, dict]:
+        if self._deep_history_loaded:
+            return self._deep_history
+        try:
+            raw = json.loads(DEEP_HISTORY_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        history: dict[str, dict] = {}
+        if isinstance(raw, dict):
+            history = {
+                str(key): dict(value)
+                for key, value in raw.items()
+                if str(key).strip() and isinstance(value, dict)
+            }
+        self._deep_history = history
+        self._deep_history_loaded = True
+        return self._deep_history
+
+    def _save_deep_history(self) -> None:
+        try:
+            DEEP_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DEEP_HISTORY_PATH.write_text(
+                json.dumps(self._deep_history, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _publisher_used_before(self, key: str, books: list[Book]) -> bool:
+        if key in self._load_deep_history():
+            return True
+        for book in books:
+            extra = book.extra or {}
+            if extra.get("lookup_note") or extra.get("publisher_page") or extra.get("publisher_site"):
+                return True
+            if book.publisher_found_fields():
+                return True
+        return False
+
+    def _deep_publisher_groups(self) -> list[dict]:
+        from publisher_sites import _haystack
+
+        buckets: dict[str, dict] = {}
+        order: list[str] = []
+        for book in self.books:
+            name = (book.publisher or "").strip()
+            display = name or "(no publisher)"
+            key = _haystack(name).strip() if name else "__none__"
+            row = buckets.get(key)
+            if row is None:
+                row = {
+                    "key": key,
+                    "name": display,
+                    "books": [],
+                    "url": resolve_publisher_site(name) if name else "",
+                }
+                buckets[key] = row
+                order.append(key)
+            elif name and len(display) > len(str(row["name"])):
+                row["name"] = display
+            if name and not row["url"]:
+                row["url"] = resolve_publisher_site(name) or ""
+            row["books"].append(book)
+        rows = [buckets[key] for key in order]
+        rows.sort(key=lambda item: (0 if item["url"] else 1, str(item["name"]).casefold()))
+        return rows
+
+    def open_deep_search(self) -> None:
+        if not self.books and not self._deep_running:
+            messagebox.showinfo("Deep search", "The working list has no books to group by publisher.")
+            return
+        existing = self._deep_popup
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    if not self._deep_running:
+                        self._fill_deep_tree()
+                    return
+            except tk.TclError:
+                self._deep_popup = None
+        self._load_deep_history()
+        win = tk.Toplevel(self)
+        win.title("Deep search")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.geometry("980x560")
+        win.minsize(720, 380)
+        self._deep_popup = win
+        win.protocol("WM_DELETE_WINDOW", self._close_deep_search)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="Books on this list, grouped by publisher. Start crawls only publishers that have a website. Stop cancels the crawl and skips the rest. Closing this window does not stop a run that is already going.",
+            wraplength=940,
+        ).pack(anchor="w")
+        ttk.Label(body, textvariable=self._deep_status, wraplength=940).pack(anchor="w", pady=(6, 8))
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True)
+        columns = ("publisher", "site", "books", "used", "comment")
+        tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="browse")
+        tree.heading("publisher", text="Publisher")
+        tree.heading("site", text="Website")
+        tree.heading("books", text="Books")
+        tree.heading("used", text="Used before")
+        tree.heading("comment", text="Comment")
+        tree.column("publisher", width=240, anchor="w")
+        tree.column("site", width=180, anchor="w")
+        tree.column("books", width=70, anchor="center")
+        tree.column("used", width=90, anchor="center")
+        tree.column("comment", width=360, anchor="w")
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+        tree.tag_configure("missing", foreground="#8A6A32")
+        tree.tag_configure("running", background="#E8F0FE")
+        tree.tag_configure("done", background="#E4F7EA")
+        tree.tag_configure("skipped", foreground="#7A7A7A")
+        tree.tag_configure("stopped", background="#FDECEC")
+        self._deep_tree = tree
+        tree.bind("<Double-1>", lambda _e: self._deep_open_selected_site())
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(10, 0))
+        self._deep_start_btn = ttk.Button(buttons, text="Start", command=self.start_deep_search, style="Accent.TButton")
+        self._deep_start_btn.pack(side="left")
+        self._deep_stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
+        self._deep_stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Add website…", command=self._deep_open_selected_site).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Close", command=self._close_deep_search).pack(side="right")
+        self._callout(
+            self._deep_start_btn,
+            "Crawl every publisher that has a website, using the same lookup as More. Rows with no URL are skipped.",
+        )
+        self._callout(self._deep_stop_btn, "Stop Deep search. Remaining publishers are skipped.")
+        if self._deep_running and self._deep_rows:
+            self._paint_deep_tree()
+        else:
+            self._fill_deep_tree()
+        self._sync_deep_buttons()
+        win.lift()
+        win.focus_force()
+
+    def _fill_deep_tree(self) -> None:
+        if self._deep_running and self._deep_rows:
+            self._paint_deep_tree()
+            self._sync_deep_buttons()
+            return
+        self._deep_rows = self._deep_publisher_groups()
+        for index, row in enumerate(self._deep_rows):
+            row["iid"] = f"p{index}"
+            url = str(row.get("url") or "")
+            used = self._publisher_used_before(str(row["key"]), row["books"])
+            history = self._load_deep_history().get(str(row["key"])) or {}
+            comment = str(history.get("comment") or "")
+            if not comment and used:
+                comment = "Looked up before."
+            row["used_label"] = "Yes" if used else "No"
+            row["comment"] = comment
+            row["tag"] = "missing" if not url else ""
+        with_url = sum(1 for row in self._deep_rows if row.get("url"))
+        self._deep_status.set(
+            f"{len(self._deep_rows)} publisher(s) · {len(self.books)} book(s) · {with_url} with a website."
+        )
+        self._paint_deep_tree()
+        self._sync_deep_buttons()
+
+    def _paint_deep_tree(self) -> None:
+        tree = self._deep_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        for index, row in enumerate(self._deep_rows):
+            iid = str(row.get("iid") or f"p{index}")
+            row["iid"] = iid
+            url = str(row.get("url") or "")
+            tag = str(row.get("tag") or ("missing" if not url else ""))
+            tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    row.get("name") or "",
+                    urlparse(url).netloc if url else "No website",
+                    f"{len(row.get('books') or []):,}",
+                    str(row.get("used_label") or "No"),
+                    str(row.get("comment") or ""),
+                ),
+                tags=(tag,) if tag else (),
+            )
+
+    def _sync_deep_buttons(self) -> None:
+        with_url = any(row.get("url") for row in self._deep_rows)
+        if self._deep_start_btn is not None:
+            if self._deep_running or self._list_locked or self._busy or not with_url:
+                self._deep_start_btn.configure(state="disabled")
+            else:
+                self._deep_start_btn.configure(state="normal")
+        if self._deep_stop_btn is not None:
+            self._deep_stop_btn.configure(state="normal" if self._deep_running else "disabled")
+
+    def _deep_open_selected_site(self) -> None:
+        tree = self._deep_tree
+        if tree is None:
+            return
+        selection = tree.selection()
+        if not selection:
+            return
+        iid = str(selection[0])
+        row = next((item for item in self._deep_rows if item.get("iid") == iid), None)
+        if not row:
+            return
+        url = str(row.get("url") or "")
+        name = str(row.get("name") or "")
+        if url:
+            self._open_publisher_site(url)
+            return
+        if name and name != "(no publisher)":
+            self.open_settings(focus_publisher=name)
+
+    def _close_deep_search(self) -> None:
+        win = self._deep_popup
+        self._deep_popup = None
+        self._deep_tree = None
+        self._deep_start_btn = None
+        self._deep_stop_btn = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def start_deep_search(self) -> None:
+        if self._guard_locked("run a deep search"):
+            return
+        if self._busy or self._deep_running:
+            return
+        if not self._deep_rows:
+            self._fill_deep_tree()
+        targets = [row for row in self._deep_rows if row.get("url") and row.get("books")]
+        if not targets:
+            messagebox.showinfo("Deep search", "No publisher on this list has a website yet. Add sites in Settings.")
+            return
+        for row in self._deep_rows:
+            if row.get("url"):
+                continue
+            row["comment"] = "Skipped — no website."
+            row["tag"] = "skipped"
+            self._on_deep_row(
+                {
+                    "iid": str(row.get("iid") or ""),
+                    "used": str(row.get("used_label") or "No"),
+                    "comment": row["comment"],
+                    "tag": "skipped",
+                }
+            )
+        self._cancel.clear()
+        self._busy = True
+        self._deep_running = True
+        self._apply_lock_state()
+        self.stop_btn.configure(state="normal")
+        self._begin_work("Deep search…")
+        self._sync_deep_buttons()
+        self._activity.start_run(
+            "Deep search",
+            f"Publisher lookup for {len(targets)} site(s), {len(self.books)} book(s).",
+        )
+        self._set_status(f"Deep search: {len(targets)} publisher site(s).")
+        self._deep_status.set(f"Starting {len(targets)} publisher site(s)…")
+        thread = threading.Thread(target=self._run_deep_search, args=(targets,), daemon=True)
+        thread.start()
+
+    def _run_deep_search(self, targets: list[dict]) -> None:
+        totals = {"found": 0, "updated": 0, "books": 0, "sites": 0, "cancelled": False}
+        try:
+            for index, row in enumerate(targets, start=1):
+                if self._cancel.is_set():
+                    totals["cancelled"] = True
+                    break
+                name = str(row.get("name") or "publisher")
+                books = [book for book in (row.get("books") or []) if (book.title or "").strip()]
+                untitled = len(row.get("books") or []) - len(books)
+                iid = str(row.get("iid") or "")
+                totals["books"] += len(books)
+                totals["sites"] += 1
+                self._ui_queue.put(
+                    (
+                        "deep_row",
+                        {
+                            "iid": iid,
+                            "used": "Yes",
+                            "comment": "Crawling…",
+                            "tag": "running",
+                            "status": f"Publisher {index} of {len(targets)} · {name}",
+                        },
+                    )
+                )
+                if not books:
+                    comment = "No titled books to look up."
+                    if untitled:
+                        comment = f"Skipped {untitled} book(s) with no title."
+                    self._deep_history[str(row["key"])] = {
+                        "name": name,
+                        "url": str(row.get("url") or ""),
+                        "comment": comment,
+                        "found": 0,
+                        "updated": 0,
+                        "total": 0,
+                        "at": entry_now(),
+                    }
+                    self._activity.log(f"{name}: {comment}")
+                    self._save_deep_history()
+                    self._ui_queue.put(
+                        (
+                            "deep_row",
+                            {
+                                "iid": iid,
+                                "used": "Yes",
+                                "comment": comment,
+                                "tag": "done",
+                                "refresh": False,
+                                "status": f"Publisher {index} of {len(targets)} · {name}",
+                            },
+                        )
+                    )
+                    continue
+                crawler = BookCrawler(
+                    cancelled=self._cancel.is_set,
+                    progress=self._crawl_progress,
+                )
+                stats = SourceStats(
+                    name=name,
+                    url=str(row.get("url") or ""),
+                    kind="publisher",
+                )
+                crawler._current_source = stats
+                found = 0
+                updated = 0
+                errors = 0
+                started = time.monotonic()
+                count_lock = threading.Lock()
+                last_ui = [0.0]
+
+                def on_book(
+                    book_index: int,
+                    book_total: int,
+                    book: Book,
+                    filled: list[str],
+                    *,
+                    row_iid=iid,
+                    pub_name=name,
+                    pub_index=index,
+                    pub_total=len(targets),
+                ) -> None:
+                    nonlocal found, updated, errors
+                    extra = book.extra or {}
+                    with count_lock:
+                        if extra.get("lookup_error"):
+                            errors += 1
+                        elif filled:
+                            updated += 1
+                        if filled or extra.get("publisher_page") or book.publisher_found_fields():
+                            found += 1
+                        snapshot = (found, updated, book_index, book_total)
+                    now = time.monotonic()
+                    if snapshot[2] < snapshot[3] and now - last_ui[0] < 0.12:
+                        return
+                    last_ui[0] = now
+                    self._ui_queue.put(
+                        (
+                            "deep_row",
+                            {
+                                "iid": row_iid,
+                                "used": "Yes",
+                                "comment": (
+                                    f"Checking {snapshot[2]} of {snapshot[3]}. "
+                                    f"Found {snapshot[0]} of {snapshot[3]}. Updated {snapshot[1]}."
+                                ),
+                                "tag": "running",
+                                "status": f"Publisher {pub_index} of {pub_total} · {pub_name}",
+                            },
+                        )
+                    )
+
+                try:
+                    crawler.progress(f"Deep search {index} of {len(targets)}: {name} ({len(books)} book(s)).")
+                    crawler.enrich_publisher_books(books, on_book=on_book)
+                except CrawlCancelled:
+                    totals["cancelled"] = True
+                stats.seconds = time.monotonic() - started
+                crawler._current_source = None
+                total = len(books)
+                stopped = totals["cancelled"] or self._cancel.is_set()
+                comment = f"Found {found} of {total}. Updated {updated}."
+                if untitled:
+                    comment += f" {untitled} with no title skipped."
+                if errors:
+                    comment += f" {errors} error(s)."
+                if stopped:
+                    comment = "Stopped. " + comment
+                self._deep_history[str(row["key"])] = {
+                    "name": name,
+                    "url": str(row.get("url") or ""),
+                    "comment": comment,
+                    "found": found,
+                    "updated": updated,
+                    "total": total,
+                    "at": entry_now(),
+                }
+                totals["found"] += found
+                totals["updated"] += updated
+                self._activity.log(f"{name}: {comment}")
+                self._save_deep_history()
+                self._ui_queue.put(
+                    (
+                        "deep_row",
+                        {
+                            "iid": iid,
+                            "used": "Yes",
+                            "comment": comment,
+                            "tag": "stopped" if stopped else "done",
+                            "refresh": True,
+                            "status": f"Publisher {index} of {len(targets)} · {name}",
+                        },
+                    )
+                )
+                if stopped:
+                    break
+            self._save_deep_history()
+            self._ui_queue.put(("deep_done", totals))
+        except Exception as exc:
+            try:
+                self._save_deep_history()
+            except Exception:
+                pass
+            self._ui_queue.put(("deep_error", str(exc)))
+
+    def _on_deep_row(self, payload: dict) -> None:
+        tree = self._deep_tree
+        iid = str((payload or {}).get("iid") or "")
+        comment = str((payload or {}).get("comment") or "")
+        used = str((payload or {}).get("used") or "Yes")
+        tag = str((payload or {}).get("tag") or "")
+        status = str((payload or {}).get("status") or "")
+        if status:
+            self._deep_status.set(status)
+        row = next((item for item in self._deep_rows if str(item.get("iid") or "") == iid), None)
+        if row is not None:
+            row["comment"] = comment
+            row["used_label"] = used
+            if tag:
+                row["tag"] = tag
+        if tree is not None and iid:
+            try:
+                if tree.exists(iid):
+                    values = list(tree.item(iid, "values"))
+                    if len(values) >= 5:
+                        values[3] = used
+                        values[4] = comment
+                        tree.item(iid, values=values, tags=(tag,) if tag else ())
+                    if tag == "running":
+                        tree.see(iid)
+                        tree.selection_set(iid)
+            except tk.TclError:
+                pass
+        if (payload or {}).get("refresh"):
+            self._prepare_books(self.books)
+            self._persist_working()
+            self.table.set_books(self.books, keep_checks=True)
+            if self._selected_book:
+                self.show_book(self._selected_book)
+
+    def _finish_deep_search(self, payload: dict | None) -> None:
+        self._deep_running = False
+        self._busy = False
+        self.stop_btn.configure(state="disabled")
+        self._apply_lock_state()
+        self._sync_deep_buttons()
+        data = payload or {}
+        error = str(data.get("error") or "")
+        cancelled = bool(data.get("cancelled"))
+        found = int(data.get("found") or 0)
+        updated = int(data.get("updated") or 0)
+        sites = int(data.get("sites") or 0)
+        if error:
+            summary = f"Deep search failed. {error}"
+            self._end_work("failed")
+            outcome = "failed"
+        elif cancelled:
+            summary = (
+                f"Deep search stopped after {sites} publisher site(s). "
+                f"Found {found} books. Updated {updated}."
+            )
+            self._end_work("stopped")
+            outcome = "stopped"
+        else:
+            summary = (
+                f"Deep search finished. {sites} publisher site(s). "
+                f"Found {found} books. Updated {updated}."
+            )
+            self._end_work("done")
+            outcome = "done"
+        self._deep_status.set(summary)
+        self._set_status(summary)
+        self._activity.finish(outcome, summary)
+        self._prepare_books(self.books)
+        self._persist_working()
+        if self._list_has_name() and not self._list_locked:
+            self._remember_named_list()
+        self.table.set_books(self.books, keep_checks=True)
+        if self._selected_book:
+            self.show_book(self._selected_book)
 
     def _run_publisher_lookup(self, books: list[Book], selected: Book | None, publisher: str) -> None:
         crawler = BookCrawler(
