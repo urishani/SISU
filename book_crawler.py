@@ -113,7 +113,7 @@ def site_error_message(html: str, status: int | None = None, url: str = "") -> s
     ):
         return (
             "This catalog is behind a browser check, so SISU cannot read the web page. "
-            "National Library searches use the Open Library API instead."
+            "National Library searches use the Alma catalog instead."
         )
     wp_title = ("wordpress" in title.casefold() and "error" in title.casefold()) or (
         "וורדפרס" in title and "שגיאה" in title

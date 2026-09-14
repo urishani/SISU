@@ -1688,7 +1688,7 @@ class BookCatalogApp(tk.Tk):
         nli_key = tk.StringVar(value=str(data.get("nli_api_key") or ""))
         ttk.Label(
             sites_tab,
-            text="National Library searches nli.org.il through the Open Library API (not the JavaScript web page). A free key from https://api2.nli.org.il/signup/ avoids the shared guest-key limit.",
+            text="National Library searches nli.org.il through the library’s public Alma catalog (not the JavaScript web page). An Open Library API key is optional, only as a fallback.",
             wraplength=740,
         ).pack(anchor="w", pady=(10, 4))
         nli_row = ttk.Frame(sites_tab)
