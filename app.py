@@ -57,6 +57,7 @@ from book_crawler import (
     format_price,
     listing_url_key,
     merge_later_into,
+    parse_site_urls,
     reapply_model_phonetics,
     site_display_name,
     site_host,
@@ -205,6 +206,17 @@ ERROR_FG = "#B42318"
 ERROR_BG = "#FDECEC"
 FINAL_FG = "#0B57D0"
 FINAL_BG = "#E8F0FE"
+ICON_HEADER_BG = "#EDE6DA"
+ICON_OPEN = "\uE72D"
+ICON_OPEN_FALLBACK = "↗"
+ICON_EDIT = "\uE70F"
+ICON_EDIT_FALLBACK = "✎"
+ICON_UP = "\uE70E"
+ICON_UP_FALLBACK = "↑"
+ICON_DOWN = "\uE70D"
+ICON_DOWN_FALLBACK = "↓"
+ICON_DELETE = "\uE74D"
+ICON_DELETE_FALLBACK = "🗑"
 UPDATE_CHECK_FIRST_MS = 2_000
 UPDATE_CHECK_EVERY_MS = 15 * 60 * 1000
 
@@ -503,16 +515,15 @@ class BookCatalogApp(tk.Tk):
         )
         self.site_share_btn = self._site_header_icon(
             site_header,
-            glyph="\uE72D",
-            fallback="⤴",
+            kind="share_nodes",
             command=self.share_site_urls,
             tip="Share the checked catalog sites by email or WhatsApp so someone else can add them in SISU.",
         )
         self.site_share_btn.pack(side="right", padx=(0, 6), pady=2)
         self.site_edit_btn = self._site_header_icon(
             site_header,
-            glyph="\uE70F",
-            fallback="✎",
+            glyph=ICON_EDIT,
+            fallback=ICON_EDIT_FALLBACK,
             command=lambda: self.open_settings(focus_tab="sites"),
             tip="Add, remove, or reorder catalog sites in Settings.",
         )
@@ -845,31 +856,107 @@ class BookCatalogApp(tk.Tk):
                 return (name, 12)
         return ("Segoe UI Symbol", 12)
 
-    def _site_header_icon(self, parent: tk.Misc, *, glyph: str, fallback: str, command, tip: str) -> tk.Label:
+    def _icon_font_available(self) -> bool:
         families = {name.casefold() for name in tkfont.families(self)}
-        use_mdl = any(name.casefold() in families for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"))
-        btn = tk.Label(
-            parent,
-            text=glyph if use_mdl else fallback,
-            bg="#EDE6DA",
-            fg=NAVY,
-            font=self._site_icon_font(),
-            cursor="hand2",
-            padx=7,
-            pady=2,
-        )
-        btn._icon_enabled = True
+        return any(name.casefold() in families for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"))
+
+    def _paint_share_nodes(self, canvas: tk.Canvas, *, color: str, bg: str) -> None:
+        canvas.delete("all")
+        left, top, bot = (6, 11), (16, 5), (16, 17)
+        for dest in (top, bot):
+            canvas.create_line(left[0], left[1], dest[0], dest[1], fill=color, width=2, capstyle=tk.ROUND)
+        for x, y in (left, top, bot):
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=color, fill=bg, width=2)
+
+    def _make_icon_button(
+        self,
+        parent: tk.Misc,
+        *,
+        command,
+        tip: str,
+        bg: str,
+        kind: str = "glyph",
+        glyph: str = "",
+        fallback: str = "",
+    ) -> tk.Misc:
+        enabled_color = NAVY
+        disabled_color = "#A89B8C"
 
         def on_click(_event=None) -> None:
             if not getattr(btn, "_icon_enabled", True):
                 return
             command()
 
+        if kind == "share_nodes":
+            btn = tk.Canvas(
+                parent,
+                width=22,
+                height=22,
+                bg=bg,
+                highlightthickness=0,
+                cursor="hand2",
+            )
+            self._paint_share_nodes(btn, color=enabled_color, bg=bg)
+
+            def set_enabled(on: bool) -> None:
+                btn._icon_enabled = bool(on)
+                self._paint_share_nodes(btn, color=enabled_color if on else disabled_color, bg=bg)
+                btn.configure(cursor="hand2" if on else "arrow")
+
+            btn._set_icon_enabled = set_enabled
+        else:
+            btn = tk.Label(
+                parent,
+                text=glyph if self._icon_font_available() else fallback,
+                bg=bg,
+                fg=enabled_color,
+                font=self._site_icon_font(),
+                cursor="hand2",
+                padx=6,
+                pady=2,
+            )
+
+            def set_enabled(on: bool) -> None:
+                btn._icon_enabled = bool(on)
+                try:
+                    btn.configure(
+                        fg=enabled_color if on else disabled_color,
+                        cursor="hand2" if on else "arrow",
+                    )
+                except tk.TclError:
+                    pass
+
+            btn._set_icon_enabled = set_enabled
+        btn._icon_enabled = True
         btn.bind("<Button-1>", on_click)
         self._callout(btn, tip)
         return btn
 
+    def _site_header_icon(
+        self,
+        parent: tk.Misc,
+        *,
+        command,
+        tip: str,
+        glyph: str = "",
+        fallback: str = "",
+        kind: str = "glyph",
+    ) -> tk.Misc:
+        return self._make_icon_button(
+            parent,
+            command=command,
+            tip=tip,
+            bg=ICON_HEADER_BG,
+            kind=kind,
+            glyph=glyph,
+            fallback=fallback,
+        )
+
     def _set_site_icon_enabled(self, widget: tk.Misc, enabled: bool) -> None:
+        setter = getattr(widget, "_set_icon_enabled", None)
+        if callable(setter):
+            setter(enabled)
+            return
         widget._icon_enabled = bool(enabled)
         try:
             widget.configure(
@@ -1381,7 +1468,7 @@ class BookCatalogApp(tk.Tk):
 
         ttk.Label(
             sites_tab,
-            text="Bookstore and library catalogs Search reads, in this order. Open a site in the browser, or move it up or down, then Save. On the main window, check the sites to include in a search.",
+            text="Bookstore and library catalogs Search reads, in this order. Open a site in the browser, move it up or down, or remove it, then Save. On the main window, check the sites to include in a search.",
             wraplength=740,
         ).pack(anchor="w")
         site_wrap = ttk.Frame(sites_tab)
@@ -1432,56 +1519,62 @@ class BookCatalogApp(tk.Tk):
                 return "break"
 
             url_entry.bind("<Double-Button-1>", _open_row)
-            open_btn = tk.Button(
+            open_btn = self._make_icon_button(
                 site_inner,
-                text="Open",
-                font=("Segoe UI", 9, "underline"),
-                fg="#0B57D0",
-                activeforeground="#0B57D0",
-                relief="flat",
-                cursor="hand2",
+                glyph=ICON_OPEN,
+                fallback=ICON_OPEN_FALLBACK,
                 command=lambda item=url_var: _open_row(item=item),
+                tip="Open this catalog in the browser.",
+                bg=BG,
             )
-            open_btn.grid(row=grid_row, column=1, padx=(0, 4), pady=3)
-            self._callout(open_btn, "Open this catalog in the browser.")
+            open_btn.grid(row=grid_row, column=1, padx=(0, 2), pady=1)
+            up_btn = self._make_icon_button(
+                site_inner,
+                glyph=ICON_UP,
+                fallback=ICON_UP_FALLBACK,
+                command=lambda item=pair_index: _move_site_row(item, -1),
+                tip="Move this catalog up.",
+                bg=BG,
+            )
+            up_btn.grid(row=grid_row, column=2, padx=(0, 2), pady=1)
+            down_btn = self._make_icon_button(
+                site_inner,
+                glyph=ICON_DOWN,
+                fallback=ICON_DOWN_FALLBACK,
+                command=lambda item=pair_index: _move_site_row(item, 1),
+                tip="Move this catalog down.",
+                bg=BG,
+            )
+            down_btn.grid(row=grid_row, column=3, padx=(0, 2), pady=1)
+            delete_btn = self._make_icon_button(
+                site_inner,
+                glyph=ICON_DELETE,
+                fallback=ICON_DELETE_FALLBACK,
+                command=lambda item=url_var: _remove_site_row(item),
+                tip="Remove this catalog.",
+                bg=BG,
+            )
+            delete_btn.grid(row=grid_row, column=4, pady=1)
 
             def _sync_open(*_args: object, button=open_btn, var=url_var) -> None:
-                has_url = bool(var.get().strip())
-                button.configure(
-                    state="normal" if has_url else "disabled",
-                    fg="#0B57D0" if has_url else "#9A9A9A",
-                    cursor="hand2" if has_url else "arrow",
-                )
+                self._set_site_icon_enabled(button, bool(var.get().strip()))
 
             url_var.trace_add("write", _sync_open)
             _sync_open()
-            up_btn = ttk.Button(
-                site_inner,
-                text="Up",
-                width=4,
-                command=lambda item=pair_index: _move_site_row(item, -1),
-            )
-            up_btn.grid(row=grid_row, column=2, padx=(0, 4), pady=3)
-            down_btn = ttk.Button(
-                site_inner,
-                text="Down",
-                width=5,
-                command=lambda item=pair_index: _move_site_row(item, 1),
-            )
-            down_btn.grid(row=grid_row, column=3, padx=(0, 4), pady=3)
-            ttk.Button(
-                site_inner,
-                text="Remove",
-                command=lambda item=url_var: _remove_site_row(item),
-            ).grid(row=grid_row, column=4, pady=3)
-            if pair_index == 0:
-                up_btn.configure(state="disabled")
-            if pair_index >= count - 1:
-                down_btn.configure(state="disabled")
+            self._set_site_icon_enabled(up_btn, pair_index > 0)
+            self._set_site_icon_enabled(down_btn, pair_index < count - 1)
             site_vars.append(url_var)
             return url_entry
 
         def _remove_site_row(item: tk.StringVar) -> None:
+            url = item.get().strip()
+            detail = url if url else "this empty catalog row"
+            if not messagebox.askyesno(
+                "Remove catalog site",
+                f"Remove this catalog site?\n\n{detail}",
+                parent=win,
+            ):
+                return
             snapshot = [var.get() for var in site_vars if var is not item]
             _fill_site_rows(snapshot)
 
@@ -1493,11 +1586,52 @@ class BookCatalogApp(tk.Tk):
             snapshot[index], snapshot[new_index] = snapshot[new_index], snapshot[index]
             _fill_site_rows(snapshot)
 
+        def _bulk_add_sites() -> None:
+            incoming = self._ask_bulk_site_urls(win)
+            if incoming is None:
+                return
+            kept = [var.get() for var in site_vars if var.get().strip()]
+            known = {self._search_site_key(url) for url in kept if self._search_site_key(url)}
+            added: list[str] = []
+            skipped = 0
+            for raw in incoming:
+                url = self._canonical_search_url(raw)
+                key = self._search_site_key(url)
+                if not url or not key:
+                    continue
+                if key in known:
+                    skipped += 1
+                    continue
+                known.add(key)
+                added.append(url)
+            if not added:
+                messagebox.showinfo(
+                    "Add catalog sites",
+                    "Those sites are already in the list." if skipped else "No catalog URLs were found.",
+                    parent=win,
+                )
+                return
+            _fill_site_rows(kept + added, focus_last=True)
+            extra = f" Skipped {skipped} already in the list." if skipped else ""
+            messagebox.showinfo(
+                "Add catalog sites",
+                f"Added {len(added)} catalog site(s).{extra}",
+                parent=win,
+            )
+
+        site_add_row = ttk.Frame(sites_tab)
+        site_add_row.pack(anchor="w")
         ttk.Button(
-            sites_tab,
+            site_add_row,
             text="Add site",
             command=lambda: _fill_site_rows([var.get() for var in site_vars] + [""], focus_last=True),
-        ).pack(anchor="w")
+        ).pack(side="left")
+        bulk_btn = ttk.Button(site_add_row, text="Bulk add…", command=_bulk_add_sites)
+        bulk_btn.pack(side="left", padx=(8, 0))
+        self._callout(
+            bulk_btn,
+            "Paste several catalog URLs (one per line). Sites already in the list are skipped.",
+        )
         nli_key = tk.StringVar(value=str(data.get("nli_api_key") or ""))
         ttk.Label(
             sites_tab,
@@ -2287,6 +2421,76 @@ class BookCatalogApp(tk.Tk):
         win.grab_set()
         win.wait_window()
         return result["choice"]
+
+    def _ask_bulk_site_urls(self, parent: tk.Misc | None = None) -> list[str] | None:
+        host = parent or self
+        win = tk.Toplevel(host)
+        win.title("Add catalog sites")
+        win.configure(bg=BG)
+        win.transient(host)
+        win.resizable(True, True)
+        result: dict[str, list[str] | None] = {"urls": None}
+
+        def cancel() -> None:
+            result["urls"] = None
+            win.destroy()
+
+        def accept() -> None:
+            result["urls"] = parse_site_urls(box.get("1.0", "end-1c"))
+            win.destroy()
+
+        def paste_clipboard() -> None:
+            try:
+                text = str(self.clipboard_get() or "")
+            except tk.TclError:
+                text = ""
+            if not text.strip():
+                return
+            box.delete("1.0", "end")
+            box.insert("1.0", text.strip() + "\n")
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="Paste catalog URLs, one per line. Sites already in the list are skipped.",
+            wraplength=480,
+            justify="left",
+        ).pack(anchor="w")
+        box = tk.Text(
+            body,
+            height=12,
+            width=62,
+            wrap="word",
+            font=("Segoe UI", 10),
+            relief="solid",
+            bd=1,
+            padx=6,
+            pady=6,
+        )
+        box.pack(fill="both", expand=True, pady=(10, 8))
+        try:
+            clip = str(self.clipboard_get() or "")
+        except tk.TclError:
+            clip = ""
+        if parse_site_urls(clip):
+            box.insert("1.0", clip.strip() + "\n")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Paste", command=paste_clipboard).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right")
+        ttk.Button(buttons, text="Add", command=accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
+        win.update_idletasks()
+        width, height = 560, 380
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.minsize(420, 280)
+        box.focus_set()
+        win.grab_set()
+        win.wait_window()
+        return result["urls"]
 
     def _share_via_outlook(self, path: Path, subject: str, body: str) -> bool:
         script = Path(tempfile.gettempdir()) / "sisu_share_excel.ps1"
