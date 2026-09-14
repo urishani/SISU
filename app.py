@@ -469,13 +469,6 @@ class BookCatalogApp(tk.Tk):
         url_heading = ttk.Frame(form)
         url_heading.grid(row=1, column=0, sticky="ne", padx=(0, 8), pady=(2, 0))
         ttk.Label(url_heading, text="Site URLs").pack(anchor="e")
-        edit_sites_btn = ttk.Button(
-            url_heading,
-            text="Edit…",
-            command=lambda: self.open_settings(focus_tab="sites"),
-        )
-        edit_sites_btn.pack(anchor="e", pady=(4, 0))
-        self._callout(edit_sites_btn, "Add, remove, or reorder catalog sites in Settings.")
         url_wrap = ttk.Frame(form)
         url_wrap.grid(row=1, column=1, sticky="nw", pady=(2, 0))
         url_wrap.columnconfigure(0, weight=0)
@@ -501,6 +494,20 @@ class BookCatalogApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
             anchor="w",
         )
+        self.site_share_btn = ttk.Button(site_header, text="Share", command=self.share_site_urls, width=7)
+        self.site_share_btn.pack(side="right", padx=(0, 6), pady=2)
+        self._callout(
+            self.site_share_btn,
+            "Email or WhatsApp the catalog sites that are checked, so someone else can add them in SISU.",
+        )
+        self.site_edit_btn = ttk.Button(
+            site_header,
+            text="Edit…",
+            command=lambda: self.open_settings(focus_tab="sites"),
+            width=7,
+        )
+        self.site_edit_btn.pack(side="right", padx=(0, 4), pady=2)
+        self._callout(self.site_edit_btn, "Add, remove, or reorder catalog sites in Settings.")
         site_header_label.pack(side="left", fill="x", expand=True, padx=(2, 8), pady=4)
         site_all_mark.bind("<Button-1>", lambda _e: self._toggle_all_sites())
         site_all_mark.bind("<MouseWheel>", self._on_site_list_wheel)
@@ -868,8 +875,8 @@ class BookCatalogApp(tk.Tk):
             texts = [str(row.get("url") or "") for row in self._site_rows if row.get("url")]
             if not texts:
                 texts = ["https://www.booknet.co.il/"]
-            width_px = max(url_font.measure(text) for text in texts) + 72
-            width_px = max(360, min(640, width_px))
+            width_px = max(url_font.measure(text) for text in texts) + 200
+            width_px = max(420, min(720, width_px))
             visible = max(1, min(4, len(self._site_rows) or 1))
             row_h = 28
             if self._site_rows:
@@ -2089,6 +2096,85 @@ class BookCatalogApp(tk.Tk):
             f"The Excel path was copied to the clipboard:\n{path}",
         )
 
+    def _checked_site_urls(self) -> list[str]:
+        return [url for url in self._urls() if url]
+
+    def _site_share_text(self, urls: list[str]) -> tuple[str, str]:
+        title = self.list_title.get().strip() or "SISU"
+        subject = f"SISU catalog sites from {title}"
+        lines = [
+            "Here are SISU catalog sites to search. Add them in SISU: Settings → Site URLs (one URL per line).",
+            "",
+            *urls,
+        ]
+        return subject, "\n".join(lines)
+
+    def share_site_urls(self) -> None:
+        urls = self._checked_site_urls()
+        if not urls:
+            messagebox.showinfo(
+                "Share sites",
+                "Check the catalog sites you want to share, then click Share.",
+            )
+            return
+        method = self._ask_share_method(len(urls))
+        if not method:
+            return
+        subject, body = self._site_share_text(urls)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(urls))
+        except tk.TclError:
+            pass
+        if method == "whatsapp":
+            webbrowser.open("https://wa.me/?text=" + quote(body))
+            self._set_status(f"Opened WhatsApp with {len(urls)} catalog site(s). The URLs are also on the clipboard.")
+            return
+        mailto = "mailto:?subject=" + quote(subject) + "&body=" + quote(body)
+        webbrowser.open(mailto)
+        self._set_status(f"Opened an email with {len(urls)} catalog site(s). The URLs are also on the clipboard.")
+
+    def _ask_share_method(self, count: int) -> str | None:
+        win = tk.Toplevel(self)
+        win.title("Share catalog sites")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(False, False)
+        result: dict[str, str | None] = {"choice": None}
+
+        def choose(method: str) -> None:
+            result["choice"] = method
+            win.destroy()
+
+        def cancel() -> None:
+            result["choice"] = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=(
+                f"Share {count} checked catalog site(s) so someone else can use them in SISU.\n"
+                "The URLs are also copied to the clipboard."
+            ),
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w")
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor="e", pady=(16, 0))
+        ttk.Button(buttons, text="Email", command=lambda: choose("email")).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="WhatsApp", command=lambda: choose("whatsapp")).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="left")
+        win.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.wait_window()
+        return result["choice"]
+
     def _share_via_outlook(self, path: Path, subject: str, body: str) -> bool:
         script = Path(tempfile.gettempdir()) / "sisu_share_excel.ps1"
         def ps_str(value: str) -> str:
@@ -2298,6 +2384,7 @@ class BookCatalogApp(tk.Tk):
         self.unknown_check.configure(state=edit_state)
         self._sync_page_limit_state()
         self.list_title_entry.configure(state=edit_state)
+        self.site_edit_btn.configure(state=edit_state)
         folder_state = "disabled" if self._list_locked else "normal"
         self.excel_folder_btn.configure(state=folder_state)
         if self._list_locked:
