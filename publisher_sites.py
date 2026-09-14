@@ -49,11 +49,11 @@ PUBLISHER_SITES: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 _STRIP_WORDS = ("הוצאת", "הוצאה לאור", "הוצאה", "לאור", "ספרים", "publishing", "books", "בעמ")
+_SKIP_WORDS = {_norm(word) for word in _STRIP_WORDS}
 
 
 def _haystack(publisher: str) -> str:
-    skip = {_norm(word) for word in _STRIP_WORDS}
-    tokens = [token for token in _norm(publisher).split() if token not in skip]
+    tokens = [token for token in _norm(publisher).split() if token not in _SKIP_WORDS]
     return f" {' '.join(tokens)} "
 
 

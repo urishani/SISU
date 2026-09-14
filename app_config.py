@@ -296,8 +296,12 @@ def llm_service_label(service: str) -> str:
     return service or "LLM"
 
 
-def configured_publisher_site(publisher: str) -> str | None:
-    mapping = load_config().get("publishers") or {}
+def configured_publisher_site(
+    publisher: str,
+    mapping: dict[str, str] | None = None,
+) -> str | None:
+    if mapping is None:
+        mapping = load_config().get("publishers") or {}
     from publisher_sites import _haystack, _norm
 
     hay = _haystack(publisher)
@@ -336,11 +340,11 @@ def merged_publisher_rows(extra_names: Iterable[str] | None = None) -> list[tupl
 
     user_map: dict[str, str] = load_config().get("publishers") or {}
     for name, url in builtin_publisher_entries():
-        add(name, configured_publisher_site(name) or url)
+        add(name, configured_publisher_site(name, user_map) or url)
     for name, url in user_map.items():
         add(name, url)
     for name in extra_names or []:
-        site = configured_publisher_site(name) or resolve_builtin_publisher_site(name) or ""
+        site = configured_publisher_site(name, user_map) or resolve_builtin_publisher_site(name) or ""
         add(name, site)
     rows.sort(key=lambda item: ((0 if not item[1] else 1), item[0]))
     return rows

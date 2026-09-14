@@ -1378,10 +1378,19 @@ class BookCatalogApp(tk.Tk):
         win.geometry("900x640")
         win.minsize(720, 520)
         self._settings_popup = win
+        load_cleanup: list = []
 
         def close() -> None:
+            for fn in load_cleanup:
+                try:
+                    fn()
+                except tk.TclError:
+                    pass
             self._settings_popup = None
-            win.destroy()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
         win.protocol("WM_DELETE_WINDOW", close)
         body = ttk.Frame(win, padding=14)
@@ -1389,19 +1398,27 @@ class BookCatalogApp(tk.Tk):
 
         tab_bar = tk.Frame(body, bg=BG)
         tab_bar.pack(fill="x", pady=(0, 8))
-        browser_tab = ttk.Frame(body, padding=12)
-        sites_tab = ttk.Frame(body, padding=12)
-        publisher_tab = ttk.Frame(body, padding=12)
-        aliases_tab = ttk.Frame(body, padding=12)
-        llm_tab = ttk.Frame(body, padding=12)
+
+        def make_tab_page() -> tuple[tk.Frame, ttk.Frame, dict[str, object]]:
+            host = tk.Frame(body, bg=BG)
+            content = ttk.Frame(host, padding=12)
+            content.pack(fill="both", expand=True)
+            return host, content, _settings_busy_overlay(host)
+
+        browser_host, browser_tab, _browser_overlay = make_tab_page()
+        sites_host, sites_tab, sites_overlay = make_tab_page()
+        publisher_host, publisher_tab, publisher_overlay = make_tab_page()
+        aliases_host, aliases_tab, aliases_overlay = make_tab_page()
+        llm_host, llm_tab, _llm_overlay = make_tab_page()
         tab_frames = {
-            "browser": browser_tab,
-            "sites": sites_tab,
-            "publishers": publisher_tab,
-            "aliases": aliases_tab,
-            "llm": llm_tab,
+            "browser": browser_host,
+            "sites": sites_host,
+            "publishers": publisher_host,
+            "aliases": aliases_host,
+            "llm": llm_host,
         }
         tab_buttons: dict[str, tk.Button] = {}
+        tab_loaders: dict[str, object] = {}
 
         def show_tab(name: str) -> None:
             for frame in tab_frames.values():
@@ -1412,6 +1429,9 @@ class BookCatalogApp(tk.Tk):
                     button.configure(bg=TAB_ON, fg=WHITE, activebackground="#A86620", activeforeground=WHITE)
                 else:
                     button.configure(bg=TAB_OFF, fg=NAVY, activebackground="#C9BBA8", activeforeground=NAVY)
+            loader = tab_loaders.get(name)
+            if callable(loader):
+                loader()
 
         def make_tab(key: str, label: str) -> None:
             button = tk.Button(
@@ -1645,14 +1665,29 @@ class BookCatalogApp(tk.Tk):
         nli_entry.pack(side="left", fill="x", expand=True, padx=8)
         _bind_entry_clipboard(nli_entry)
 
+        sites_state = {"loaded": False}
+
+        def _ensure_sites() -> None:
+            if sites_state["loaded"]:
+                return
+            sites_state["loaded"] = True
+            site_seed = [self._canonical_search_url(str(item.get("url") or "")) for item in search_sites()]
+            site_seed = [url for url in site_seed if url] or list(DEFAULT_SEARCH_URLS)
+            _fill_site_rows(site_seed)
+
+        tab_loaders["sites"] = _ensure_sites
+
         ttk.Label(
             publisher_tab,
             text="Known publisher websites are filled in. Empty rows are publishers from the current list — add their site and Save. Open opens the site in your browser.",
             wraplength=740,
         ).pack(anchor="w")
-        table_wrap = ttk.Frame(publisher_tab)
+        table_wrap = tk.Frame(publisher_tab, bg=BG)
         table_wrap.pack(fill="both", expand=True, pady=(8, 6))
-        inner = _settings_scroll_table(table_wrap, columns=(1,))
+        table_holder = ttk.Frame(table_wrap)
+        table_holder.pack(fill="both", expand=True)
+        inner = _settings_scroll_table(table_holder, columns=(1,))
+        publisher_overlay = _settings_busy_overlay(table_wrap)
 
         rows: list[tuple[tk.StringVar, tk.StringVar]] = []
 
@@ -1708,45 +1743,166 @@ class BookCatalogApp(tk.Tk):
             rows.append(pair)
 
         def _remove_and_rebuild(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
-            snapshot = [(name.get(), url.get()) for name, url in rows if (name, url) != pair]
-            _fill_rows(snapshot)
+            _harvest_publishers()
+            try:
+                index = rows.index(pair)
+            except ValueError:
+                return
+            if 0 <= index < len(publisher_store):
+                del publisher_store[index]
+            snapshot = [(name, url) for name, url in publisher_store]
+            _fill_rows(snapshot, str(publishers_state.get("highlight") or ""))
+
+        publisher_store: list[list[str]] = []
+        publishers_state: dict[str, object] = {
+            "started": False,
+            "ready": False,
+            "job": None,
+            "highlight": "",
+        }
+        add_pub_btn = ttk.Button(publisher_tab, text="Add publisher")
+        add_pub_btn.pack(anchor="w")
+        add_pub_btn.configure(state="disabled")
+
+        def _harvest_publishers() -> None:
+            for index, (name_var, url_var) in enumerate(rows):
+                if index < len(publisher_store):
+                    publisher_store[index][0] = name_var.get()
+                    publisher_store[index][1] = url_var.get()
+                else:
+                    publisher_store.append([name_var.get(), url_var.get()])
+
+        def _cancel_publisher_job() -> None:
+            job = publishers_state.get("job")
+            if job is not None:
+                try:
+                    win.after_cancel(job)
+                except tk.TclError:
+                    pass
+                publishers_state["job"] = None
+
+        def _publisher_headers() -> None:
+            ttk.Label(inner, text="Publisher", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+            ttk.Label(inner, text="Website", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
+            ttk.Label(inner, text="").grid(row=0, column=2)
+
+        def _chunk_fill_publishers() -> None:
+            if not win.winfo_exists():
+                return
+            start = len(rows)
+            remaining = publisher_store[start:]
+            if not remaining:
+                publishers_state["ready"] = True
+                add_pub_btn.configure(state="normal")
+                publisher_overlay["hide"]()
+                publishers_state["job"] = None
+                return
+            publisher_overlay["show"]()
+            batch = remaining[:SETTINGS_FILL_BATCH]
+            highlight = str(publishers_state.get("highlight") or "")
+            _suspend_settings_table(inner, True)
+            for name, url in batch:
+                _append_data_row(
+                    name,
+                    url,
+                    highlight=bool(highlight) and publishers_match(name, highlight),
+                )
+            _suspend_settings_table(inner, False)
+            publishers_state["job"] = win.after(1, _chunk_fill_publishers)
 
         def _fill_rows(items: list[tuple[str, str]], highlight_name: str = "") -> None:
+            _cancel_publisher_job()
+            publishers_state["highlight"] = highlight_name
+            publisher_store[:] = [[name, url] for name, url in items]
+            publishers_state["ready"] = False
+            add_pub_btn.configure(state="disabled")
+            publisher_overlay["show"]()
             _suspend_settings_table(inner, True)
             for child in inner.winfo_children():
                 child.destroy()
             rows.clear()
-            ttk.Label(inner, text="Publisher", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
-            ttk.Label(inner, text="Website", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
-            ttk.Label(inner, text="").grid(row=0, column=2)
-            for name, url in items:
-                _append_data_row(
-                    name,
-                    url,
-                    highlight=bool(highlight_name) and publishers_match(name, highlight_name),
-                )
+            _publisher_headers()
             _suspend_settings_table(inner, False)
+            _chunk_fill_publishers()
 
-        seed = merged_publisher_rows(self._current_publishers())
-        if focus_publisher.strip() and not any(publishers_match(focus_publisher, name) for name, _url in seed):
-            seed.insert(0, (focus_publisher.strip(), ""))
+        def _add_publisher() -> None:
+            if not publishers_state["ready"]:
+                return
+            _harvest_publishers()
+            publisher_store.append(["", ""])
+            _append_data_row("", "", highlight=True)
 
-        ttk.Button(
-            publisher_tab,
-            text="Add publisher",
-            command=lambda: _append_data_row("", "", highlight=True),
-        ).pack(anchor="w")
+        def _ensure_publishers() -> None:
+            if publishers_state["ready"]:
+                publisher_overlay["hide"]()
+                return
+            publisher_overlay["show"]()
+            if publishers_state["started"]:
+                return
+            publishers_state["started"] = True
+            extra = list(self._current_publishers())
+            wanted = focus_publisher.strip()
+
+            def work() -> None:
+                seed = merged_publisher_rows(extra)
+                if wanted and not any(publishers_match(wanted, name) for name, _url in seed):
+                    seed.insert(0, (wanted, ""))
+
+                def apply() -> None:
+                    if not win.winfo_exists():
+                        return
+                    _fill_rows(seed, highlight_name=wanted)
+
+                try:
+                    win.after(0, apply)
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
+
+        add_pub_btn.configure(command=_add_publisher)
+        tab_loaders["publishers"] = _ensure_publishers
+        load_cleanup.append(_cancel_publisher_job)
 
         ttk.Label(
             aliases_tab,
             text="Page labels found on bookstore sites, and the catalog field each one should fill. Add a row, then Save.",
             wraplength=740,
         ).pack(anchor="w")
-        alias_wrap = ttk.Frame(aliases_tab)
-        alias_wrap.pack(fill="both", expand=True, pady=(8, 4))
-        alias_inner = _settings_scroll_table(alias_wrap, columns=(0, 1))
+        alias_tools = ttk.Frame(aliases_tab)
+        alias_tools.pack(fill="x", pady=(8, 4))
+        ttk.Label(alias_tools, text="Find").pack(side="left")
+        alias_filter = tk.StringVar()
+        alias_filter_entry = ttk.Entry(alias_tools, textvariable=alias_filter)
+        alias_filter_entry.pack(side="left", fill="x", expand=True, padx=(8, 12))
+        self._callout(alias_filter_entry, "Type to show only page labels that contain this text.")
+        sort_az = ttk.Button(alias_tools, text="A–Z", command=lambda: _sort_aliases(False))
+        sort_az.pack(side="left")
+        self._callout(sort_az, "Sort page labels alphabetically, A to Z.")
+        sort_za = ttk.Button(alias_tools, text="Z–A", command=lambda: _sort_aliases(True))
+        sort_za.pack(side="left", padx=(6, 0))
+        self._callout(sort_za, "Sort page labels alphabetically, Z to A.")
+        alias_count = tk.StringVar(value="")
+        ttk.Label(aliases_tab, textvariable=alias_count).pack(anchor="w")
+        alias_wrap = tk.Frame(aliases_tab, bg=BG)
+        alias_wrap.pack(fill="both", expand=True, pady=(4, 4))
+        alias_holder = ttk.Frame(alias_wrap)
+        alias_holder.pack(fill="both", expand=True)
+        alias_inner = _settings_scroll_table(alias_holder, columns=(0, 1))
+        aliases_overlay = _settings_busy_overlay(alias_wrap)
         alias_rows: list[tuple[tk.StringVar, tk.StringVar]] = []
+        alias_store: list[list[str]] = []
+        alias_view_map: list[int] = []
         field_choices = sorted(EXCEL_TARGETS.keys())
+        aliases_state: dict[str, object] = {
+            "loaded": False,
+            "ready": False,
+            "job": None,
+            "filter_job": None,
+            "generation": 0,
+        }
+        add_label_btn = ttk.Button(aliases_tab, text="Add label")
+        add_label_btn.configure(state="disabled")
 
         def _append_alias_row(label: str = "", field: str = "") -> None:
             label_var = tk.StringVar(value=label)
@@ -1771,24 +1927,120 @@ class BookCatalogApp(tk.Tk):
             ).grid(row=grid_row, column=2, pady=3)
             alias_rows.append(pair)
 
-        def _remove_alias_row(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
-            snapshot = [(label.get(), field.get()) for label, field in alias_rows if (label, field) != pair]
-            _fill_alias_rows(snapshot)
+        def _harvest_aliases() -> None:
+            for widget_i, store_i in enumerate(alias_view_map):
+                if widget_i < len(alias_rows) and store_i < len(alias_store):
+                    alias_store[store_i][0] = alias_rows[widget_i][0].get()
+                    alias_store[store_i][1] = alias_rows[widget_i][1].get()
 
-        def _fill_alias_rows(items: list[tuple[str, str]]) -> None:
+        def _visible_alias_indices() -> list[int]:
+            needle = alias_filter.get().strip().casefold()
+            indices: list[int] = []
+            for index, (label, _field) in enumerate(alias_store):
+                if not needle or not str(label).strip() or needle in str(label).casefold():
+                    indices.append(index)
+            return indices
+
+        def _cancel_alias_job() -> None:
+            for key in ("job", "filter_job"):
+                job = aliases_state.get(key)
+                if job is not None:
+                    try:
+                        win.after_cancel(job)
+                    except tk.TclError:
+                        pass
+                    aliases_state[key] = None
+
+        def _refresh_alias_count(shown: int | None = None) -> None:
+            total = len(alias_store)
+            visible = shown if shown is not None else len(alias_view_map)
+            if alias_filter.get().strip():
+                alias_count.set(f"Showing {visible} of {total}")
+            else:
+                alias_count.set(f"{total} labels")
+
+        def _reset_alias_table() -> None:
             _suspend_settings_table(alias_inner, True)
             for child in alias_inner.winfo_children():
                 child.destroy()
             alias_rows.clear()
+            alias_view_map.clear()
             ttk.Label(alias_inner, text="Page label", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
             ttk.Label(alias_inner, text="Catalog field", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
-            for label, field in items:
-                _append_alias_row(label, field)
             _suspend_settings_table(alias_inner, False)
+
+        def _chunk_fill_aliases(pending: list[int], pos: int, generation: int) -> None:
+            if not win.winfo_exists() or generation != aliases_state["generation"]:
+                return
+            if pos >= len(pending):
+                aliases_state["ready"] = True
+                aliases_state["job"] = None
+                add_label_btn.configure(state="normal")
+                aliases_overlay["hide"]()
+                _refresh_alias_count(len(pending))
+                return
+            aliases_overlay["show"]()
+            batch = pending[pos : pos + SETTINGS_FILL_BATCH]
+            _suspend_settings_table(alias_inner, True)
+            for store_i in batch:
+                label, field = alias_store[store_i]
+                _append_alias_row(label, field)
+                alias_view_map.append(store_i)
+            _suspend_settings_table(alias_inner, False)
+            aliases_state["job"] = win.after(
+                1, lambda: _chunk_fill_aliases(pending, pos + len(batch), generation)
+            )
+
+        def _fill_alias_view(*, harvest: bool = True) -> None:
+            if harvest:
+                _harvest_aliases()
+            _cancel_alias_job()
+            aliases_state["ready"] = False
+            aliases_state["generation"] = int(aliases_state["generation"] or 0) + 1
+            add_label_btn.configure(state="disabled")
+            aliases_overlay["show"]()
+            _reset_alias_table()
+            pending = _visible_alias_indices()
+            _refresh_alias_count(len(pending))
+            _chunk_fill_aliases(pending, 0, int(aliases_state["generation"]))
+
+        def _remove_alias_row(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
+            _harvest_aliases()
+            try:
+                widget_i = alias_rows.index(pair)
+            except ValueError:
+                return
+            store_i = alias_view_map[widget_i]
+            del alias_store[store_i]
+            _fill_alias_view(harvest=False)
+
+        def _add_alias_row() -> None:
+            if not aliases_state["ready"]:
+                return
+            _harvest_aliases()
+            alias_store.append(["", ""])
+            _fill_alias_view(harvest=False)
+
+        def _sort_aliases(descending: bool) -> None:
+            if not aliases_state["loaded"]:
+                return
+            _harvest_aliases()
+            alias_store.sort(key=lambda item: (item[0].casefold(), item[1].casefold()), reverse=descending)
+            _fill_alias_view(harvest=False)
+
+        def _on_alias_filter(_event: object = None) -> None:
+            if not aliases_state["loaded"]:
+                return
+            job = aliases_state.get("filter_job")
+            if job is not None:
+                try:
+                    win.after_cancel(job)
+                except tk.TclError:
+                    pass
+            aliases_state["filter_job"] = win.after(120, lambda: _fill_alias_view(harvest=True))
 
         alias_comment = ""
         cover_items: list[tuple[str, str]] = []
-        loaded_aliases: list[tuple[str, str]] = []
         if ALIASES_PATH.exists():
             try:
                 parsed = json.loads(ALIASES_PATH.read_text(encoding="utf-8"))
@@ -1798,14 +2050,24 @@ class BookCatalogApp(tk.Tk):
                 alias_comment = str(parsed.get("comment") or "")
                 aliases_map = parsed.get("aliases") or {}
                 if isinstance(aliases_map, dict):
-                    loaded_aliases = sorted(
-                        ((str(label), str(field)) for label, field in aliases_map.items() if str(label).strip()),
-                        key=lambda item: (item[1].casefold(), item[0].casefold()),
+                    alias_store.extend(
+                        sorted(
+                            (
+                                [str(label), str(field)]
+                                for label, field in aliases_map.items()
+                                if str(label).strip()
+                            ),
+                            key=lambda item: (item[1].casefold(), item[0].casefold()),
+                        )
                     )
                 covers_map = parsed.get("cover_values") or {}
                 if isinstance(covers_map, dict):
                     cover_items = [(str(word), str(code)) for word, code in covers_map.items()]
-        ttk.Button(aliases_tab, text="Add label", command=lambda: _append_alias_row("", "")).pack(anchor="w")
+        cover_store: list[list[str]] = [[word, code] for word, code in cover_items]
+        add_label_btn.configure(command=_add_alias_row)
+        add_label_btn.pack(anchor="w")
+        alias_filter_entry.bind("<KeyRelease>", _on_alias_filter)
+        _bind_entry_clipboard(alias_filter_entry)
 
         ttk.Label(
             aliases_tab,
@@ -1841,6 +2103,10 @@ class BookCatalogApp(tk.Tk):
             ).grid(row=grid_row, column=2, pady=3)
             cover_rows.append(pair)
 
+        def _harvest_covers() -> None:
+            if cover_rows:
+                cover_store[:] = [[word.get(), code.get()] for word, code in cover_rows]
+
         def _remove_cover_row(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
             snapshot = [(word.get(), code.get()) for word, code in cover_rows if (word, code) != pair]
             _fill_cover_rows(snapshot)
@@ -1857,6 +2123,22 @@ class BookCatalogApp(tk.Tk):
             for word, code in items:
                 _append_cover_row(word, code)
             _suspend_settings_table(cover_inner, False)
+            cover_store[:] = [[word, code] for word, code in items]
+
+        def _ensure_aliases() -> None:
+            if aliases_state["ready"]:
+                aliases_overlay["hide"]()
+                return
+            aliases_overlay["show"]()
+            if aliases_state["loaded"]:
+                return
+            aliases_state["loaded"] = True
+            if not cover_rows:
+                _fill_cover_rows([(word, code) for word, code in cover_store])
+            _fill_alias_view(harvest=False)
+
+        tab_loaders["aliases"] = _ensure_aliases
+        load_cleanup.append(_cancel_alias_job)
 
         ttk.Button(aliases_tab, text="Add cover word", command=lambda: _append_cover_row("", "")).pack(anchor="w")
 
@@ -2075,10 +2357,12 @@ class BookCatalogApp(tk.Tk):
         _sync_llm_enabled()
 
         def save_aliases() -> bool:
+            _harvest_aliases()
+            _harvest_covers()
             aliases: dict[str, str] = {}
-            for label_var, field_var in alias_rows:
-                label = label_var.get().strip()
-                field = field_var.get().strip()
+            for label, field in alias_store:
+                label = str(label or "").strip()
+                field = str(field or "").strip()
                 if not label:
                     continue
                 if not field:
@@ -2086,9 +2370,9 @@ class BookCatalogApp(tk.Tk):
                     return False
                 aliases[label] = field
             covers: dict[str, str] = {}
-            for word_var, code_var in cover_rows:
-                word = word_var.get().strip()
-                code = code_var.get().strip().upper()
+            for word, code in cover_store:
+                word = str(word or "").strip()
+                code = str(code or "").strip().upper()
                 if not word:
                     continue
                 if code not in {"S", "H", "BB"}:
@@ -2115,12 +2399,21 @@ class BookCatalogApp(tk.Tk):
         ).pack(side="left")
 
         def save() -> None:
-            publishers: dict[str, str] = {}
-            for name_var, url_var in rows:
-                name = name_var.get().strip()
-                if not name:
-                    continue
-                publishers[name] = normalize_site_url(url_var.get())
+            current = load_config()
+            if publishers_state["started"] and publisher_store:
+                _harvest_publishers()
+                publishers = {}
+                for name, url in publisher_store:
+                    name = str(name or "").strip()
+                    if not name:
+                        continue
+                    publishers[name] = normalize_site_url(str(url or ""))
+            else:
+                publishers = {
+                    str(name): str(url or "")
+                    for name, url in (current.get("publishers") or {}).items()
+                    if str(name).strip()
+                }
             previous_enabled = {
                 self._search_site_key(str(item.get("url") or "")): bool(item.get("enabled", True))
                 for item in search_sites()
@@ -2131,23 +2424,31 @@ class BookCatalogApp(tk.Tk):
                 previous_enabled[self._search_site_key(str(row.get("url") or ""))] = bool(row["var"].get())
             sites: list[dict] = []
             seen_sites: set[str] = set()
-            for index, var in enumerate(site_vars):
-                url = self._canonical_search_url(var.get())
-                key = self._search_site_key(url)
-                if not url or not key or key in seen_sites:
-                    continue
-                seen_sites.add(key)
-                old_url = original_site_urls[index] if index < len(original_site_urls) else ""
-                old_key = self._search_site_key(old_url)
-                enabled = previous_enabled.get(old_key, True) if old_key else True
-                sites.append({"url": url, "enabled": enabled})
+            if sites_state["loaded"]:
+                for index, var in enumerate(site_vars):
+                    url = self._canonical_search_url(var.get())
+                    key = self._search_site_key(url)
+                    if not url or not key or key in seen_sites:
+                        continue
+                    seen_sites.add(key)
+                    old_url = original_site_urls[index] if index < len(original_site_urls) else ""
+                    old_key = self._search_site_key(old_url)
+                    enabled = previous_enabled.get(old_key, True) if old_key else True
+                    sites.append({"url": url, "enabled": enabled})
+            else:
+                for item in search_sites():
+                    url = self._canonical_search_url(str(item.get("url") or ""))
+                    key = self._search_site_key(url)
+                    if not url or not key or key in seen_sites:
+                        continue
+                    seen_sites.add(key)
+                    sites.append({"url": url, "enabled": bool(item.get("enabled", True))})
             try:
                 llm_fields = _llm_fields()
             except ValueError as exc:
                 show_tab("llm")
                 messagebox.showerror("LLM", str(exc))
                 return
-            current = load_config()
             current_llm = dict(current.get("llm") or {})
             current_llm.update(llm_fields)
             save_config(
@@ -2196,13 +2497,6 @@ class BookCatalogApp(tk.Tk):
         show_tab(start_tab)
         win.lift()
         win.focus_force()
-        win.update_idletasks()
-        _fill_rows(seed, highlight_name=focus_publisher)
-        site_seed = [self._canonical_search_url(str(item.get("url") or "")) for item in search_sites()]
-        site_seed = [url for url in site_seed if url] or list(DEFAULT_SEARCH_URLS)
-        _fill_site_rows(site_seed)
-        _fill_alias_rows(loaded_aliases)
-        _fill_cover_rows(cover_items)
 
     def _on_list_title_change(self) -> None:
         self._bind_list_excel_path(rename_existing=not self._list_locked)
@@ -6144,6 +6438,40 @@ def _bind_combobox_clipboard(combo: ttk.Combobox) -> None:
     for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Shift-Insert>", "<Button-2>"):
         combo.bind(sequence, paste)
     combo.bind("<Control-KeyPress>", on_ctrl)
+
+
+SETTINGS_FILL_BATCH = 12
+
+
+def _settings_busy_overlay(parent: tk.Widget) -> dict[str, object]:
+    overlay = tk.Frame(parent, bg=WHITE)
+    box = ttk.Frame(overlay, padding=16)
+    box.place(relx=0.5, rely=0.5, anchor="center")
+    bar = ttk.Progressbar(box, mode="indeterminate", length=168)
+    bar.pack()
+    ttk.Label(box, text="Loading…", font=("Segoe UI", 10)).pack(pady=(10, 0))
+    running = [False]
+
+    def show() -> None:
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        overlay.lift()
+        if not running[0]:
+            bar.start(12)
+            running[0] = True
+
+    def hide() -> None:
+        if running[0]:
+            try:
+                bar.stop()
+            except tk.TclError:
+                pass
+            running[0] = False
+        try:
+            overlay.place_forget()
+        except tk.TclError:
+            pass
+
+    return {"show": show, "hide": hide, "frame": overlay}
 
 
 def _settings_scroll_table(
