@@ -926,9 +926,9 @@ class Book:
         from hebrew_text import hebrew_phonetic, split_hebrew_latin
 
         current = (self.title_phonetic or "").strip()
-        if current and not has_hebrew(current) and not allow_llm:
-            return False
-        if current and not has_hebrew(current) and (self.extra.get("phonetic_source") or "") == "llm":
+        source_tag = (self.extra.get("phonetic_source") or "").strip()
+        locked = source_tag in {"llm", "manual"}
+        if current and not has_hebrew(current) and locked and not allow_llm:
             return False
         hebrew, _latin = split_hebrew_latin(self.title)
         source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
@@ -941,17 +941,22 @@ class Book:
             if generated and not has_hebrew(generated) and generated != current:
                 self.title_phonetic = generated
                 self.extra["phonetic_source"] = (
-                    "llm" if llm_client.last_phonetic_report.succeeded else "algorithm"
+                    "llm" if llm_client.last_phonetic_report.succeeded else "model"
                 )
                 return True
             generated = generated or hebrew_phonetic(source)
         else:
             generated = hebrew_phonetic(source)
-        if not generated or generated == current:
+        if not generated:
+            return False
+        if generated == current:
+            if source_tag in {"", "algorithm"}:
+                self.extra["phonetic_source"] = "model"
+            return False
+        if locked:
             return False
         self.title_phonetic = generated
-        if not (self.extra.get("phonetic_source") or "").strip():
-            self.extra["phonetic_source"] = "algorithm"
+        self.extra["phonetic_source"] = "model"
         return True
 
     def identity_code(self) -> str:
@@ -1959,7 +1964,7 @@ def fill_missing_phonetics(books: list[Book], *, use_llm: bool = True) -> int:
             if offset in llm_set:
                 book.extra["phonetic_source"] = "llm"
             elif was_missing and not (book.extra.get("phonetic_source") or "").strip():
-                book.extra["phonetic_source"] = "algorithm"
+                book.extra["phonetic_source"] = "model"
             if was_missing:
                 filled += 1
     return filled
