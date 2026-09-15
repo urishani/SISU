@@ -215,6 +215,7 @@ ERROR_BG = "#FDECEC"
 FINAL_FG = "#0B57D0"
 FINAL_BG = "#E8F0FE"
 ICON_HEADER_BG = "#EDE6DA"
+ICON_HEADER_CANVAS = 33
 ICON_OPEN = "\uE72D"
 ICON_OPEN_FALLBACK = "↗"
 ICON_EDIT = "\uE70F"
@@ -902,7 +903,7 @@ class BookCatalogApp(tk.Tk):
             width = max(int(canvas.cget("width") or 0), 22)
             height = max(int(canvas.cget("height") or 0), 22)
         except (tk.TclError, TypeError, ValueError):
-            width, height = 33, 33
+            width, height = ICON_HEADER_CANVAS, ICON_HEADER_CANVAS
         scale = min(width, height) / 22
         left = (6 * scale, 11 * scale)
         top = (16 * scale, 5 * scale)
@@ -936,17 +937,17 @@ class BookCatalogApp(tk.Tk):
             width = max(int(canvas.cget("width") or 0), 22)
             height = max(int(canvas.cget("height") or 0), 22)
         except (tk.TclError, TypeError, ValueError):
-            width, height = 33, 33
+            width, height = ICON_HEADER_CANVAS, ICON_HEADER_CANVAS
         scale = min(width, height) / 22
         line_w = max(2, round(2 * scale))
-        left = 5 * scale
-        right = 17 * scale
-        lip = 13 * scale
-        bottom = 18 * scale
+        left = 3 * scale
+        right = 19 * scale
+        lip = 12 * scale
+        bottom = 19.5 * scale
         cx = (left + right) / 2
-        arrow_top = 3.5 * scale
-        arrow_tip = 12 * scale
-        wing = 4 * scale
+        arrow_top = 2.5 * scale
+        arrow_tip = 11.5 * scale
+        wing = 5 * scale
         canvas.create_line(cx, arrow_top, cx, arrow_tip, fill=color, width=line_w, capstyle=tk.ROUND)
         canvas.create_line(
             cx,
@@ -997,8 +998,8 @@ class BookCatalogApp(tk.Tk):
         if paint is not None:
             btn = tk.Canvas(
                 parent,
-                width=33,
-                height=33,
+                width=ICON_HEADER_CANVAS,
+                height=ICON_HEADER_CANVAS,
                 bg=bg,
                 highlightthickness=0,
                 cursor="hand2",
