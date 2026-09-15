@@ -541,6 +541,13 @@ class BookCatalogApp(tk.Tk):
             tip="Share the checked catalog sites by email or WhatsApp so someone else can add them in SISU.",
         )
         self.site_share_btn.pack(side="right", padx=(0, 8), pady=2)
+        self.site_bulk_btn = self._site_header_icon(
+            site_header,
+            kind="import_sites",
+            command=self.bulk_add_site_urls,
+            tip="Paste catalog URLs someone shared with you. Sites already in the list are skipped.",
+        )
+        self.site_bulk_btn.pack(side="right", padx=(0, 6), pady=2)
         self.site_edit_btn = self._site_header_icon(
             site_header,
             glyph=ICON_EDIT,
@@ -923,6 +930,46 @@ class BookCatalogApp(tk.Tk):
                 width=line_w,
             )
 
+    def _paint_import_sites(self, canvas: tk.Canvas, *, color: str, bg: str) -> None:
+        canvas.delete("all")
+        try:
+            width = max(int(canvas.cget("width") or 0), 22)
+            height = max(int(canvas.cget("height") or 0), 22)
+        except (tk.TclError, TypeError, ValueError):
+            width, height = 33, 33
+        scale = min(width, height) / 22
+        line_w = max(2, round(2 * scale))
+        left = 5 * scale
+        right = 17 * scale
+        lip = 13 * scale
+        bottom = 18 * scale
+        cx = (left + right) / 2
+        arrow_top = 3.5 * scale
+        arrow_tip = 12 * scale
+        wing = 4 * scale
+        canvas.create_line(cx, arrow_top, cx, arrow_tip, fill=color, width=line_w, capstyle=tk.ROUND)
+        canvas.create_line(
+            cx,
+            arrow_tip,
+            cx - wing,
+            arrow_tip - wing,
+            fill=color,
+            width=line_w,
+            capstyle=tk.ROUND,
+        )
+        canvas.create_line(
+            cx,
+            arrow_tip,
+            cx + wing,
+            arrow_tip - wing,
+            fill=color,
+            width=line_w,
+            capstyle=tk.ROUND,
+        )
+        canvas.create_line(left, lip, left, bottom, fill=color, width=line_w, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        canvas.create_line(left, bottom, right, bottom, fill=color, width=line_w, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        canvas.create_line(right, bottom, right, lip, fill=color, width=line_w, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
     def _make_icon_button(
         self,
         parent: tk.Misc,
@@ -942,7 +989,12 @@ class BookCatalogApp(tk.Tk):
                 return
             command()
 
-        if kind == "share_nodes":
+        painters = {
+            "share_nodes": self._paint_share_nodes,
+            "import_sites": self._paint_import_sites,
+        }
+        paint = painters.get(kind)
+        if paint is not None:
             btn = tk.Canvas(
                 parent,
                 width=33,
@@ -951,11 +1003,11 @@ class BookCatalogApp(tk.Tk):
                 highlightthickness=0,
                 cursor="hand2",
             )
-            self._paint_share_nodes(btn, color=enabled_color, bg=bg)
+            paint(btn, color=enabled_color, bg=bg)
 
-            def set_enabled(on: bool) -> None:
+            def set_enabled(on: bool, draw=paint) -> None:
                 btn._icon_enabled = bool(on)
-                self._paint_share_nodes(btn, color=enabled_color if on else disabled_color, bg=bg)
+                draw(btn, color=enabled_color if on else disabled_color, bg=bg)
                 btn.configure(cursor="hand2" if on else "arrow")
 
             btn._set_icon_enabled = set_enabled
@@ -2704,7 +2756,7 @@ class BookCatalogApp(tk.Tk):
         title = self.list_title.get().strip() or "SISU"
         subject = f"SISU catalog sites from {title}"
         lines = [
-            "Here are SISU catalog sites to search. Add them in SISU: Settings → Site URLs (one URL per line).",
+            "Here are SISU catalog sites to search. In SISU, click the receive icon next to Share on Site URLs and paste them (one URL per line).",
             "",
             *urls,
         ]
@@ -2734,6 +2786,53 @@ class BookCatalogApp(tk.Tk):
         mailto = "mailto:?subject=" + quote(subject) + "&body=" + quote(body)
         webbrowser.open(mailto)
         self._set_status(f"Opened an email with {len(urls)} catalog site(s). The URLs are also on the clipboard.")
+
+    def bulk_add_site_urls(self) -> None:
+        if self._guard_locked("add catalog sites"):
+            return
+        if self._busy:
+            return
+        incoming = self._ask_bulk_site_urls(self)
+        if incoming is None:
+            return
+        selected = list(self._checked_site_urls())
+        catalog: list[dict] = []
+        known: set[str] = set()
+        for item in search_sites() or []:
+            url = self._canonical_search_url(str(item.get("url") or ""))
+            key = self._search_site_key(url)
+            if not url or not key or key in known:
+                continue
+            known.add(key)
+            catalog.append({"url": url, "enabled": bool(item.get("enabled", True))})
+        added: list[str] = []
+        skipped = 0
+        for raw in incoming:
+            url = self._canonical_search_url(raw)
+            key = self._search_site_key(url)
+            if not url or not key:
+                continue
+            if key in known:
+                skipped += 1
+                continue
+            known.add(key)
+            catalog.append({"url": url, "enabled": True})
+            added.append(url)
+        if not added:
+            messagebox.showinfo(
+                "Add catalog sites",
+                "Those sites are already in the list." if skipped else "No catalog URLs were found.",
+            )
+            return
+        update_search_sites(catalog)
+        self._rebuild_site_url_list(selected=selected + added, catalog=catalog)
+        self._persist_site_enabled()
+        if getattr(self, "_list_actions_ready", False):
+            self._persist_working()
+        self._sync_search_action_buttons()
+        extra = f" Skipped {skipped} already in the list." if skipped else ""
+        self._set_status(f"Added {len(added)} catalog site(s).{extra}")
+        messagebox.showinfo("Add catalog sites", f"Added {len(added)} catalog site(s).{extra}")
 
     def _ask_share_method(self, count: int) -> str | None:
         win = tk.Toplevel(self)
@@ -3070,6 +3169,8 @@ class BookCatalogApp(tk.Tk):
         self._sync_page_limit_state()
         self.list_title_entry.configure(state=edit_state)
         self._set_site_icon_enabled(self.site_edit_btn, not self._list_locked)
+        if getattr(self, "site_bulk_btn", None):
+            self._set_site_icon_enabled(self.site_bulk_btn, not (self._list_locked or self._busy))
         folder_state = "disabled" if self._list_locked else "normal"
         self.excel_folder_btn.configure(state=folder_state)
         if self._list_locked:
