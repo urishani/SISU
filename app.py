@@ -367,6 +367,10 @@ class BookCatalogApp(tk.Tk):
             )
         except tk.TclError:
             pass
+        deep_font = tkfont.Font(self, family="Segoe UI", size=10)
+        deep_row = max(36, int(deep_font.metrics("linespace") or 16) + 20)
+        style.configure("Deep.Treeview", font=("Segoe UI", 10), rowheight=deep_row)
+        style.configure("Deep.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
     def _build(self) -> None:
         header = tk.Frame(self, bg=NAVY)
@@ -633,7 +637,9 @@ class BookCatalogApp(tk.Tk):
             self.search_btn,
             "Search the checked bookstore URLs, merge unique titles into one list, then fill catalog and publisher pages.",
         )
-        self.deep_btn = ttk.Button(buttons, text="Deep search", command=self.open_deep_search)
+        self.deep_btn = ttk.Button(
+            buttons, text="Deep search", command=self.open_deep_search, style="Accent.TButton"
+        )
         self.deep_btn.pack(side="left", padx=(0, 4))
         self._callout(
             self.deep_btn,
@@ -1291,6 +1297,7 @@ class BookCatalogApp(tk.Tk):
         self._refresh_site_list_canvas()
         self.after_idle(self._refresh_site_list_canvas)
         self._set_site_list_enabled(not (self._list_locked or self._busy))
+        self._sync_search_action_buttons()
 
     def _refresh_site_list_canvas(self) -> None:
         self._fit_search_fields()
@@ -1320,6 +1327,7 @@ class BookCatalogApp(tk.Tk):
         if self._site_list_updating:
             return
         self._sync_site_all_mark()
+        self._sync_search_action_buttons()
         self._persist_site_enabled()
         if getattr(self, "_list_actions_ready", False):
             self._persist_working()
@@ -3037,15 +3045,24 @@ class BookCatalogApp(tk.Tk):
         self._apply_lock_state()
         self._update_list_action_buttons()
 
-    def _apply_lock_state(self) -> None:
-        search_state = "disabled" if (self._list_locked or self._busy) else "normal"
-        edit_state = "disabled" if self._list_locked else "normal"
-        self.search_btn.configure(state=search_state)
+    def _has_checked_search_site(self) -> bool:
+        return any(
+            row.get("var") and bool(row["var"].get())
+            for row in getattr(self, "_site_rows", [])
+        )
+
+    def _sync_search_action_buttons(self) -> None:
+        blocked = bool(self._list_locked or self._busy or getattr(self, "_updating", False))
+        if getattr(self, "search_btn", None):
+            search_on = (not blocked) and self._has_checked_search_site()
+            self.search_btn.configure(state="normal" if search_on else "disabled")
         if getattr(self, "deep_btn", None):
-            if self._deep_running:
-                self.deep_btn.configure(state="normal")
-            else:
-                self.deep_btn.configure(state=search_state)
+            deep_on = bool(self._deep_running) or ((not blocked) and bool(self.books))
+            self.deep_btn.configure(state="normal" if deep_on else "disabled")
+
+    def _apply_lock_state(self) -> None:
+        edit_state = "disabled" if self._list_locked else "normal"
+        self._sync_search_action_buttons()
         self._set_site_list_enabled(not (self._list_locked or self._busy))
         self.year_entry.configure(state=edit_state)
         self.no_limit_check.configure(state=edit_state)
@@ -3481,7 +3498,7 @@ class BookCatalogApp(tk.Tk):
 
         self._cancel.clear()
         self._busy = True
-        self.search_btn.configure(state="disabled")
+        self._apply_lock_state()
         self._set_site_list_enabled(False)
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
@@ -4290,7 +4307,7 @@ class BookCatalogApp(tk.Tk):
             return
         self._cancel.clear()
         self._busy = True
-        self.search_btn.configure(state="disabled")
+        self._apply_lock_state()
         self._set_site_list_enabled(False)
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
@@ -4627,21 +4644,34 @@ class BookCatalogApp(tk.Tk):
         win.configure(bg=BG)
         win.transient(self)
         win.geometry("980x560")
-        win.minsize(720, 380)
+        win.minsize(720, 420)
         self._deep_popup = win
         win.protocol("WM_DELETE_WINDOW", self._close_deep_search)
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
         ttk.Label(
             body,
             text="Books on this list, grouped by publisher. Start crawls only publishers that have a website. Stop cancels the crawl and skips the rest. Closing this window does not stop a run that is already going.",
             wraplength=940,
-        ).pack(anchor="w")
-        ttk.Label(body, textvariable=self._deep_status, wraplength=940).pack(anchor="w", pady=(6, 8))
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(body, textvariable=self._deep_status, wraplength=940).grid(
+            row=1, column=0, sticky="ew", pady=(6, 8)
+        )
         wrap = ttk.Frame(body)
-        wrap.pack(fill="both", expand=True)
+        wrap.grid(row=2, column=0, sticky="nsew")
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
         columns = ("publisher", "site", "books", "used", "comment")
-        tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="browse")
+        tree = ttk.Treeview(
+            wrap,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            style="Deep.Treeview",
+            height=14,
+        )
         tree.heading("publisher", text="Publisher")
         tree.heading("site", text="Website")
         tree.heading("books", text="Books")
@@ -4654,17 +4684,19 @@ class BookCatalogApp(tk.Tk):
         tree.column("comment", width=360, anchor="w")
         scroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        tree.pack(side="left", fill="both", expand=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
         tree.tag_configure("missing", foreground="#8A6A32")
         tree.tag_configure("running", background="#E8F0FE")
         tree.tag_configure("done", background="#E4F7EA")
         tree.tag_configure("skipped", foreground="#7A7A7A")
         tree.tag_configure("stopped", background="#FDECEC")
         self._deep_tree = tree
+        self._apply_deep_tree_rowheight()
+        tree.after_idle(self._apply_deep_tree_rowheight)
         tree.bind("<Double-1>", lambda _e: self._deep_open_selected_site())
         buttons = ttk.Frame(body)
-        buttons.pack(fill="x", pady=(10, 0))
+        buttons.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         self._deep_start_btn = ttk.Button(buttons, text="Start", command=self.start_deep_search, style="Accent.TButton")
         self._deep_start_btn.pack(side="left")
         self._deep_stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
@@ -4707,6 +4739,18 @@ class BookCatalogApp(tk.Tk):
         )
         self._paint_deep_tree()
         self._sync_deep_buttons()
+
+    def _apply_deep_tree_rowheight(self) -> None:
+        tree = self._deep_tree
+        if tree is None:
+            return
+        row_font = tkfont.Font(tree, family="Segoe UI", size=10)
+        height = max(36, int(row_font.metrics("linespace") or 16) + 20)
+        ttk.Style(self).configure("Deep.Treeview", font=("Segoe UI", 10), rowheight=height)
+        try:
+            tree.configure(style="Deep.Treeview")
+        except tk.TclError:
+            pass
 
     def _paint_deep_tree(self) -> None:
         tree = self._deep_tree
@@ -5210,9 +5254,8 @@ class BookCatalogApp(tk.Tk):
 
     def _finish_more(self, payload: dict | None) -> None:
         self._busy = False
-        self.search_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self._update_list_action_buttons()
+        self._apply_lock_state()
         remap = (payload or {}).get("remap") or None
         selected = (payload or {}).get("selected") or self._selected_book
         self._prepare_books(self.books)
@@ -6605,14 +6648,14 @@ class BookCatalogApp(tk.Tk):
         self._updating = False
         if self._busy:
             return
-        self.search_btn.configure(state="normal")
+        self._sync_search_action_buttons()
         if silent:
             return
         messagebox.showerror("Update failed", text)
 
     def _apply_self_update(self) -> None:
         self._updating = True
-        self.search_btn.configure(state="disabled")
+        self._sync_search_action_buttons()
         self.more_btn.configure(state="disabled")
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
