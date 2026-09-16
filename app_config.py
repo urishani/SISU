@@ -473,11 +473,22 @@ def settings_pack_has_data(pack: dict | None) -> bool:
     return any(counts[key] for key in ("sites", "publishers", "aliases", "covers"))
 
 
+def _extract_json_object(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        return raw[start : end + 1]
+    return raw
+
+
 def parse_settings_pack(source: str | dict | None) -> dict | None:
     if isinstance(source, dict):
         data = source
     else:
-        text = str(source or "").strip()
+        text = _extract_json_object(str(source or ""))
         if not text:
             return None
         try:

@@ -2586,13 +2586,13 @@ class BookCatalogApp(tk.Tk):
         share_settings_btn.pack(side="left", padx=(8, 0))
         self._callout(
             share_settings_btn,
-            "Copy catalog sites, publisher websites, and field keywords into a file you can send by email or WhatsApp.",
+            "Write a settings JSON file and show it in File Explorer so you can drag it into email or WhatsApp.",
         )
         import_settings_btn = ttk.Button(buttons, text="Import settings…", command=import_live_settings)
         import_settings_btn.pack(side="left", padx=(8, 0))
         self._callout(
             import_settings_btn,
-            "Add a shared SISU settings file or pasted JSON into this copy. API keys and browser choice stay local.",
+            "Paste the JSON from email or WhatsApp, or load the attached sisu-settings.json file into the box.",
         )
 
         def save() -> None:
@@ -2865,8 +2865,9 @@ class BookCatalogApp(tk.Tk):
         except tk.TclError:
             pass
         if method == "whatsapp":
-            webbrowser.open("https://wa.me/?text=" + quote(body))
-            self._set_status(f"Opened WhatsApp with {len(urls)} catalog site(s). The URLs are also on the clipboard.")
+            opened = self._open_whatsapp_app(body)
+            extra = " Paste them into the chat." if opened else " WhatsApp did not open — paste them into a chat."
+            self._set_status(f"Catalog site URLs are on the clipboard.{extra}")
             return
         mailto = "mailto:?subject=" + quote(subject) + "&body=" + quote(body)
         webbrowser.open(mailto)
@@ -2929,10 +2930,149 @@ class BookCatalogApp(tk.Tk):
         )
 
     def _write_settings_pack_file(self, pack: dict, path: Path | None = None) -> Path:
-        target = path or (APP_DIR / "cache" / "sisu-settings.json")
+        target = path or (Path(tempfile.gettempdir()) / "SISU-share" / "sisu-settings.json")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(pack, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return target
+
+    def _reveal_in_explorer(self, path: Path) -> bool:
+        target = path.resolve()
+        if not target.exists():
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        ole32 = ctypes.windll.ole32
+        shell32 = ctypes.windll.shell32
+        ole32.CoInitialize(None)
+        pidl = ctypes.c_void_p()
+        try:
+            shell32.SHParseDisplayName.argtypes = [
+                wintypes.LPCWSTR,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                wintypes.ULONG,
+                ctypes.POINTER(wintypes.ULONG),
+            ]
+            shell32.SHParseDisplayName.restype = ctypes.HRESULT
+            shell32.SHOpenFolderAndSelectItems.argtypes = [
+                ctypes.c_void_p,
+                wintypes.UINT,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            shell32.SHOpenFolderAndSelectItems.restype = ctypes.HRESULT
+            if shell32.SHParseDisplayName(str(target), None, ctypes.byref(pidl), 0, None) == 0 and pidl:
+                if shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0:
+                    return True
+        except OSError:
+            pass
+        finally:
+            if pidl:
+                ctypes.windll.ole32.CoTaskMemFree(pidl)
+        try:
+            subprocess.Popen(["explorer.exe", "/select,", str(target)])
+            return True
+        except OSError:
+            pass
+        try:
+            os.startfile(target.parent)
+            return True
+        except OSError:
+            return False
+
+    def _find_whatsapp_exe(self) -> Path | None:
+        local = Path(os.environ.get("LOCALAPPDATA") or "")
+        programs = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+        candidates = [
+            local / "WhatsApp" / "WhatsApp.exe",
+            local / "Programs" / "WhatsApp" / "WhatsApp.exe",
+            local / "Microsoft" / "WindowsApps" / "WhatsApp.exe",
+            programs / "WhatsApp" / "WhatsApp.exe",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        if local:
+            apps = local / "Microsoft" / "WindowsApps"
+            if apps.is_dir():
+                for candidate in apps.glob("WhatsApp*.exe"):
+                    if candidate.is_file():
+                        return candidate
+        return None
+
+    def _focus_app_window(self, title_part: str) -> bool:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        needle = str(title_part or "").strip().lower()
+        if not needle:
+            return False
+        found = ctypes.c_void_p()
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd) + 1
+            if length <= 1:
+                return True
+            buf = ctypes.create_unicode_buffer(length)
+            user32.GetWindowTextW(hwnd, buf, length)
+            title = buf.value.lower()
+            if needle in title and "web" not in title:
+                found.value = hwnd
+                return False
+            return True
+
+        user32.EnumWindows(callback, 0)
+        hwnd = found.value
+        if not hwnd:
+            return False
+        user32.ShowWindow(hwnd, 9)
+        user32.SetForegroundWindow(hwnd)
+        return True
+
+    def _open_whatsapp_app(self, text: str = "") -> bool:
+        if self._focus_app_window("WhatsApp"):
+            return True
+        exe = self._find_whatsapp_exe()
+        if exe is not None:
+            try:
+                subprocess.Popen([str(exe)])
+                return True
+            except OSError:
+                pass
+        note = str(text or "").strip()
+        uris = []
+        if note and len(quote(note)) < 1800:
+            uris.append("whatsapp://send?text=" + quote(note))
+        uris.append("whatsapp://send")
+        uris.append("whatsapp://")
+        for uri in uris:
+            try:
+                os.startfile(uri)
+                return True
+            except OSError:
+                continue
+        return False
+
+    def _copy_file_to_clipboard(self, path: Path) -> bool:
+        target = path.resolve()
+        if not target.exists():
+            return False
+        quoted = "'" + str(target).replace("'", "''") + "'"
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Set-Clipboard -LiteralPath {quoted}"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
 
     def share_settings_pack(self, pack: dict | None = None) -> None:
         payload = parse_settings_pack(pack) or build_settings_pack()
@@ -2943,34 +3083,113 @@ class BookCatalogApp(tk.Tk):
             )
             return
         summary = self._settings_pack_summary(payload)
-        method = self._ask_share_method(
-            settings_pack_counts(payload)["sites"],
-            title="Share settings",
-            message=(
-                f"Share {summary} so another SISU copy can import them.\n"
-                "API keys, LLM settings, and the browser choice stay on this computer."
-            ),
-            allow_file=True,
-        )
-        if not method:
-            return
-        text = json.dumps(payload, ensure_ascii=False, indent=2)
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(text)
-        except tk.TclError:
-            pass
+        json_text = json.dumps(payload, ensure_ascii=False, indent=2)
         path = self._write_settings_pack_file(payload)
-        subject = "SISU settings: catalog sites, publishers, and keywords"
-        body = (
-            "SISU settings are attached as sisu-settings.json.\n\n"
-            f"This package has {summary}.\n\n"
-            "In SISU: Settings → Import settings… → Open file, then choose this JSON file.\n"
-            "You can also paste the JSON with Import settings → Paste."
+
+        win = tk.Toplevel(self)
+        win.title("Share settings")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(True, True)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+        ttk.Label(
+            body,
+            text=(
+                f"This JSON is {summary}. Show file opens sisu-settings.json in File Explorer "
+                "so you can drag it into an email or WhatsApp chat. WhatsApp brings the WhatsApp "
+                "app to the front — it does not open the browser. The other SISU copy uses "
+                "Settings → Import settings → Load file."
+            ),
+            wraplength=640,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew")
+        text_wrap = ttk.Frame(body)
+        text_wrap.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        text_wrap.columnconfigure(0, weight=1)
+        text_wrap.rowconfigure(0, weight=1)
+        box = tk.Text(
+            text_wrap,
+            wrap="none",
+            font=("Consolas", 9),
+            relief="solid",
+            bd=1,
+            padx=6,
+            pady=6,
         )
-        if method == "file":
+        yscroll = ttk.Scrollbar(text_wrap, orient="vertical", command=box.yview)
+        xscroll = ttk.Scrollbar(text_wrap, orient="horizontal", command=box.xview)
+        box.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        box.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        box.insert("1.0", json_text)
+        box.focus_set()
+        box.tag_add("sel", "1.0", "end-1c")
+
+        def copy_json() -> None:
+            self._copy_text(json_text)
+            self._set_status("Settings JSON copied. Paste it into Import settings, Gmail, or WhatsApp.")
+
+        def show_file() -> None:
+            self._copy_file_to_clipboard(path)
+
+            def show() -> None:
+                if self._reveal_in_explorer(path):
+                    self._set_status(f"File Explorer has {path.name} selected. Drag it into email or WhatsApp.")
+                else:
+                    messagebox.showerror("Share settings", f"Could not open File Explorer for:\n{path}", parent=win)
+
+            win.after(150, show)
+
+        def email_json() -> None:
+            self._copy_file_to_clipboard(path)
+            subject = "SISU settings JSON"
+            body_text = (
+                f"SISU settings ({summary}). Attach sisu-settings.json "
+                "(drag it from File Explorer or paste with Ctrl+V).\n\n"
+                "In the other SISU: Settings → Import settings… → Load file."
+            )
+            if self._share_via_outlook(path, subject, body_text):
+                win.after(150, lambda: self._reveal_in_explorer(path))
+                self._set_status("Opened email with sisu-settings.json attached. File Explorer has the same file selected.")
+                return
+            gmail = (
+                "https://mail.google.com/mail/?view=cm&fs=1&tf=1&su="
+                + quote(subject)
+                + "&body="
+                + quote(body_text)
+            )
+            self._open_in_browser(gmail)
+            win.after(150, lambda: self._reveal_in_explorer(path))
+            self._set_status("Opened Gmail. Drag sisu-settings.json from File Explorer onto the draft.")
+
+        def whatsapp_json() -> None:
+            self._copy_file_to_clipboard(path)
+            opened = self._open_whatsapp_app(
+                "SISU settings JSON. Drag sisu-settings.json from File Explorer onto this chat, or paste it."
+            )
+
+            def show() -> None:
+                self._reveal_in_explorer(path)
+                if opened:
+                    self._set_status("Opened the WhatsApp app. Drag sisu-settings.json from File Explorer onto the chat.")
+                else:
+                    messagebox.showinfo(
+                        "Share settings",
+                        "Could not open the WhatsApp app. File Explorer has sisu-settings.json selected — "
+                        "drag it onto your WhatsApp window, or paste with Ctrl+V.",
+                        parent=win,
+                    )
+
+            win.after(150, show)
+
+        def save_file() -> None:
             chosen = filedialog.asksaveasfilename(
-                title="Save SISU settings",
+                parent=win,
+                title="Save SISU settings JSON",
                 defaultextension=".json",
                 initialfile="sisu-settings.json",
                 filetypes=[("SISU settings", "*.json"), ("All files", "*.*")],
@@ -2978,31 +3197,33 @@ class BookCatalogApp(tk.Tk):
             if not chosen:
                 return
             saved = self._write_settings_pack_file(payload, Path(chosen))
-            self._set_status(f"Saved settings to {saved.name}.")
-            return
-        if method == "whatsapp":
-            note = (
-                f"SISU settings ({summary}).\n\n"
-                "The JSON is on the clipboard. In SISU use Settings → Import settings… → Paste.\n"
-                f"Or attach this file: {path}"
-            )
-            webbrowser.open("https://wa.me/?text=" + quote(note))
-            self._set_status("Opened WhatsApp. Settings JSON is on the clipboard and saved as a file you can attach.")
-            return
-        if self._share_via_outlook(path, subject, body):
-            self._set_status("Opened an email with the SISU settings file attached.")
-            return
-        if self._share_via_eml(path, subject, body):
-            self._set_status("Opened an email draft with the SISU settings file attached.")
-            return
-        mailto = "mailto:?subject=" + quote(subject) + "&body=" + quote(body + "\n\n" + text[:1200])
-        webbrowser.open(mailto)
-        messagebox.showinfo(
-            "Share settings",
-            "Could not attach the file in your mail program automatically.\n\n"
-            "The settings JSON is on the clipboard. The file is also saved at:\n"
-            f"{path}",
-        )
+            self._copy_file_to_clipboard(saved)
+            self._reveal_in_explorer(saved)
+            self._set_status(f"Saved {saved.name} and selected it in File Explorer.")
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, sticky="ew")
+        ttk.Button(buttons, text="Copy JSON", command=copy_json).pack(side="left")
+        ttk.Button(buttons, text="Email", command=email_json).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="WhatsApp", command=whatsapp_json).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Show file", command=show_file).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Save file…", command=save_file).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right")
+        win.minsize(720, 420)
+        win.update_idletasks()
+        width, height = 800, 560
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.lift()
+        win.focus_force()
+
+    def _copy_text(self, text: str) -> None:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            pass
 
     def import_settings_pack(self, parent: tk.Misc | None = None) -> bool:
         source = self._ask_settings_pack_source(parent)
@@ -3012,7 +3233,8 @@ class BookCatalogApp(tk.Tk):
         if not pack:
             messagebox.showerror(
                 "Import settings",
-                "That was not a SISU settings file. Use a JSON package with catalog sites, publisher websites, or field keywords.",
+                "That paste was not SISU settings JSON. Copy the JSON block from Gmail or WhatsApp, "
+                "or load a sisu-settings.json file into this box, then import.",
             )
             return False
         summary = self._settings_pack_summary(pack)
@@ -3070,24 +3292,14 @@ class BookCatalogApp(tk.Tk):
             result["text"] = None
             win.destroy()
 
-        def from_file() -> None:
-            path = filedialog.askopenfilename(
-                parent=win,
-                title="Open SISU settings",
-                filetypes=[("SISU settings", "*.json"), ("All files", "*.*")],
-            )
-            if not path:
-                return
-            try:
-                result["text"] = Path(path).read_text(encoding="utf-8")
-            except OSError as exc:
-                messagebox.showerror("Import settings", f"Could not read that file:\n{exc}", parent=win)
-                return
-            win.destroy()
-
         def accept() -> None:
             result["text"] = box.get("1.0", "end-1c")
             win.destroy()
+
+        def put_text(text: str) -> None:
+            box.delete("1.0", "end")
+            box.insert("1.0", text.strip())
+            box.focus_set()
 
         def paste_clipboard() -> None:
             try:
@@ -3096,8 +3308,22 @@ class BookCatalogApp(tk.Tk):
                 text = ""
             if not text.strip():
                 return
-            box.delete("1.0", "end")
-            box.insert("1.0", text)
+            put_text(text)
+
+        def load_file() -> None:
+            path = filedialog.askopenfilename(
+                parent=win,
+                title="Open SISU settings JSON",
+                filetypes=[("SISU settings", "*.json"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                messagebox.showerror("Import settings", f"Could not read that file:\n{exc}", parent=win)
+                return
+            put_text(text)
 
         win.protocol("WM_DELETE_WINDOW", cancel)
         body = ttk.Frame(win, padding=14)
@@ -3106,22 +3332,51 @@ class BookCatalogApp(tk.Tk):
         body.rowconfigure(1, weight=1)
         ttk.Label(
             body,
-            text="Open a SISU settings JSON file, or paste the JSON someone shared with you.",
-            wraplength=520,
+            text=(
+                "Paste the settings JSON copied from Gmail or WhatsApp into this box. "
+                "Or load a saved sisu-settings.json file — its contents appear here, then click Import."
+            ),
+            wraplength=620,
+            justify="left",
         ).grid(row=0, column=0, sticky="ew")
-        box = tk.Text(body, width=72, height=14, wrap="word", font=("Segoe UI", 10))
-        box.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        text_wrap = ttk.Frame(body)
+        text_wrap.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        text_wrap.columnconfigure(0, weight=1)
+        text_wrap.rowconfigure(0, weight=1)
+        box = tk.Text(
+            text_wrap,
+            wrap="none",
+            font=("Consolas", 9),
+            relief="solid",
+            bd=1,
+            padx=6,
+            pady=6,
+        )
+        yscroll = ttk.Scrollbar(text_wrap, orient="vertical", command=box.yview)
+        xscroll = ttk.Scrollbar(text_wrap, orient="horizontal", command=box.xview)
+        box.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        box.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        try:
+            clip = str(self.clipboard_get() or "")
+        except tk.TclError:
+            clip = ""
+        if parse_settings_pack(clip):
+            box.insert("1.0", clip.strip())
         buttons = ttk.Frame(body)
         buttons.grid(row=2, column=0, sticky="ew")
-        ttk.Button(buttons, text="Open file…", command=from_file).pack(side="left")
-        ttk.Button(buttons, text="Paste clipboard", command=paste_clipboard).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Paste", command=paste_clipboard).pack(side="left")
+        ttk.Button(buttons, text="Load file…", command=load_file).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right")
         ttk.Button(buttons, text="Import", command=accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
-        win.minsize(560, 360)
         win.update_idletasks()
-        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
-        y = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_reqheight()) // 3)
-        win.geometry(f"+{x}+{y}")
+        width, height = 720, 480
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.minsize(520, 320)
+        box.focus_set()
         win.grab_set()
         win.wait_window()
         text = result.get("text")
@@ -3259,25 +3514,27 @@ class BookCatalogApp(tk.Tk):
         win.wait_window()
         return result["urls"]
 
-    def _share_via_outlook(self, path: Path, subject: str, body: str) -> bool:
-        script = Path(tempfile.gettempdir()) / "sisu_share_excel.ps1"
+    def _share_via_outlook(self, path: Path | None, subject: str, body: str) -> bool:
+        script = Path(tempfile.gettempdir()) / "sisu_share_mail.ps1"
+        body_file = Path(tempfile.gettempdir()) / "sisu_share_body.txt"
         def ps_str(value: str) -> str:
             return "'" + value.replace("'", "''") + "'"
 
-        script.write_text(
-            "\n".join(
-                [
-                    "$ErrorActionPreference = 'Stop'",
-                    "$outlook = New-Object -ComObject Outlook.Application",
-                    "$mail = $outlook.CreateItem(0)",
-                    f"$mail.Subject = {ps_str(subject)}",
-                    f"$mail.Body = {ps_str(body)}",
-                    f"$null = $mail.Attachments.Add({ps_str(str(path))})",
-                    "$mail.Display() | Out-Null",
-                ]
-            ),
-            encoding="utf-8-sig",
-        )
+        try:
+            body_file.write_text(body, encoding="utf-8")
+        except OSError:
+            return False
+        lines = [
+            "$ErrorActionPreference = 'Stop'",
+            "$outlook = New-Object -ComObject Outlook.Application",
+            "$mail = $outlook.CreateItem(0)",
+            f"$mail.Subject = {ps_str(subject)}",
+            f"$mail.Body = [System.IO.File]::ReadAllText({ps_str(str(body_file))}, [System.Text.Encoding]::UTF8)",
+        ]
+        if path is not None:
+            lines.append(f"$null = $mail.Attachments.Add({ps_str(str(path))})")
+        lines.append("$mail.Display() | Out-Null")
+        script.write_text("\n".join(lines), encoding="utf-8-sig")
         try:
             completed = subprocess.run(
                 ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", str(script)],
