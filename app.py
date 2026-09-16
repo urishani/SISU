@@ -31,14 +31,19 @@ from app_config import (
     all_search_urls,
     browser_executable,
     browser_label,
+    build_settings_pack,
     enabled_search_urls,
     load_config,
     mark_phonetic_model_prompted,
+    merge_settings_pack,
     merged_publisher_rows,
     normalize_site_url,
+    parse_settings_pack,
     phonetic_model_prompt_pending,
     save_config,
     search_sites,
+    settings_pack_counts,
+    settings_pack_has_data,
     update_search_sites,
 )
 from book_crawler import (
@@ -2519,6 +2524,57 @@ class BookCatalogApp(tk.Tk):
             self._set_status("Field aliases saved. The next Search or More will use them.")
             return True
 
+        def _live_settings_pack() -> dict:
+            pack = build_settings_pack()
+            if publishers_state["started"] and publisher_store:
+                _harvest_publishers()
+                publishers = {}
+                for name, url in publisher_store:
+                    name = str(name or "").strip()
+                    if not name:
+                        continue
+                    publishers[name] = normalize_site_url(str(url or ""))
+                pack["publishers"] = publishers
+            if sites_state["loaded"]:
+                sites: list[dict] = []
+                seen: set[str] = set()
+                for var in site_vars:
+                    url = self._canonical_search_url(var.get())
+                    key = self._search_site_key(url)
+                    if not url or not key or key in seen:
+                        continue
+                    seen.add(key)
+                    sites.append({"url": url, "enabled": True})
+                if sites:
+                    pack["search_sites"] = sites
+            if aliases_state["loaded"]:
+                _harvest_aliases()
+                _harvest_covers()
+                aliases: dict[str, str] = {}
+                for label, field in alias_store:
+                    label = str(label or "").strip()
+                    field = str(field or "").strip()
+                    if label and field:
+                        aliases[label] = field
+                covers: dict[str, str] = {}
+                for word, code in cover_store:
+                    word = str(word or "").strip()
+                    code = str(code or "").strip().upper()
+                    if word and code:
+                        covers[word] = code
+                pack["aliases"] = aliases
+                pack["cover_values"] = covers
+            return pack
+
+        def share_live_settings() -> None:
+            self.share_settings_pack(_live_settings_pack())
+
+        def import_live_settings() -> None:
+            if not self.import_settings_pack(parent=win):
+                return
+            close()
+            self.open_settings()
+
         buttons = ttk.Frame(body)
         buttons.pack(fill="x", pady=(10, 0))
         ttk.Button(
@@ -2526,6 +2582,18 @@ class BookCatalogApp(tk.Tk):
             text="Check for updates",
             command=lambda: self.check_for_updates(silent=False),
         ).pack(side="left")
+        share_settings_btn = ttk.Button(buttons, text="Share settings", command=share_live_settings)
+        share_settings_btn.pack(side="left", padx=(8, 0))
+        self._callout(
+            share_settings_btn,
+            "Copy catalog sites, publisher websites, and field keywords into a file you can send by email or WhatsApp.",
+        )
+        import_settings_btn = ttk.Button(buttons, text="Import settings…", command=import_live_settings)
+        import_settings_btn.pack(side="left", padx=(8, 0))
+        self._callout(
+            import_settings_btn,
+            "Add a shared SISU settings file or pasted JSON into this copy. API keys and browser choice stay local.",
+        )
 
         def save() -> None:
             current = load_config()
@@ -2851,9 +2919,226 @@ class BookCatalogApp(tk.Tk):
         self._set_status(f"Added {len(added)} catalog site(s).{extra}")
         messagebox.showinfo("Add catalog sites", f"Added {len(added)} catalog site(s).{extra}")
 
-    def _ask_share_method(self, count: int) -> str | None:
+    def _settings_pack_summary(self, pack: dict | None) -> str:
+        counts = settings_pack_counts(pack)
+        return (
+            f"{counts['sites']} catalog site(s), "
+            f"{counts['publishers']} publisher website(s), "
+            f"{counts['aliases']} field keyword(s)"
+            + (f", {counts['covers']} cover keyword(s)" if counts["covers"] else "")
+        )
+
+    def _write_settings_pack_file(self, pack: dict, path: Path | None = None) -> Path:
+        target = path or (APP_DIR / "cache" / "sisu-settings.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(pack, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return target
+
+    def share_settings_pack(self, pack: dict | None = None) -> None:
+        payload = parse_settings_pack(pack) or build_settings_pack()
+        if not settings_pack_has_data(payload):
+            messagebox.showinfo(
+                "Share settings",
+                "There are no catalog sites, publisher websites, or field keywords to share yet.",
+            )
+            return
+        summary = self._settings_pack_summary(payload)
+        method = self._ask_share_method(
+            settings_pack_counts(payload)["sites"],
+            title="Share settings",
+            message=(
+                f"Share {summary} so another SISU copy can import them.\n"
+                "API keys, LLM settings, and the browser choice stay on this computer."
+            ),
+            allow_file=True,
+        )
+        if not method:
+            return
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            pass
+        path = self._write_settings_pack_file(payload)
+        subject = "SISU settings: catalog sites, publishers, and keywords"
+        body = (
+            "SISU settings are attached as sisu-settings.json.\n\n"
+            f"This package has {summary}.\n\n"
+            "In SISU: Settings → Import settings… → Open file, then choose this JSON file.\n"
+            "You can also paste the JSON with Import settings → Paste."
+        )
+        if method == "file":
+            chosen = filedialog.asksaveasfilename(
+                title="Save SISU settings",
+                defaultextension=".json",
+                initialfile="sisu-settings.json",
+                filetypes=[("SISU settings", "*.json"), ("All files", "*.*")],
+            )
+            if not chosen:
+                return
+            saved = self._write_settings_pack_file(payload, Path(chosen))
+            self._set_status(f"Saved settings to {saved.name}.")
+            return
+        if method == "whatsapp":
+            note = (
+                f"SISU settings ({summary}).\n\n"
+                "The JSON is on the clipboard. In SISU use Settings → Import settings… → Paste.\n"
+                f"Or attach this file: {path}"
+            )
+            webbrowser.open("https://wa.me/?text=" + quote(note))
+            self._set_status("Opened WhatsApp. Settings JSON is on the clipboard and saved as a file you can attach.")
+            return
+        if self._share_via_outlook(path, subject, body):
+            self._set_status("Opened an email with the SISU settings file attached.")
+            return
+        if self._share_via_eml(path, subject, body):
+            self._set_status("Opened an email draft with the SISU settings file attached.")
+            return
+        mailto = "mailto:?subject=" + quote(subject) + "&body=" + quote(body + "\n\n" + text[:1200])
+        webbrowser.open(mailto)
+        messagebox.showinfo(
+            "Share settings",
+            "Could not attach the file in your mail program automatically.\n\n"
+            "The settings JSON is on the clipboard. The file is also saved at:\n"
+            f"{path}",
+        )
+
+    def import_settings_pack(self, parent: tk.Misc | None = None) -> bool:
+        source = self._ask_settings_pack_source(parent)
+        if source is None:
+            return False
+        pack = parse_settings_pack(source)
+        if not pack:
+            messagebox.showerror(
+                "Import settings",
+                "That was not a SISU settings file. Use a JSON package with catalog sites, publisher websites, or field keywords.",
+            )
+            return False
+        summary = self._settings_pack_summary(pack)
+        if not messagebox.askyesno(
+            "Import settings",
+            f"Add this shared package to SISU?\n\n{summary}\n\n"
+            "Existing sites, publishers, and keywords are kept. Matching items are updated. "
+            "API keys and browser settings are not imported.",
+        ):
+            return False
+        counts = merge_settings_pack(pack)
+        selected = [str(item.get("url") or "") for item in search_sites() if item.get("enabled")]
+        self._rebuild_site_url_list(selected=selected, catalog=search_sites())
+        self._persist_site_enabled()
+        if getattr(self, "_list_actions_ready", False):
+            self._persist_working()
+        parts = []
+        if counts.get("sites_added"):
+            parts.append(f"{counts['sites_added']} catalog site(s)")
+        if counts.get("publishers_added") or counts.get("publishers_updated"):
+            parts.append(
+                f"{counts.get('publishers_added') or 0} publisher site(s) added, "
+                f"{counts.get('publishers_updated') or 0} updated"
+            )
+        if counts.get("aliases_added") or counts.get("aliases_updated"):
+            parts.append(
+                f"{counts.get('aliases_added') or 0} field keyword(s) added, "
+                f"{counts.get('aliases_updated') or 0} updated"
+            )
+        if counts.get("covers_added") or counts.get("covers_updated"):
+            parts.append(
+                f"{counts.get('covers_added') or 0} cover keyword(s) added, "
+                f"{counts.get('covers_updated') or 0} updated"
+            )
+        skipped = int(counts.get("sites_skipped") or 0)
+        extra = f" Skipped {skipped} catalog site(s) already in the list." if skipped else ""
+        if not parts:
+            message = "Those settings were already in this copy." + extra
+        else:
+            message = "Imported " + "; ".join(parts) + "." + extra
+        self._set_status(message)
+        messagebox.showinfo("Import settings", message)
+        return True
+
+    def _ask_settings_pack_source(self, parent: tk.Misc | None = None) -> str | None:
+        host = parent or self
+        win = tk.Toplevel(host)
+        win.title("Import settings")
+        win.configure(bg=BG)
+        win.transient(host)
+        win.resizable(True, True)
+        result: dict[str, str | None] = {"text": None}
+
+        def cancel() -> None:
+            result["text"] = None
+            win.destroy()
+
+        def from_file() -> None:
+            path = filedialog.askopenfilename(
+                parent=win,
+                title="Open SISU settings",
+                filetypes=[("SISU settings", "*.json"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                result["text"] = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                messagebox.showerror("Import settings", f"Could not read that file:\n{exc}", parent=win)
+                return
+            win.destroy()
+
+        def accept() -> None:
+            result["text"] = box.get("1.0", "end-1c")
+            win.destroy()
+
+        def paste_clipboard() -> None:
+            try:
+                text = str(self.clipboard_get() or "")
+            except tk.TclError:
+                text = ""
+            if not text.strip():
+                return
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+        ttk.Label(
+            body,
+            text="Open a SISU settings JSON file, or paste the JSON someone shared with you.",
+            wraplength=520,
+        ).grid(row=0, column=0, sticky="ew")
+        box = tk.Text(body, width=72, height=14, wrap="word", font=("Segoe UI", 10))
+        box.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, sticky="ew")
+        ttk.Button(buttons, text="Open file…", command=from_file).pack(side="left")
+        ttk.Button(buttons, text="Paste clipboard", command=paste_clipboard).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right")
+        ttk.Button(buttons, text="Import", command=accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
+        win.minsize(560, 360)
+        win.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_reqheight()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.wait_window()
+        text = result.get("text")
+        if text is None:
+            return None
+        return str(text)
+
+    def _ask_share_method(
+        self,
+        count: int,
+        *,
+        title: str = "Share catalog sites",
+        message: str = "",
+        allow_file: bool = False,
+    ) -> str | None:
         win = tk.Toplevel(self)
-        win.title("Share catalog sites")
+        win.title(title)
         win.configure(bg=BG)
         win.transient(self)
         win.resizable(False, False)
@@ -2872,17 +3157,20 @@ class BookCatalogApp(tk.Tk):
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text=(
+            text=message
+            or (
                 f"Share {count} checked catalog site(s) so someone else can use them in SISU.\n"
                 "The URLs are also copied to the clipboard."
             ),
-            wraplength=360,
+            wraplength=420,
             justify="left",
         ).pack(anchor="w")
         buttons = ttk.Frame(body)
         buttons.pack(anchor="e", pady=(16, 0))
         ttk.Button(buttons, text="Email", command=lambda: choose("email")).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="WhatsApp", command=lambda: choose("whatsapp")).pack(side="left", padx=(0, 6))
+        if allow_file:
+            ttk.Button(buttons, text="Save file…", command=lambda: choose("file")).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Cancel", command=cancel).pack(side="left")
         win.update_idletasks()
         x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_reqwidth()) // 2)
@@ -3007,10 +3295,17 @@ class BookCatalogApp(tk.Tk):
         msg = EmailMessage()
         msg["Subject"] = subject
         msg.set_content(body)
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            maintype, subtype = "application", "json"
+        elif suffix == ".xlsx":
+            maintype, subtype = "application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            maintype, subtype = "application", "octet-stream"
         msg.add_attachment(
             path.read_bytes(),
-            maintype="application",
-            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            maintype=maintype,
+            subtype=subtype,
             filename=path.name,
         )
         draft = APP_DIR / "cache" / "sisu_share_draft.eml"

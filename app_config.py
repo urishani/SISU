@@ -391,3 +391,181 @@ def browser_executable(browser_id: str, custom_path: str = "") -> str | None:
         if candidate and Path(candidate).exists():
             return candidate
     return None
+
+
+SETTINGS_PACK_KIND = "sisu-settings"
+SETTINGS_PACK_VERSION = 1
+
+
+def _settings_site_key(url: str) -> str:
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(normalize_site_url(url))
+    host = parsed.netloc.casefold()
+    if host.startswith("www."):
+        host = host[4:]
+    path = unquote(parsed.path).rstrip("/") or "/"
+    return f"{host}{path}".casefold()
+
+
+def _clean_settings_sites(raw: object) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+    items = raw if isinstance(raw, list) else []
+    for item in items:
+        if isinstance(item, str):
+            url = normalize_site_url(item)
+            enabled = True
+        elif isinstance(item, dict):
+            url = normalize_site_url(str(item.get("url") or ""))
+            enabled = bool(item.get("enabled", True))
+        else:
+            continue
+        key = _settings_site_key(url)
+        if not url or not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append({"url": url, "enabled": enabled})
+    return rows
+
+
+def _clean_settings_publishers(raw: object) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    incoming = raw if isinstance(raw, dict) else {}
+    for name, url in incoming.items():
+        label = str(name or "").strip()
+        if not label:
+            continue
+        mapping[label] = normalize_site_url(str(url or ""))
+    return mapping
+
+
+def build_settings_pack() -> dict:
+    data = load_config()
+    from field_map import load_alias_payload
+
+    aliases = load_alias_payload()
+    return {
+        "kind": SETTINGS_PACK_KIND,
+        "version": SETTINGS_PACK_VERSION,
+        "search_sites": _clean_settings_sites(data.get("search_sites")),
+        "publishers": _clean_settings_publishers(data.get("publishers")),
+        "aliases": dict(aliases.get("aliases") or {}),
+        "cover_values": dict(aliases.get("cover_values") or {}),
+    }
+
+
+def settings_pack_counts(pack: dict | None) -> dict[str, int]:
+    data = pack if isinstance(pack, dict) else {}
+    aliases = data.get("aliases") if isinstance(data.get("aliases"), dict) else {}
+    covers = data.get("cover_values") if isinstance(data.get("cover_values"), dict) else {}
+    publishers = data.get("publishers") if isinstance(data.get("publishers"), dict) else {}
+    return {
+        "sites": len(_clean_settings_sites(data.get("search_sites"))),
+        "publishers": len(_clean_settings_publishers(publishers)),
+        "aliases": len(aliases),
+        "covers": len(covers),
+    }
+
+
+def settings_pack_has_data(pack: dict | None) -> bool:
+    counts = settings_pack_counts(pack)
+    return any(counts[key] for key in ("sites", "publishers", "aliases", "covers"))
+
+
+def parse_settings_pack(source: str | dict | None) -> dict | None:
+    if isinstance(source, dict):
+        data = source
+    else:
+        text = str(source or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    aliases = data.get("aliases") if isinstance(data.get("aliases"), dict) else {}
+    covers = data.get("cover_values") if isinstance(data.get("cover_values"), dict) else {}
+    nested = data.get("field_aliases") if isinstance(data.get("field_aliases"), dict) else {}
+    if not aliases and isinstance(nested.get("aliases"), dict):
+        aliases = nested.get("aliases") or {}
+    if not covers and isinstance(nested.get("cover_values"), dict):
+        covers = nested.get("cover_values") or {}
+    pack = {
+        "kind": SETTINGS_PACK_KIND,
+        "version": SETTINGS_PACK_VERSION,
+        "search_sites": _clean_settings_sites(data.get("search_sites")),
+        "publishers": _clean_settings_publishers(data.get("publishers")),
+        "aliases": {
+            str(label).strip(): str(field).strip()
+            for label, field in aliases.items()
+            if str(label).strip() and str(field).strip()
+        },
+        "cover_values": {
+            str(label).strip(): str(code).strip().upper()
+            for label, code in covers.items()
+            if str(label).strip() and str(code).strip()
+        },
+    }
+    if not settings_pack_has_data(pack):
+        return None
+    return pack
+
+
+def merge_settings_pack(pack: dict | None) -> dict[str, int]:
+    parsed = parse_settings_pack(pack)
+    if not parsed:
+        return {
+            "sites_added": 0,
+            "sites_skipped": 0,
+            "publishers_added": 0,
+            "publishers_updated": 0,
+            "aliases_added": 0,
+            "aliases_updated": 0,
+            "covers_added": 0,
+            "covers_updated": 0,
+        }
+    current = load_config()
+    sites = _clean_settings_sites(current.get("search_sites"))
+    known = {_settings_site_key(str(item.get("url") or "")) for item in sites}
+    sites_added = sites_skipped = 0
+    for item in parsed.get("search_sites") or []:
+        url = str(item.get("url") or "")
+        key = _settings_site_key(url)
+        if not url or not key:
+            continue
+        if key in known:
+            sites_skipped += 1
+            continue
+        known.add(key)
+        sites.append({"url": url, "enabled": bool(item.get("enabled", True))})
+        sites_added += 1
+    publishers = _clean_settings_publishers(current.get("publishers"))
+    pub_added = pub_updated = 0
+    for name, url in (parsed.get("publishers") or {}).items():
+        label = str(name or "").strip()
+        site = normalize_site_url(str(url or ""))
+        if not label:
+            continue
+        matched = next((existing for existing in publishers if publishers_match(existing, label) or existing == label), None)
+        if matched is None:
+            publishers[label] = site
+            pub_added += 1
+        elif site and publishers.get(matched) != site:
+            publishers[matched] = site
+            pub_updated += 1
+    current["search_sites"] = sites
+    current["publishers"] = publishers
+    save_config(current)
+    from field_map import merge_alias_payload
+
+    alias_counts = merge_alias_payload(parsed.get("aliases") or {}, parsed.get("cover_values") or {})
+    return {
+        "sites_added": sites_added,
+        "sites_skipped": sites_skipped,
+        "publishers_added": pub_added,
+        "publishers_updated": pub_updated,
+        **alias_counts,
+    }

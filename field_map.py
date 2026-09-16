@@ -259,6 +259,111 @@ def reload_aliases() -> None:
     load_aliases()
 
 
+def load_alias_payload() -> dict[str, Any]:
+    payload = {
+        "comment": "Maps labels found on bookstore and publisher pages to SISU field keys.",
+        "aliases": {},
+        "cover_values": {},
+    }
+    if not ALIASES_PATH.exists():
+        return payload
+    try:
+        raw = json.loads(ALIASES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return payload
+    if not isinstance(raw, dict):
+        return payload
+    comment = str(raw.get("comment") or "").strip()
+    if comment:
+        payload["comment"] = comment
+    aliases = raw.get("aliases") if isinstance(raw.get("aliases"), dict) else {}
+    payload["aliases"] = {
+        str(label).strip(): str(field).strip()
+        for label, field in aliases.items()
+        if str(label).strip() and str(field).strip()
+    }
+    covers = raw.get("cover_values") if isinstance(raw.get("cover_values"), dict) else {}
+    payload["cover_values"] = {
+        str(label).strip(): str(code).strip().upper()
+        for label, code in covers.items()
+        if str(label).strip() and str(code).strip().upper() in COVER_DISPLAY
+    }
+    return payload
+
+
+def save_alias_payload(payload: dict[str, Any]) -> None:
+    current = load_alias_payload()
+    aliases = payload.get("aliases") if isinstance(payload.get("aliases"), dict) else current["aliases"]
+    covers = payload.get("cover_values") if isinstance(payload.get("cover_values"), dict) else current["cover_values"]
+    comment = str(payload.get("comment") or current.get("comment") or "").strip()
+    data = {
+        "comment": comment
+        or "Maps labels found on bookstore and publisher pages to SISU field keys.",
+        "aliases": {
+            str(label).strip(): str(field).strip()
+            for label, field in (aliases or {}).items()
+            if str(label).strip() and str(field).strip()
+        },
+        "cover_values": {
+            str(label).strip(): str(code).strip().upper()
+            for label, code in (covers or {}).items()
+            if str(label).strip() and str(code).strip().upper() in COVER_DISPLAY
+        },
+    }
+    ALIASES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    reload_aliases()
+
+
+def merge_alias_payload(incoming_aliases: dict | None, incoming_covers: dict | None = None) -> dict[str, int]:
+    current = load_alias_payload()
+    aliases = dict(current.get("aliases") or {})
+    covers = dict(current.get("cover_values") or {})
+    alias_index = {normalize_label(label): label for label in aliases}
+    cover_index = {normalize_label(label): label for label in covers}
+    added = updated = cover_added = cover_updated = 0
+    for label, field in (incoming_aliases or {}).items():
+        name = str(label or "").strip()
+        value = str(field or "").strip()
+        if not name or not value:
+            continue
+        key = normalize_label(name)
+        existing = alias_index.get(key)
+        if existing is None:
+            aliases[name] = value
+            alias_index[key] = name
+            added += 1
+        elif aliases.get(existing) != value:
+            aliases[existing] = value
+            updated += 1
+    for label, code in (incoming_covers or {}).items():
+        name = str(label or "").strip()
+        value = str(code or "").strip().upper()
+        if not name or value not in COVER_DISPLAY:
+            continue
+        key = normalize_label(name)
+        existing = cover_index.get(key)
+        if existing is None:
+            covers[name] = value
+            cover_index[key] = name
+            cover_added += 1
+        elif covers.get(existing) != value:
+            covers[existing] = value
+            cover_updated += 1
+    save_alias_payload(
+        {
+            "comment": current.get("comment") or "",
+            "aliases": aliases,
+            "cover_values": covers,
+        }
+    )
+    return {
+        "aliases_added": added,
+        "aliases_updated": updated,
+        "covers_added": cover_added,
+        "covers_updated": cover_updated,
+    }
+
+
 def resolve_label(label: str) -> str | None:
     compact = normalize_label(label)
     if not compact or compact in {normalize_label(item) for item in NOISE_LABELS}:
