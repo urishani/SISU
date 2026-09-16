@@ -4223,6 +4223,7 @@ class BookCrawler:
         if not start_url.startswith(("http://", "https://")):
             start_url = "https://" + start_url
         start_url = catalog_listing_url(start_url)
+        self._check_cancel()
         self.last_site_error = ""
         results: list[Book] = []
         seen_products: set[str] = set()
@@ -4891,6 +4892,7 @@ class BookCrawler:
         return books
 
     def _list_publisher_catalog(self, publisher_url: str) -> list[Book]:
+        self._check_cancel()
         parsed = urlparse(publisher_url if "://" in publisher_url else "https://" + publisher_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
         shopify = self._shopify_publisher_listings(origin, publisher_url)
@@ -5156,6 +5158,7 @@ class BookCrawler:
             if not stats.name or stats.name == "Publisher sites":
                 stats.name = site_name or host
         pending = [book for book in books if book.missing_fields()]
+        self._check_cancel()
         for book in pending:
             book.mark_publisher_lookup(publisher_url, note=f"Looking on {host}…")
         for book in books:

@@ -4046,6 +4046,7 @@ class BookCatalogApp(tk.Tk):
         seed_books: list[Book] | None = None,
         seed_stamp: str = "",
     ) -> None:
+        books = list(seed_books or [])
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
             progress=self._crawl_progress,
@@ -4054,7 +4055,6 @@ class BookCatalogApp(tk.Tk):
         self._active_crawler = crawler
         try:
             self._crawl_progress(f"Searching {len(urls)} bookstore and catalog URL(s)…")
-            books = list(seed_books or [])
             books = crawler.search_all_sites(
                 urls=urls,
                 year=year,
