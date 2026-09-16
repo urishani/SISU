@@ -3780,16 +3780,18 @@ class BookCrawler:
         cancelled: Callable[[], bool] | None = None,
         progress: ProgressFn | None = None,
         event: EventFn | None = None,
+        skip_event: threading.Event | None = None,
     ) -> None:
         self.delay_seconds = delay_seconds
         self.timeout = timeout
         self.cancelled = cancelled or (lambda: False)
+        self._skip_event = skip_event
         raw_progress = progress or (lambda _msg: None)
         raw_event = event or (lambda _kind, _data: None)
 
         def gated_progress(msg: str) -> None:
             text = str(msg or "")
-            if self._is_cancelled() and not text.startswith("Stopped"):
+            if self._is_cancelled() and not text.startswith(("Stopped", "Skipped")):
                 return
             raw_progress(text)
 
@@ -3808,13 +3810,16 @@ class BookCrawler:
         self._tls = threading.local()
         self._report_lock = threading.Lock()
         self._aborted = False
-        self.session = requests.Session()
+        self.session = self._new_session()
         self._sessions = [self.session]
-        retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
+
+    def _new_session(self, retries: int = 2, backoff: float = 0.4) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(total=retries, backoff_factor=backoff, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        self.session.headers.update(
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers.update(
             {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -3823,9 +3828,10 @@ class BookCrawler:
                 "Accept-Language": "he,en;q=0.8",
             }
         )
+        return session
 
     def abort(self) -> None:
-        """Drop in-flight HTTP so Stop does not wait out the current page request."""
+        """Drop in-flight HTTP so Stop or Skip does not wait out the current page request."""
         self._aborted = True
         with self._report_lock:
             sessions = list(self._sessions)
@@ -3835,8 +3841,31 @@ class BookCrawler:
             except Exception:
                 pass
 
+    def skipped(self) -> bool:
+        return bool(self._skip_event is not None and self._skip_event.is_set())
+
+    def recover_after_skip(self) -> None:
+        """Allow the next site after Skip. Does nothing if Stop was pressed."""
+        if self.cancelled():
+            return
+        self._aborted = False
+        if self._skip_event is not None:
+            self._skip_event.clear()
+        with self._report_lock:
+            old = list(self._sessions)
+            self._sessions = []
+        for session in old:
+            try:
+                session.close()
+            except Exception:
+                pass
+        self.session = self._new_session()
+        with self._report_lock:
+            self._sessions = [self.session]
+        self._tls = threading.local()
+
     def _is_cancelled(self) -> bool:
-        return bool(self._aborted or self.cancelled())
+        return bool(self._aborted or self.cancelled() or self.skipped())
 
     def _check_cancel(self) -> None:
         if self._is_cancelled():
@@ -4475,8 +4504,13 @@ class BookCrawler:
                     if len(product_urls) >= max_products:
                         break
         except CrawlCancelled:
-            self.report.cancelled = True
-            self.progress(f"Stopped. Keeping {len(results)} matching book(s) found so far.")
+            if self.cancelled():
+                self.report.cancelled = True
+                self.progress(f"Stopped. Keeping {len(results)} matching book(s) found so far.")
+            else:
+                self.progress(
+                    f"Skipped {site_name}. Keeping {len(results)} matching book(s) from this catalog."
+                )
             _safe_flush_scan_files()
             raise
         _safe_flush_scan_files()
@@ -5239,6 +5273,7 @@ class BookCrawler:
         self,
         books: list[Book],
         on_book: Callable[[int, int, Book, list[str]], None] | None = None,
+        site_url: str = "",
     ) -> int:
         from publisher_sites import resolve_publisher_site
 
@@ -5250,18 +5285,22 @@ class BookCrawler:
         updated = 0
         titled = [book for book in books if (book.title or "").strip()]
         total = len(titled)
-        groups: dict[str, list[Book]] = {}
+        groups: dict[str, dict[str, Any]] = {}
         order: list[str] = []
         no_site: list[Book] = []
+        forced = (site_url or "").strip()
         for book in titled:
-            publisher_url = resolve_publisher_site(book.publisher) or ""
+            publisher_url = forced or resolve_publisher_site(book.publisher) or ""
             if not publisher_url:
                 no_site.append(book)
                 continue
-            if publisher_url not in groups:
-                groups[publisher_url] = []
-                order.append(publisher_url)
-            groups[publisher_url].append(book)
+            key = listing_url_key(publisher_url)
+            row = groups.get(key)
+            if row is None:
+                row = {"url": publisher_url, "books": []}
+                groups[key] = row
+                order.append(key)
+            row["books"].append(book)
         try:
             for book in no_site:
                 note = (
@@ -5273,11 +5312,11 @@ class BookCrawler:
                 book.mark_publisher_lookup("", note=note)
                 book.refresh_scan_status()
                 self._notify_publisher_book(book, [], on_book, counter, total)
-            for publisher_url in order:
+            for key in order:
                 self._check_cancel()
                 updated += self._enrich_publisher_group(
-                    groups[publisher_url],
-                    publisher_url,
+                    groups[key]["books"],
+                    str(groups[key]["url"]),
                     on_book,
                     counter,
                     total,
@@ -5304,9 +5343,16 @@ class BookCrawler:
 
         filled = 0
         for extra_url in extra_urls:
-            self._check_cancel()
-            host = urlparse(extra_url).netloc
             site_name = site_display_name(extra_url)
+            try:
+                self._check_cancel()
+            except CrawlCancelled:
+                if self.cancelled():
+                    raise
+                self.progress(f"Skipped {site_name}.")
+                self.recover_after_skip()
+                continue
+            host = urlparse(extra_url).netloc
             self._emit("site", {"url": extra_url, "name": site_name, "index": 0, "total": 0, "phase": "fill"})
             extras = cached_books_for_host(host)
             if not extras:
@@ -5356,7 +5402,11 @@ class BookCrawler:
                 try:
                     match = self.find_matching_product(extra_url, book)
                 except CrawlCancelled:
-                    raise
+                    if self.cancelled():
+                        raise
+                    self.progress(f"Skipped {site_name}.")
+                    self.recover_after_skip()
+                    break
                 except SiteError as exc:
                     self.progress(str(exc))
                     break
@@ -5473,6 +5523,10 @@ class BookCrawler:
         listing_started = search_started
         try:
             for index, url in enumerate(listing_urls, start=1):
+                if self.cancelled():
+                    raise CrawlCancelled("Search cancelled")
+                if self.skipped() and not self._aborted:
+                    self.recover_after_skip()
                 self._check_cancel()
                 host = site_display_name(url)
                 self.progress(f"Site {index} of {len(listing_urls)}: listing books from {host}…")
@@ -5483,15 +5537,24 @@ class BookCrawler:
                 stats = SourceStats(name=host, url=url, kind="catalog")
                 self._current_source = stats
                 site_started = time.perf_counter()
-                found = self.crawl(
-                    start_url=url,
-                    year=year,
-                    max_listing_pages=0 if requested <= 0 else page_limit,
-                    max_products=max_products,
-                    include_unknown_year=include_unknown_year,
-                    start_error=False,
-                    on_book=lambda book, site=host, site_url=url: self._take_book(books, book, site, site_url),
-                )
+                found: list[Book] = []
+                try:
+                    found = self.crawl(
+                        start_url=url,
+                        year=year,
+                        max_listing_pages=0 if requested <= 0 else page_limit,
+                        max_products=max_products,
+                        include_unknown_year=include_unknown_year,
+                        start_error=False,
+                        on_book=lambda book, site=host, site_url=url: self._take_book(books, book, site, site_url),
+                    )
+                except CrawlCancelled:
+                    if self.cancelled():
+                        raise
+                    found = books[before:]
+                    self.last_site_error = "Skipped"
+                    self.progress(f"Skipped {host}. Continuing with the next site.")
+                    self.recover_after_skip()
                 self._check_cancel()
                 stats.seconds = time.perf_counter() - site_started
                 stats.listing_pages = max(0, self.report.listing_pages - pages_before)
@@ -5502,7 +5565,9 @@ class BookCrawler:
                 added = len(books) - before
                 titled = len([book for book in found if book.title])
                 listed += 1 if titled else 0
-                if self.last_site_error:
+                if self.last_site_error == "Skipped":
+                    notes.append(f"{host}: skipped")
+                elif self.last_site_error:
                     short = self.last_site_error.split(".")[0]
                     notes.append(f"{host}: could not open ({short})")
                 else:
@@ -5511,10 +5576,13 @@ class BookCrawler:
                         f"{stats.duplicates} duplicates, {stats.updated} updated, {format_duration(stats.seconds)}"
                     )
                 self.progress(stats.line())
-                self.progress(
-                    f"{host}: {titled} book(s) this year. "
-                    f"{added} new name(s). Combined list: {len(books)}."
-                )
+                if self.last_site_error == "Skipped":
+                    self.progress(f"{host}: skipped. Combined list: {len(books)}.")
+                else:
+                    self.progress(
+                        f"{host}: {titled} book(s) this year. "
+                        f"{added} new name(s). Combined list: {len(books)}."
+                    )
             self._check_cancel()
             self.report.elapsed_listing = time.perf_counter() - listing_started
             self.report.site_notes = notes
@@ -5534,7 +5602,13 @@ class BookCrawler:
             )
             cache_started = time.perf_counter()
             cache_stats = SourceStats(name="Cached catalog pages", kind="cache")
-            cache_stats.updated = self.enrich_books(books, listing_urls, max_searches=0)
+            try:
+                cache_stats.updated = self.enrich_books(books, listing_urls, max_searches=0)
+            except CrawlCancelled:
+                if self.cancelled():
+                    raise
+                self.progress("Skipped remaining cached-page fill.")
+                self.recover_after_skip()
             cache_stats.seconds = time.perf_counter() - cache_started
             self.report.elapsed_cache = cache_stats.seconds
             if cache_stats.seconds or cache_stats.updated:

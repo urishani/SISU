@@ -283,12 +283,17 @@ class BookCatalogApp(tk.Tk):
         self._deep_popup: tk.Toplevel | None = None
         self._deep_tree: ttk.Treeview | None = None
         self._deep_status = tk.StringVar(value="")
+        self._deep_names = tk.StringVar(value="")
         self._deep_start_btn: ttk.Button | None = None
         self._deep_stop_btn: ttk.Button | None = None
+        self._deep_skip_btn: ttk.Button | None = None
         self._deep_running = False
         self._deep_rows: list[dict] = []
         self._deep_history: dict[str, dict] = {}
         self._deep_history_loaded = False
+        self._deep_tip: tk.Toplevel | None = None
+        self._deep_tip_after: str | int | None = None
+        self._deep_tip_target: str | None = None
         self._found_popup: tk.Toplevel | None = None
         self._settings_popup: tk.Toplevel | None = None
         self._report_popup: tk.Toplevel | None = None
@@ -298,6 +303,7 @@ class BookCatalogApp(tk.Tk):
         self._update_declined_remote = ""
         self._update_check_after: str | int | None = None
         self._cancel = threading.Event()
+        self._skip = threading.Event()
         self._active_crawler = None
         self._busy = False
         self._follow_search = True
@@ -369,9 +375,12 @@ class BookCatalogApp(tk.Tk):
             )
         except tk.TclError:
             pass
-        deep_font = tkfont.Font(self, family="Segoe UI", size=10)
-        deep_row = max(36, int(deep_font.metrics("linespace") or 16) + 20)
-        style.configure("Deep.Treeview", font=("Segoe UI", 10), rowheight=deep_row)
+        style.configure(
+            "Deep.Treeview",
+            font=("Segoe UI", 10),
+            padding=0,
+            rowheight=self._deep_tree_rowheight(),
+        )
         style.configure("Deep.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
     def _build(self) -> None:
@@ -663,6 +672,12 @@ class BookCatalogApp(tk.Tk):
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self.stop_btn.pack(side="left")
         self._callout(self.stop_btn, "Stop the current Search or Deep search. Books found so far are kept.")
+        self.skip_btn = ttk.Button(buttons, text="Skip", command=self.skip_current, state="disabled")
+        self.skip_btn.pack(side="left", padx=(4, 0))
+        self._callout(
+            self.skip_btn,
+            "Leave the current catalog or publisher and continue with the next one. The rest of the run keeps going.",
+        )
 
         self.colored_info_label = ttk.Label(form, textvariable=self.colored_info, wraplength=1, justify="left")
         self.colored_info_label.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -3609,6 +3624,7 @@ class BookCatalogApp(tk.Tk):
             return
 
         self._cancel.clear()
+        self._skip.clear()
         self._busy = True
         self._apply_lock_state()
         self._set_site_list_enabled(False)
@@ -3616,7 +3632,7 @@ class BookCatalogApp(tk.Tk):
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
         self.unfinal_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+        self._set_run_controls(True)
         self._update_list_action_buttons()
         self._cancel_live_save()
         seed_books = list(self.books)
@@ -3680,6 +3696,35 @@ class BookCatalogApp(tk.Tk):
             self._activity.log("Stop requested at the current book.")
         except Exception:
             pass
+
+    def skip_current(self) -> None:
+        if not self._busy:
+            return
+        self._skip.set()
+        crawler = self._active_crawler
+        if crawler is not None:
+            crawler.abort()
+        if self._deep_running:
+            running = next((row for row in self._deep_rows if str(row.get("tag") or "") == "running"), None)
+            target = str((running or {}).get("name") or "this publisher")
+            message = f"Skipping {target}. Continuing with the next publisher."
+            self._set_status(message)
+            self._deep_status.set(message)
+        else:
+            target = self._scan_site or "this site"
+            message = f"Skipping {target}. Continuing with the next site."
+            self._set_status(message)
+        try:
+            self._activity.log(f"Skipped {target}.")
+        except Exception:
+            pass
+
+    def _set_run_controls(self, running: bool) -> None:
+        state = "normal" if running else "disabled"
+        if getattr(self, "stop_btn", None):
+            self.stop_btn.configure(state=state)
+        if getattr(self, "skip_btn", None):
+            self.skip_btn.configure(state=state)
 
     def _crawl_progress(self, msg: str) -> None:
         if self._cancel.is_set() and not str(msg or "").startswith("Stopped"):
@@ -4049,6 +4094,7 @@ class BookCatalogApp(tk.Tk):
         books = list(seed_books or [])
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
+            skip_event=self._skip,
             progress=self._crawl_progress,
             event=lambda kind, data: self._ui_queue.put(("event", (kind, data))),
         )
@@ -4123,6 +4169,14 @@ class BookCatalogApp(tk.Tk):
             if stopping and self._discard_after_stop(kind, payload):
                 processed += 1
                 continue
+            if (
+                self._skip.is_set()
+                and kind == "deep_row"
+                and isinstance(payload, dict)
+                and str(payload.get("tag") or "") == "running"
+            ):
+                processed += 1
+                continue
             if kind == "live":
                 latest_live = self._live_latest or str(payload or "")
                 continue
@@ -4185,7 +4239,8 @@ class BookCatalogApp(tk.Tk):
         error: str = "",
     ) -> None:
         self._busy = False
-        self.stop_btn.configure(state="disabled")
+        self._skip.clear()
+        self._set_run_controls(False)
         self._follow_search = True
         self._highlight_site_url("")
         self._cancel_live_save()
@@ -4443,6 +4498,7 @@ class BookCatalogApp(tk.Tk):
         if not books or self._busy:
             return
         self._cancel.clear()
+        self._skip.clear()
         self._busy = True
         self._apply_lock_state()
         self._set_site_list_enabled(False)
@@ -4450,7 +4506,7 @@ class BookCatalogApp(tk.Tk):
         self.approve_btn.configure(state="disabled")
         self.final_btn.configure(state="disabled")
         self.unfinal_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+        self._set_run_controls(True)
         self._update_list_action_buttons()
         self._begin_work("Working…")
         label = books[0].publisher.strip() if books else "publisher"
@@ -4721,10 +4777,10 @@ class BookCatalogApp(tk.Tk):
         except OSError:
             pass
 
-    def _publisher_used_before(self, key: str, books: list[Book]) -> bool:
-        if key in self._load_deep_history():
+    def _publisher_used_before(self, row: dict) -> bool:
+        if self._deep_history_entry(row):
             return True
-        for book in books:
+        for book in row.get("books") or []:
             extra = book.extra or {}
             if extra.get("lookup_note") or extra.get("publisher_page") or extra.get("publisher_site"):
                 return True
@@ -4732,31 +4788,72 @@ class BookCatalogApp(tk.Tk):
                 return True
         return False
 
+    def _deep_history_entry(self, row: dict) -> dict:
+        hist = self._load_deep_history()
+        found: list[dict] = []
+        keys = [str(row.get("key") or "")]
+        keys.extend(str(key) for key in (row.get("alias_keys") or []) if key)
+        for key in keys:
+            item = hist.get(key)
+            if isinstance(item, dict):
+                found.append(item)
+        if not found:
+            return {}
+        return max(found, key=lambda item: str(item.get("at") or ""))
+
+    def _deep_collection_names(self, row: dict) -> list[str]:
+        names = [str(name).strip() for name in (row.get("names") or []) if str(name).strip()]
+        if names:
+            return names
+        name = str(row.get("name") or "").strip()
+        return [name] if name else []
+
     def _deep_publisher_groups(self) -> list[dict]:
+        from collections import Counter
         from publisher_sites import _haystack
 
         buckets: dict[str, dict] = {}
         order: list[str] = []
         for book in self.books:
             name = (book.publisher or "").strip()
-            display = name or "(no publisher)"
-            key = _haystack(name).strip() if name else "__none__"
+            url = resolve_publisher_site(name) if name else ""
+            alias_key = _haystack(name).strip() if name else "__none__"
+            if url:
+                key = "url:" + listing_url_key(url)
+            else:
+                key = "name:" + (alias_key or "__none__")
             row = buckets.get(key)
             if row is None:
                 row = {
                     "key": key,
-                    "name": display,
+                    "url": url or "",
                     "books": [],
-                    "url": resolve_publisher_site(name) if name else "",
+                    "names": [],
+                    "alias_keys": set(),
                 }
                 buckets[key] = row
                 order.append(key)
-            elif name and len(display) > len(str(row["name"])):
-                row["name"] = display
-            if name and not row["url"]:
-                row["url"] = resolve_publisher_site(name) or ""
+            elif url and not row["url"]:
+                row["url"] = url
+            label = name or "(no publisher)"
+            if label not in row["names"]:
+                row["names"].append(label)
+            if alias_key:
+                row["alias_keys"].add(alias_key)
             row["books"].append(book)
-        rows = [buckets[key] for key in order]
+        rows: list[dict] = []
+        for key in order:
+            row = buckets[key]
+            counts = Counter(
+                (book.publisher or "").strip() or "(no publisher)" for book in row["books"]
+            )
+            names = [name for name in row["names"] if name]
+            names.sort(key=lambda name: (-counts.get(name, 0), name.casefold()))
+            row["names"] = names
+            row["alias_keys"] = sorted(row["alias_keys"])
+            row["collection"] = len(names) > 1
+            row["name"] = f"{names[0]}..." if row["collection"] else (names[0] if names else "(no publisher)")
+            rows.append(row)
         rows.sort(key=lambda item: (0 if item["url"] else 1, str(item["name"]).casefold()))
         return rows
 
@@ -4787,17 +4884,20 @@ class BookCatalogApp(tk.Tk):
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(2, weight=1)
+        body.rowconfigure(3, weight=1)
         ttk.Label(
             body,
-            text="Books on this list, grouped by publisher. Start crawls only publishers that have a website. Stop cancels the crawl and skips the rest. Closing this window does not stop a run that is already going.",
+            text="Books on this list, grouped by publisher website. Catalog names that share a URL are one row (Name…). Hover or click a collection to see the names as they appear in the catalogs. Start crawls each website once. Skip leaves the current site and continues with the next. Stop cancels the crawl. Closing this window does not stop a run that is already going.",
             wraplength=940,
         ).grid(row=0, column=0, sticky="ew")
         ttk.Label(body, textvariable=self._deep_status, wraplength=940).grid(
-            row=1, column=0, sticky="ew", pady=(6, 8)
+            row=1, column=0, sticky="ew", pady=(6, 4)
+        )
+        ttk.Label(body, textvariable=self._deep_names, wraplength=940).grid(
+            row=2, column=0, sticky="ew", pady=(0, 8)
         )
         wrap = ttk.Frame(body)
-        wrap.grid(row=2, column=0, sticky="nsew")
+        wrap.grid(row=3, column=0, sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         wrap.rowconfigure(0, weight=1)
         columns = ("publisher", "site", "books", "used", "comment")
@@ -4832,12 +4932,18 @@ class BookCatalogApp(tk.Tk):
         self._apply_deep_tree_rowheight()
         tree.after_idle(self._apply_deep_tree_rowheight)
         tree.bind("<Double-1>", lambda _e: self._deep_open_selected_site())
+        tree.bind("<<TreeviewSelect>>", lambda _e: self._deep_on_select())
+        tree.bind("<Motion>", self._deep_on_motion, add="+")
+        tree.bind("<Leave>", self._hide_deep_tip, add="+")
+        tree.bind("<MouseWheel>", self._hide_deep_tip, add="+")
         buttons = ttk.Frame(body)
-        buttons.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        buttons.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         self._deep_start_btn = ttk.Button(buttons, text="Start", command=self.start_deep_search, style="Accent.TButton")
         self._deep_start_btn.pack(side="left")
         self._deep_stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_search, state="disabled")
         self._deep_stop_btn.pack(side="left", padx=(8, 0))
+        self._deep_skip_btn = ttk.Button(buttons, text="Skip", command=self.skip_current, state="disabled")
+        self._deep_skip_btn.pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Add website…", command=self._deep_open_selected_site).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Close", command=self._close_deep_search).pack(side="right")
         self._callout(
@@ -4845,6 +4951,10 @@ class BookCatalogApp(tk.Tk):
             "Crawl every publisher that has a website, using the same lookup as More. Rows with no URL are skipped.",
         )
         self._callout(self._deep_stop_btn, "Stop Deep search. Remaining publishers are skipped.")
+        self._callout(
+            self._deep_skip_btn,
+            "Leave the current publisher and continue with the next one. The rest of Deep search keeps going.",
+        )
         if self._deep_running and self._deep_rows:
             self._paint_deep_tree()
         else:
@@ -4862,8 +4972,8 @@ class BookCatalogApp(tk.Tk):
         for index, row in enumerate(self._deep_rows):
             row["iid"] = f"p{index}"
             url = str(row.get("url") or "")
-            used = self._publisher_used_before(str(row["key"]), row["books"])
-            history = self._load_deep_history().get(str(row["key"])) or {}
+            used = self._publisher_used_before(row)
+            history = self._deep_history_entry(row)
             comment = str(history.get("comment") or "")
             if not comment and used:
                 comment = "Looked up before."
@@ -4871,19 +4981,29 @@ class BookCatalogApp(tk.Tk):
             row["comment"] = comment
             row["tag"] = "missing" if not url else ""
         with_url = sum(1 for row in self._deep_rows if row.get("url"))
+        catalog_names = sum(len(self._deep_collection_names(row)) for row in self._deep_rows)
+        extra = f" · {catalog_names} catalog names" if catalog_names > len(self._deep_rows) else ""
         self._deep_status.set(
-            f"{len(self._deep_rows)} publisher(s) · {len(self.books)} book(s) · {with_url} with a website."
+            f"{len(self._deep_rows)} publisher site(s){extra} · {len(self.books)} book(s) · {with_url} with a website."
         )
+        self._deep_names.set("")
         self._paint_deep_tree()
         self._sync_deep_buttons()
+
+    def _deep_tree_rowheight(self, widget: tk.Widget | None = None) -> int:
+        row_font = tkfont.Font(widget or self, family="Segoe UI", size=10)
+        return max(22, int(row_font.metrics("linespace") or 16) + 6)
 
     def _apply_deep_tree_rowheight(self) -> None:
         tree = self._deep_tree
         if tree is None:
             return
-        row_font = tkfont.Font(tree, family="Segoe UI", size=10)
-        height = max(36, int(row_font.metrics("linespace") or 16) + 20)
-        ttk.Style(self).configure("Deep.Treeview", font=("Segoe UI", 10), rowheight=height)
+        ttk.Style(self).configure(
+            "Deep.Treeview",
+            font=("Segoe UI", 10),
+            padding=0,
+            rowheight=self._deep_tree_rowheight(tree),
+        )
         try:
             tree.configure(style="Deep.Treeview")
         except tk.TclError:
@@ -4913,6 +5033,89 @@ class BookCatalogApp(tk.Tk):
                 tags=(tag,) if tag else (),
             )
 
+    def _deep_row_by_iid(self, iid: str) -> dict | None:
+        return next((item for item in self._deep_rows if str(item.get("iid") or "") == str(iid or "")), None)
+
+    def _deep_on_select(self) -> None:
+        tree = self._deep_tree
+        if tree is None:
+            return
+        selection = tree.selection()
+        row = self._deep_row_by_iid(str(selection[0])) if selection else None
+        names = self._deep_collection_names(row) if row else []
+        if len(names) > 1:
+            self._deep_names.set("Catalog names: " + " · ".join(names))
+        else:
+            self._deep_names.set("")
+
+    def _hide_deep_tip(self, _event=None) -> None:
+        if self._deep_tip_after is not None:
+            try:
+                self.after_cancel(self._deep_tip_after)
+            except tk.TclError:
+                pass
+            self._deep_tip_after = None
+        if self._deep_tip is not None:
+            try:
+                self._deep_tip.destroy()
+            except tk.TclError:
+                pass
+            self._deep_tip = None
+        self._deep_tip_target = None
+
+    def _show_deep_tip(self, x: int, y: int, text: str, target: str) -> None:
+        self._deep_tip_after = None
+        if self._deep_tip_target != target or self._deep_tip is not None or not text:
+            return
+        tree = self._deep_tree
+        if tree is None:
+            return
+        try:
+            if not tree.winfo_ismapped():
+                return
+        except tk.TclError:
+            return
+        tip = tk.Toplevel(tree)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x + 12}+{y + 18}")
+        try:
+            tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tip,
+            text=text,
+            justify="left",
+            wraplength=420,
+            background="#FFF8E8",
+            foreground=NAVY,
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+            padx=8,
+            pady=6,
+        ).pack()
+        self._deep_tip = tip
+
+    def _deep_on_motion(self, event: tk.Event) -> None:
+        tree = self._deep_tree
+        if tree is None:
+            return
+        row_id = tree.identify_row(event.y)
+        row = self._deep_row_by_iid(row_id) if row_id else None
+        names = self._deep_collection_names(row) if row else []
+        if len(names) <= 1:
+            if self._deep_tip_target is not None:
+                self._hide_deep_tip()
+            return
+        if self._deep_tip_target == row_id:
+            return
+        self._hide_deep_tip()
+        self._deep_tip_target = row_id
+        x, y = int(event.x_root), int(event.y_root)
+        text = "Catalog names:\n" + "\n".join(names)
+        self._deep_tip_after = self.after(350, lambda: self._show_deep_tip(x, y, text, row_id))
+
     def _sync_deep_buttons(self) -> None:
         with_url = any(row.get("url") for row in self._deep_rows)
         if self._deep_start_btn is not None:
@@ -4922,6 +5125,8 @@ class BookCatalogApp(tk.Tk):
                 self._deep_start_btn.configure(state="normal")
         if self._deep_stop_btn is not None:
             self._deep_stop_btn.configure(state="normal" if self._deep_running else "disabled")
+        if self._deep_skip_btn is not None:
+            self._deep_skip_btn.configure(state="normal" if self._deep_running else "disabled")
 
     def _deep_open_selected_site(self) -> None:
         tree = self._deep_tree
@@ -4936,18 +5141,23 @@ class BookCatalogApp(tk.Tk):
             return
         url = str(row.get("url") or "")
         name = str(row.get("name") or "")
+        names = self._deep_collection_names(row)
         if url:
             self._open_publisher_site(url)
             return
-        if name and name != "(no publisher)":
-            self.open_settings(focus_publisher=name)
+        focus = next((item for item in names if item and item != "(no publisher)"), name)
+        if focus and focus != "(no publisher)":
+            self.open_settings(focus_publisher=focus)
 
     def _close_deep_search(self) -> None:
+        self._hide_deep_tip()
+        self._deep_names.set("")
         win = self._deep_popup
         self._deep_popup = None
         self._deep_tree = None
         self._deep_start_btn = None
         self._deep_stop_btn = None
+        self._deep_skip_btn = None
         if win is not None:
             try:
                 win.destroy()
@@ -4979,10 +5189,11 @@ class BookCatalogApp(tk.Tk):
                 }
             )
         self._cancel.clear()
+        self._skip.clear()
         self._busy = True
         self._deep_running = True
         self._apply_lock_state()
-        self.stop_btn.configure(state="normal")
+        self._set_run_controls(True)
         self._begin_work("Deep search…")
         self._sync_deep_buttons()
         self._activity.start_run(
@@ -5050,6 +5261,7 @@ class BookCatalogApp(tk.Tk):
                     continue
                 crawler = BookCrawler(
                     cancelled=self._cancel.is_set,
+                    skip_event=self._skip,
                     progress=self._crawl_progress,
                 )
                 self._active_crawler = crawler
@@ -5087,7 +5299,7 @@ class BookCatalogApp(tk.Tk):
                         if filled or extra.get("publisher_page") or book.publisher_found_fields():
                             found += 1
                         snapshot = (found, updated, book_index, book_total)
-                    if self._cancel.is_set():
+                    if self._cancel.is_set() or self._skip.is_set():
                         return
                     now = time.monotonic()
                     if snapshot[2] < snapshot[3] and now - last_ui[0] < 0.12:
@@ -5109,11 +5321,18 @@ class BookCatalogApp(tk.Tk):
                         )
                     )
 
+                skipped = False
                 try:
                     crawler.progress(f"Deep search {index} of {len(targets)}: {name} ({len(books)} book(s)).")
-                    crawler.enrich_publisher_books(books, on_book=on_book)
+                    crawler.enrich_publisher_books(
+                        books,
+                        on_book=on_book,
+                        site_url=str(row.get("url") or ""),
+                    )
                 except CrawlCancelled:
-                    totals["cancelled"] = True
+                    skipped = bool(self._skip.is_set()) and not self._cancel.is_set()
+                    if not skipped:
+                        totals["cancelled"] = True
                 finally:
                     if self._active_crawler is crawler:
                         self._active_crawler = None
@@ -5126,7 +5345,9 @@ class BookCatalogApp(tk.Tk):
                     comment += f" {untitled} with no title skipped."
                 if errors:
                     comment += f" {errors} error(s)."
-                if stopped:
+                if skipped:
+                    comment = "Skipped. " + comment
+                elif stopped:
                     comment = "Stopped. " + comment
                 self._deep_history[str(row["key"])] = {
                     "name": name,
@@ -5141,6 +5362,7 @@ class BookCatalogApp(tk.Tk):
                 totals["updated"] += updated
                 self._activity.log(f"{name}: {comment}")
                 self._save_deep_history()
+                tag = "skipped" if skipped else "stopped" if stopped else "done"
                 self._ui_queue.put(
                     (
                         "deep_row",
@@ -5148,7 +5370,7 @@ class BookCatalogApp(tk.Tk):
                             "iid": iid,
                             "used": "Yes",
                             "comment": comment,
-                            "tag": "stopped" if stopped else "done",
+                            "tag": tag,
                             "refresh": True,
                             "status": f"Publisher {index} of {len(targets)} · {name}",
                         },
@@ -5156,6 +5378,8 @@ class BookCatalogApp(tk.Tk):
                 )
                 if stopped:
                     break
+                if skipped:
+                    self._skip.clear()
             self._save_deep_history()
             self._ui_queue.put(("deep_done", totals))
         except Exception as exc:
@@ -5167,7 +5391,7 @@ class BookCatalogApp(tk.Tk):
 
     def _on_deep_row(self, payload: dict) -> None:
         tag = str((payload or {}).get("tag") or "")
-        if self._cancel.is_set() and tag == "running":
+        if (self._cancel.is_set() or self._skip.is_set()) and tag == "running":
             return
         tree = self._deep_tree
         iid = str((payload or {}).get("iid") or "")
@@ -5205,7 +5429,8 @@ class BookCatalogApp(tk.Tk):
     def _finish_deep_search(self, payload: dict | None) -> None:
         self._deep_running = False
         self._busy = False
-        self.stop_btn.configure(state="disabled")
+        self._skip.clear()
+        self._set_run_controls(False)
         self._apply_lock_state()
         self._sync_deep_buttons()
         data = payload or {}
@@ -5246,6 +5471,7 @@ class BookCatalogApp(tk.Tk):
     def _run_publisher_lookup(self, books: list[Book], selected: Book | None, publisher: str) -> None:
         crawler = BookCrawler(
             cancelled=self._cancel.is_set,
+            skip_event=self._skip,
             progress=self._crawl_progress,
         )
         self._active_crawler = crawler
@@ -5402,7 +5628,8 @@ class BookCatalogApp(tk.Tk):
 
     def _finish_more(self, payload: dict | None) -> None:
         self._busy = False
-        self.stop_btn.configure(state="disabled")
+        self._skip.clear()
+        self._set_run_controls(False)
         self._apply_lock_state()
         remap = (payload or {}).get("remap") or None
         selected = (payload or {}).get("selected") or self._selected_book
