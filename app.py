@@ -298,6 +298,7 @@ class BookCatalogApp(tk.Tk):
         self._update_declined_remote = ""
         self._update_check_after: str | int | None = None
         self._cancel = threading.Event()
+        self._active_crawler = None
         self._busy = False
         self._follow_search = True
         self._programmatic_select = False
@@ -2906,15 +2907,21 @@ class BookCatalogApp(tk.Tk):
         win.protocol("WM_DELETE_WINDOW", cancel)
         body = ttk.Frame(win, padding=16)
         body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
         ttk.Label(
             body,
             text="Paste catalog URLs, one per line. Sites already in the list are skipped.",
-            wraplength=480,
+            wraplength=520,
             justify="left",
-        ).pack(anchor="w")
+        ).grid(row=0, column=0, sticky="ew")
+        text_wrap = ttk.Frame(body)
+        text_wrap.grid(row=1, column=0, sticky="nsew", pady=(10, 8))
+        text_wrap.columnconfigure(0, weight=1)
+        text_wrap.rowconfigure(0, weight=1)
         box = tk.Text(
-            body,
-            height=12,
+            text_wrap,
+            height=8,
             width=62,
             wrap="word",
             font=("Segoe UI", 10),
@@ -2923,7 +2930,10 @@ class BookCatalogApp(tk.Tk):
             padx=6,
             pady=6,
         )
-        box.pack(fill="both", expand=True, pady=(10, 8))
+        scroll = ttk.Scrollbar(text_wrap, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=scroll.set)
+        box.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
         try:
             clip = str(self.clipboard_get() or "")
         except tk.TclError:
@@ -2931,7 +2941,7 @@ class BookCatalogApp(tk.Tk):
         if parse_site_urls(clip):
             box.insert("1.0", clip.strip() + "\n")
         buttons = ttk.Frame(body)
-        buttons.pack(fill="x")
+        buttons.grid(row=2, column=0, sticky="ew")
         ttk.Button(buttons, text="Paste", command=paste_clipboard).pack(side="left")
         ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right")
         ttk.Button(buttons, text="Add", command=accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
@@ -2940,7 +2950,7 @@ class BookCatalogApp(tk.Tk):
         x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
         y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
         win.geometry(f"{width}x{height}+{x}+{y}")
-        win.minsize(420, 280)
+        win.minsize(420, 260)
         box.focus_set()
         win.grab_set()
         win.wait_window()
@@ -3660,11 +3670,20 @@ class BookCatalogApp(tk.Tk):
 
     def stop_search(self) -> None:
         self._cancel.set()
-        self._set_status("Stopping…")
+        crawler = self._active_crawler
+        if crawler is not None:
+            crawler.abort()
+        self._set_status("Stopping now at this book.")
         if self._deep_running:
-            self._deep_status.set("Stopping…")
+            self._deep_status.set("Stopping now at this book.")
+        try:
+            self._activity.log("Stop requested at the current book.")
+        except Exception:
+            pass
 
     def _crawl_progress(self, msg: str) -> None:
+        if self._cancel.is_set() and not str(msg or "").startswith("Stopped"):
+            return
         text = str(msg or "").strip()
         if not text:
             return
@@ -4032,6 +4051,7 @@ class BookCatalogApp(tk.Tk):
             progress=self._crawl_progress,
             event=lambda kind, data: self._ui_queue.put(("event", (kind, data))),
         )
+        self._active_crawler = crawler
         try:
             self._crawl_progress(f"Searching {len(urls)} bookstore and catalog URL(s)…")
             books = list(seed_books or [])
@@ -4074,6 +4094,8 @@ class BookCatalogApp(tk.Tk):
         except Exception as exc:
             self._ui_queue.put(("error", str(exc)))
         finally:
+            if self._active_crawler is crawler:
+                self._active_crawler = None
             try:
                 from book_cache import flush_page_cache
 
@@ -4081,15 +4103,26 @@ class BookCatalogApp(tk.Tk):
             except Exception:
                 pass
 
+    def _discard_after_stop(self, kind: str, payload: object) -> bool:
+        if kind in {"status", "live", "event", "lookup_step"}:
+            return True
+        if kind == "deep_row" and isinstance(payload, dict):
+            return str(payload.get("tag") or "") == "running"
+        return False
+
     def _drain_queue(self) -> None:
         processed = 0
         latest_live = None
-        limit = 24 if self._deep_running else 8
+        stopping = bool(self._cancel.is_set())
+        limit = 400 if stopping else (24 if self._deep_running else 8)
         while processed < limit:
             try:
                 kind, payload = self._ui_queue.get_nowait()
             except queue.Empty:
                 break
+            if stopping and self._discard_after_stop(kind, payload):
+                processed += 1
+                continue
             if kind == "live":
                 latest_live = self._live_latest or str(payload or "")
                 continue
@@ -4136,9 +4169,11 @@ class BookCatalogApp(tk.Tk):
                 self._on_update_error(bool(silent), str(text))
             elif kind == "update_applied":
                 self._finish_self_update()
-        if latest_live is not None:
+        if latest_live is not None and not self._cancel.is_set():
             self._live_queued = False
             self._apply_log_live(latest_live)
+        elif latest_live is not None:
+            self._live_queued = False
         self.after(20 if processed >= limit or latest_live is not None else 80, self._drain_queue)
 
     def _finish_search(
@@ -5017,6 +5052,7 @@ class BookCatalogApp(tk.Tk):
                     cancelled=self._cancel.is_set,
                     progress=self._crawl_progress,
                 )
+                self._active_crawler = crawler
                 stats = SourceStats(
                     name=name,
                     url=str(row.get("url") or ""),
@@ -5051,6 +5087,8 @@ class BookCatalogApp(tk.Tk):
                         if filled or extra.get("publisher_page") or book.publisher_found_fields():
                             found += 1
                         snapshot = (found, updated, book_index, book_total)
+                    if self._cancel.is_set():
+                        return
                     now = time.monotonic()
                     if snapshot[2] < snapshot[3] and now - last_ui[0] < 0.12:
                         return
@@ -5076,6 +5114,9 @@ class BookCatalogApp(tk.Tk):
                     crawler.enrich_publisher_books(books, on_book=on_book)
                 except CrawlCancelled:
                     totals["cancelled"] = True
+                finally:
+                    if self._active_crawler is crawler:
+                        self._active_crawler = None
                 stats.seconds = time.monotonic() - started
                 crawler._current_source = None
                 total = len(books)
@@ -5125,11 +5166,13 @@ class BookCatalogApp(tk.Tk):
             self._ui_queue.put(("deep_error", str(exc)))
 
     def _on_deep_row(self, payload: dict) -> None:
+        tag = str((payload or {}).get("tag") or "")
+        if self._cancel.is_set() and tag == "running":
+            return
         tree = self._deep_tree
         iid = str((payload or {}).get("iid") or "")
         comment = str((payload or {}).get("comment") or "")
         used = str((payload or {}).get("used") or "Yes")
-        tag = str((payload or {}).get("tag") or "")
         status = str((payload or {}).get("status") or "")
         if status:
             self._deep_status.set(status)
@@ -5205,6 +5248,7 @@ class BookCatalogApp(tk.Tk):
             cancelled=self._cancel.is_set,
             progress=self._crawl_progress,
         )
+        self._active_crawler = crawler
         remap: dict[str, str] = {}
         updated = 0
         errors = 0
@@ -5281,6 +5325,8 @@ class BookCatalogApp(tk.Tk):
         except Exception as exc:
             self._ui_queue.put(("more_error", str(exc)))
         finally:
+            if self._active_crawler is crawler:
+                self._active_crawler = None
             crawler._current_source = None
 
     def open_field_report(self) -> None:
@@ -6523,6 +6569,8 @@ class BookCatalogApp(tk.Tk):
             pass
 
     def _on_search_event(self, kind: str, data: dict) -> None:
+        if self._cancel.is_set():
+            return
         site = str(data.get("site") or "")
         url = str(data.get("url") or "")
         if kind == "pages":

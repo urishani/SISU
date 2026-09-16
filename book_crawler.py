@@ -3784,8 +3784,22 @@ class BookCrawler:
         self.delay_seconds = delay_seconds
         self.timeout = timeout
         self.cancelled = cancelled or (lambda: False)
-        self.progress = progress or (lambda _msg: None)
-        self.event = event or (lambda _kind, _data: None)
+        raw_progress = progress or (lambda _msg: None)
+        raw_event = event or (lambda _kind, _data: None)
+
+        def gated_progress(msg: str) -> None:
+            text = str(msg or "")
+            if self._is_cancelled() and not text.startswith("Stopped"):
+                return
+            raw_progress(text)
+
+        def gated_event(kind: str, data: dict[str, Any] | None = None) -> None:
+            if self._is_cancelled():
+                return
+            raw_event(kind, data)
+
+        self.progress = gated_progress
+        self.event = gated_event
         self.report = CrawlReport()
         self.last_site_error = ""
         self._duplicate_ids: set[int] = set()
@@ -3793,7 +3807,9 @@ class BookCrawler:
         self._current_source: SourceStats | None = None
         self._tls = threading.local()
         self._report_lock = threading.Lock()
+        self._aborted = False
         self.session = requests.Session()
+        self._sessions = [self.session]
         retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(429, 502, 503, 504))
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("http://", adapter)
@@ -3808,9 +3824,35 @@ class BookCrawler:
             }
         )
 
+    def abort(self) -> None:
+        """Drop in-flight HTTP so Stop does not wait out the current page request."""
+        self._aborted = True
+        with self._report_lock:
+            sessions = list(self._sessions)
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._aborted or self.cancelled())
+
     def _check_cancel(self) -> None:
-        if self.cancelled():
+        if self._is_cancelled():
             raise CrawlCancelled("Search cancelled")
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        remaining = float(seconds or 0)
+        if remaining <= 0:
+            return
+        deadline = time.monotonic() + remaining
+        while True:
+            self._check_cancel()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(0.05, left))
 
     def _emit(self, kind: str, data: dict[str, Any] | None = None) -> None:
         try:
@@ -3853,6 +3895,7 @@ class BookCrawler:
             setattr(self.report, attr, getattr(self.report, attr) + n)
 
     def _request_session(self) -> requests.Session:
+        self._check_cancel()
         if not self._in_pool():
             return self.session
         session = getattr(self._tls, "session", None)
@@ -3864,6 +3907,8 @@ class BookCrawler:
             session.mount("https://", adapter)
             session.headers.update(self.session.headers)
             self._tls.session = session
+            with self._report_lock:
+                self._sessions.append(session)
         return session
 
     def fetch(self, url: str, timeout: float | tuple[float, float] | None = None) -> tuple[str, str]:
@@ -3877,9 +3922,16 @@ class BookCrawler:
         delay = PUBLISHER_POOL_DELAY if self._in_pool() else self.delay_seconds
         try:
             response = self._request_session().get(url, timeout=timeout)
-        except requests.RequestException as exc:
-            raise SiteError(request_failure_message(exc, url), url=url) from exc
+        except CrawlCancelled:
+            raise
+        except Exception as exc:
+            self._check_cancel()
+            if isinstance(exc, requests.RequestException):
+                raise SiteError(request_failure_message(exc, url), url=url) from exc
+            raise
+        self._check_cancel()
         html = decode_http_text(response)
+        self._check_cancel()
         failure = site_error_message(html, response.status_code, response.url or url)
         if failure:
             raise SiteError(failure, url=response.url or url)
@@ -3888,13 +3940,16 @@ class BookCrawler:
         path_l = urlparse(url).path.lower()
         if "/api/" not in path_l and not path_l.endswith(".js") and not path_l.endswith("products.json"):
             if delay:
-                time.sleep(delay)
+                self._interruptible_sleep(delay)
         return html, response.url
 
     def _evrit_json(self, url: str) -> dict[str, Any] | None:
         try:
             raw, _final = self.fetch(url)
+        except CrawlCancelled:
+            raise
         except (SiteError, requests.RequestException):
+            self._check_cancel()
             return None
         try:
             data = json.loads(raw)
@@ -3923,7 +3978,10 @@ class BookCrawler:
     def _load_json(self, url: str) -> Any:
         try:
             raw, _final = self.fetch(url)
+        except CrawlCancelled:
+            raise
         except (SiteError, requests.RequestException):
+            self._check_cancel()
             return None
         try:
             return json.loads(raw)
@@ -3992,6 +4050,7 @@ class BookCrawler:
                     break
                 batch: list[str] = []
                 for item in items:
+                    self._check_cancel()
                     if not isinstance(item, dict):
                         continue
                     listed = Book(url="")
@@ -4024,6 +4083,7 @@ class BookCrawler:
         except CrawlCancelled:
             raise
         except (SiteError, requests.RequestException):
+            self._check_cancel()
             return None if not urls else urls
         return urls or None
 
@@ -4106,6 +4166,7 @@ class BookCrawler:
                     break
                 batch: list[str] = []
                 for item in items:
+                    self._check_cancel()
                     if not isinstance(item, dict):
                         continue
                     product_id = item.get("ProductID")
@@ -4144,6 +4205,7 @@ class BookCrawler:
         except CrawlCancelled:
             raise
         except (SiteError, requests.RequestException):
+            self._check_cancel()
             return None if not urls else urls
         return urls
 
@@ -4206,6 +4268,7 @@ class BookCrawler:
         def take_listed(product_url: str, listing: Book | None = None) -> Book | None:
             from book_cache import get_page_book
 
+            self._check_cancel()
             if product_url in seen_products:
                 if listing:
                     canonical, _is_new = keep(listing)
@@ -4265,18 +4328,20 @@ class BookCrawler:
                     max_books=max_products if max_products > 0 else 50_000,
                     include_unknown_year=include_unknown_year,
                     page_limit=nli_pages,
-                    cancelled=self.cancelled,
+                    cancelled=self._is_cancelled,
                     progress=self.progress,
                     on_listed=keep_listed,
                     on_page=nli_page,
                 )
             except NliCatalogError as exc:
+                self._check_cancel()
                 self.report.listing_failed += 1
                 message = str(exc)
                 self.last_site_error = message
                 if start_error:
                     self.report.error = message
                 self.progress(message)
+            self._check_cancel()
             _safe_flush_scan_files()
             return results
 
@@ -4284,6 +4349,7 @@ class BookCrawler:
             html, final_url = self.fetch(start_url)
             self.report.listing_pages += 1
         except (SiteError, requests.RequestException) as exc:
+            self._check_cancel()
             self.report.listing_failed += 1
             message = str(exc) if isinstance(exc, SiteError) else "Could not open the start URL."
             self.last_site_error = message
@@ -4366,6 +4432,7 @@ class BookCrawler:
                             self.report.listing_pages += 1
                             soup = parse_html(html)
                         except (SiteError, requests.RequestException):
+                            self._check_cancel()
                             self.report.listing_failed += 1
                             continue
                     discovered = last_listing_page(soup, listing_url)
@@ -4380,6 +4447,7 @@ class BookCrawler:
                     listed_books = collect_listing_books(soup, listing_url)
                     if listed_books:
                         for listed in listed_books:
+                            self._check_cancel()
                             if not same_domain(start_url, listed.url) or is_asset_url(listed.url):
                                 continue
                             if listed.url not in product_urls:
@@ -4387,6 +4455,7 @@ class BookCrawler:
                             take_listed(listed.url, listed)
                     else:
                         for product_url, listing_title in collect_product_entries(soup, listing_url):
+                            self._check_cancel()
                             if not same_domain(start_url, product_url) or is_asset_url(product_url):
                                 continue
                             if product_url not in product_urls:
@@ -4407,6 +4476,8 @@ class BookCrawler:
         except CrawlCancelled:
             self.report.cancelled = True
             self.progress(f"Stopped. Keeping {len(results)} matching book(s) found so far.")
+            _safe_flush_scan_files()
+            raise
         _safe_flush_scan_files()
         return results
 
@@ -4504,7 +4575,10 @@ class BookCrawler:
         seen.add(key)
         try:
             candidate, html, resolved = self._book_and_html(product_url, remember=remember)
+        except CrawlCancelled:
+            raise
         except (SiteError, requests.RequestException):
+            self._check_cancel()
             return None
         listing = is_query_listing_url(resolved or product_url)
         matched = candidate if candidate and candidate.title and books_match(wanted, candidate) else None
@@ -4515,7 +4589,10 @@ class BookCrawler:
         if not html:
             try:
                 html, resolved = self.fetch(resolved or product_url)
+            except CrawlCancelled:
+                raise
             except (SiteError, requests.RequestException):
+                self._check_cancel()
                 html = ""
         if html:
             soup = parse_html(html)
@@ -4558,7 +4635,10 @@ class BookCrawler:
                 return candidate
             try:
                 html, final_url = self.fetch(candidate.url)
+            except CrawlCancelled:
+                raise
             except (SiteError, requests.RequestException):
+                self._check_cancel()
                 return candidate
             soup = parse_html(html)
             seen.add(_url_key(candidate.url))
@@ -4615,7 +4695,10 @@ class BookCrawler:
                 seen.add(key)
                 try:
                     html, final_url = self.fetch(search_url)
+                except CrawlCancelled:
+                    raise
                 except (SiteError, requests.RequestException):
+                    self._check_cancel()
                     continue
                 soup = parse_html(html)
                 if is_search_results_page(soup, final_url):
@@ -4700,6 +4783,7 @@ class BookCrawler:
             if not items:
                 break
             for item in items:
+                self._check_cancel()
                 if not isinstance(item, dict):
                     continue
                 listed = Book(url="")
@@ -4729,6 +4813,7 @@ class BookCrawler:
         bases.append(f"{origin}/collections/all/products.json")
         seen: set[str] = set()
         for base in bases:
+            self._check_cancel()
             if base in seen:
                 continue
             seen.add(base)
@@ -4742,6 +4827,7 @@ class BookCrawler:
             html, final_url = self.fetch(start_url)
             self._inc_report("listing_pages")
         except SiteError:
+            self._check_cancel()
             return []
         soup = parse_html(html)
         if is_product_page(soup, final_url):
@@ -4758,6 +4844,7 @@ class BookCrawler:
         known_total = 0
 
         def take(listed: Book) -> None:
+            self._check_cancel()
             url = (listed.url or "").strip()
             if not url or url in seen or is_asset_url(url) or not same_domain(start_url, url):
                 return
@@ -4776,6 +4863,7 @@ class BookCrawler:
                     self._inc_report("listing_pages")
                     soup = parse_html(html)
                 except SiteError:
+                    self._check_cancel()
                     self._inc_report("listing_failed")
                     continue
             discovered = last_listing_page(soup, listing_url)
@@ -4823,13 +4911,13 @@ class BookCrawler:
     def _pool_fetch_page(self, url: str) -> Book | None:
         self._tls.in_pool = True
         try:
-            if self.cancelled():
-                return None
+            self._check_cancel()
             book, _html, _resolved = self._book_and_html(url, remember=True)
             return book
         except CrawlCancelled:
-            return None
+            raise
         except (SiteError, requests.RequestException):
+            self._check_cancel()
             return None
         finally:
             self._tls.in_pool = False
@@ -4972,6 +5060,8 @@ class BookCrawler:
                         in_flight.pop(fut, None)
                         try:
                             page = fut.result()
+                        except CrawlCancelled:
+                            raise
                         except Exception:
                             page = None
                         opened += 1
@@ -5013,13 +5103,13 @@ class BookCrawler:
             self._tls.in_pool = True
             self._tls.timeout = PUBLISHER_GUESS_TIMEOUT
             try:
-                if self.cancelled():
-                    return book, None
+                self._check_cancel()
                 match = self.find_matching_product(publisher_url, book, try_slugs=False, skip_home=True)
                 return book, match
             except CrawlCancelled:
-                return book, None
+                raise
             except (SiteError, requests.RequestException):
+                self._check_cancel()
                 return book, None
             finally:
                 self._tls.in_pool = False
@@ -5211,6 +5301,7 @@ class BookCrawler:
 
         filled = 0
         for extra_url in extra_urls:
+            self._check_cancel()
             host = urlparse(extra_url).netloc
             site_name = site_display_name(extra_url)
             self._emit("site", {"url": extra_url, "name": site_name, "index": 0, "total": 0, "phase": "fill"})
@@ -5238,6 +5329,7 @@ class BookCrawler:
             searches = 0
             search_total = min(max_searches, len(pending))
             for book in pending:
+                self._check_cancel()
                 if searches >= max_searches:
                     break
                 searches += 1
@@ -5397,6 +5489,7 @@ class BookCrawler:
                     start_error=False,
                     on_book=lambda book, site=host, site_url=url: self._take_book(books, book, site, site_url),
                 )
+                self._check_cancel()
                 stats.seconds = time.perf_counter() - site_started
                 stats.listing_pages = max(0, self.report.listing_pages - pages_before)
                 if self.last_site_error:
@@ -5419,6 +5512,7 @@ class BookCrawler:
                     f"{host}: {titled} book(s) this year. "
                     f"{added} new name(s). Combined list: {len(books)}."
                 )
+            self._check_cancel()
             self.report.elapsed_listing = time.perf_counter() - listing_started
             self.report.site_notes = notes
             self.report.error = ""

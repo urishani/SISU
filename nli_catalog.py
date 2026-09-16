@@ -350,7 +350,14 @@ def search_sru_year_books(
         if progress:
             extra = f" of {total:,}" if total else ""
             progress(f"National Library catalog page {page:,}{extra} · {len(books):,} book(s) so far")
-        page_total, records = _fetch_sru_page(session, query, start)
+        try:
+            page_total, records = _fetch_sru_page(session, query, start)
+        except NliCatalogError:
+            if cancelled and cancelled():
+                break
+            raise
+        if cancelled and cancelled():
+            break
         if page_total:
             total = page_total
         if on_page:
@@ -359,6 +366,8 @@ def search_sru_year_books(
             break
         batch_kept = 0
         for record in records:
+            if cancelled and cancelled():
+                return books
             book = book_from_marc(record, year=want_year)
             if not book:
                 continue
@@ -380,7 +389,13 @@ def search_sru_year_books(
             break
         if batch_kept == 0 and page >= 3:
             break
-        time.sleep(0.12)
+        if cancelled and cancelled():
+            break
+        deadline = time.monotonic() + 0.12
+        while time.monotonic() < deadline:
+            if cancelled and cancelled():
+                return books
+            time.sleep(min(0.05, deadline - time.monotonic()))
     return books
 
 
@@ -504,7 +519,11 @@ def search_openlibrary_year_books(
         try:
             response = session.get(url, timeout=30)
         except Exception as exc:
+            if cancelled and cancelled():
+                break
             raise NliCatalogError(f"Could not reach the National Library Search API: {exc}") from exc
+        if cancelled and cancelled():
+            break
         if response.status_code == 429:
             extra = (
                 " The shared guest key is rate-limited. SISU now reads the Alma catalog instead."
@@ -547,6 +566,8 @@ def search_openlibrary_year_books(
             progress(f"National Library API page {page:,} · {len(books):,} book(s) so far")
         batch_kept = 0
         for item in rows:
+            if cancelled and cancelled():
+                return books
             book = book_from_record(item)
             if not book:
                 continue
