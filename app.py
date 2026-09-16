@@ -384,9 +384,16 @@ class BookCatalogApp(tk.Tk):
             "Deep.Treeview",
             font=("Segoe UI", 10),
             padding=0,
-            rowheight=self._deep_tree_rowheight(),
+            rowheight=self._compact_tree_rowheight(),
         )
         style.configure("Deep.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        style.configure(
+            "Lists.Treeview",
+            font=("Segoe UI", 10),
+            padding=0,
+            rowheight=self._compact_tree_rowheight(),
+        )
+        style.configure("Lists.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
     def _build(self) -> None:
         header = tk.Frame(self, bg=NAVY)
@@ -4007,7 +4014,14 @@ class BookCatalogApp(tk.Tk):
         wrap = ttk.Frame(body)
         wrap.pack(fill="both", expand=True)
         columns = ("title", "books", "year", "updated", "state")
-        tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="browse", height=12)
+        tree = ttk.Treeview(
+            wrap,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=12,
+            style="Lists.Treeview",
+        )
         tree.heading("title", text="Title")
         tree.heading("books", text="Books")
         tree.heading("year", text="Year")
@@ -4024,6 +4038,8 @@ class BookCatalogApp(tk.Tk):
         tree.pack(side="left", fill="both", expand=True)
         self._lists_tree = tree
         tree.bind("<Double-1>", lambda _e: self._open_selected_saved_list())
+        self._apply_lists_tree_rowheight()
+        tree.after_idle(self._apply_lists_tree_rowheight)
         self._reload_lists_table()
 
     def _close_lists_popup(self) -> None:
@@ -5542,9 +5558,27 @@ class BookCatalogApp(tk.Tk):
         self._paint_deep_tree()
         self._sync_deep_buttons()
 
-    def _deep_tree_rowheight(self, widget: tk.Widget | None = None) -> int:
+    def _compact_tree_rowheight(self, widget: tk.Widget | None = None) -> int:
         row_font = tkfont.Font(widget or self, family="Segoe UI", size=10)
         return max(22, int(row_font.metrics("linespace") or 16) + 6)
+
+    def _apply_lists_tree_rowheight(self) -> None:
+        tree = getattr(self, "_lists_tree", None)
+        if tree is None:
+            return
+        ttk.Style(self).configure(
+            "Lists.Treeview",
+            font=("Segoe UI", 10),
+            padding=0,
+            rowheight=self._compact_tree_rowheight(tree),
+        )
+        try:
+            tree.configure(style="Lists.Treeview")
+        except tk.TclError:
+            pass
+
+    def _deep_tree_rowheight(self, widget: tk.Widget | None = None) -> int:
+        return self._compact_tree_rowheight(widget)
 
     def _apply_deep_tree_rowheight(self) -> None:
         tree = self._deep_tree
