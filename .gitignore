@@ -1,8 +1,14 @@
-cache/
-lists/
-__pycache__/
+# Python desktop app
+python/cache/
+python/lists/
+python/__pycache__/
+python/**/__pycache__/
 *.pyc
-_test_write.xlsx
+python/_test_write.xlsx
 *.xlsx
-!master our program.xlsx
-config.json
+!python/master our program.xlsx
+python/config.json
+
+# Base44 companion at the repository root
+node_modules/
+dist/

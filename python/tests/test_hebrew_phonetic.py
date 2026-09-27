@@ -12,7 +12,7 @@ def test_known_titles() -> None:
     assert hebrew_phonetic("של") == "Shel"
     assert hebrew_phonetic("המדריך") == "Hamadrikh"
     assert hebrew_phonetic("אהבה") == "Ahava"
-    assert hebrew_phonetic("ישראל") == "Yisrael"
+    assert hebrew_phonetic("ישראל") == "Yisra'el"
     assert hebrew_phonetic("החיים") == "Hachayim"
     assert hebrew_phonetic("ספר") == "Sefer"
     assert hebrew_phonetic("1984") == ""

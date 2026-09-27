@@ -27,6 +27,7 @@ EXCEL_TARGETS: dict[str, str] = {
     "author_en": "Author (English)",
     "title_en": "Title in English",
     "title_he": "Title in Hebrew",
+    "title_he_nikud": "Title (Hebrew, menukad)",
     "author_he": "Author (Hebrew)",
     "category": "Category #1",
     "category2": "Category #2",

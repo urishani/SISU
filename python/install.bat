@@ -23,7 +23,7 @@ if not defined PY (
 )
 if not defined PY set "PY=python"
 
-echo Pulling the latest SISU files ...
+echo Pulling the latest repository files ...
 set "GIT_TERMINAL_PROMPT=0"
 git fetch --prune
 if errorlevel 1 (

@@ -2,7 +2,9 @@
 
 Windows desktop app that crawls Israeli bookstore and publisher sites, lists books, and writes selected titles into the orange columns of a catalog Excel file.
 
-Git and Python are already installed, and this SISU folder is already on the computer.
+This app lives in the `python` folder. The repository root is reserved for the Base44 companion app.
+
+Git and Python are already installed, and this folder is already on the computer.
 
 ## Run
 

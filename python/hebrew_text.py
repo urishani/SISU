@@ -78,6 +78,20 @@ def split_hebrew_latin(text: str | None) -> tuple[str, str]:
 
 def hebrew_phonetic(text: str | None) -> str:
     """Approximate Latin spelling of a Hebrew title. Not a translation."""
+    from hebrew_nikud import has_nikud, menukad_title, phonetic_from_nikud
     from hebrew_phonetic_model import phonetic_title
 
-    return phonetic_title(repair_text(text))
+    repaired = repair_text(text)
+    pointed = repaired if has_nikud(repaired) else menukad_title(repaired)
+    if pointed and has_nikud(pointed):
+        spelled = phonetic_from_nikud(pointed)
+        if spelled:
+            return spelled
+    return phonetic_title(repaired)
+
+
+def hebrew_menukad(text: str | None) -> str:
+    """Hebrew title with niqqud (menukad)."""
+    from hebrew_nikud import menukad_title
+
+    return menukad_title(repair_text(text))

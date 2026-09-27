@@ -752,6 +752,7 @@ class Book:
     title: str = ""
     title_en: str = ""
     title_phonetic: str = ""
+    title_he_nikud: str = ""
     author: str = ""
     publisher: str = ""
     year: str = ""
@@ -910,6 +911,7 @@ class Book:
         self.title = repair_text(self.title)
         self.title_en = repair_text(self.title_en)
         self.title_phonetic = repair_text(self.title_phonetic)
+        self.title_he_nikud = repair_text(self.title_he_nikud)
         self.author = repair_text(self.author)
         self.publisher = repair_text(self.publisher)
         self.description = repair_text(self.description)
@@ -935,7 +937,28 @@ class Book:
             if captured_ph and not has_hebrew(captured_ph):
                 phonetic = captured_ph
         self.title_phonetic = phonetic
-        return self.ensure_phonetic(allow_llm=allow_llm)
+        nikud_changed = self.ensure_nikud()
+        return self.ensure_phonetic(allow_llm=allow_llm) or nikud_changed
+
+    def ensure_nikud(self, *, replace: bool = False) -> bool:
+        """Fill a missing menukad Hebrew title. Does not change the updated date."""
+        from hebrew_nikud import has_nikud
+        from hebrew_text import hebrew_menukad, split_hebrew_latin
+
+        current = (self.title_he_nikud or "").strip()
+        hebrew, _latin = split_hebrew_latin(self.title)
+        source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
+        if not source:
+            return False
+        generated = hebrew_menukad(source)
+        if not generated:
+            return False
+        if current == generated and not replace:
+            return False
+        if current and has_nikud(current) and not replace:
+            return False
+        self.title_he_nikud = generated
+        return current != generated
 
     def ensure_phonetic(self, *, allow_llm: bool = False, replace: bool = False) -> bool:
         """Fill a missing phonetic title from Hebrew. Does not change the updated date.
@@ -955,6 +978,8 @@ class Book:
         source = hebrew if has_hebrew(hebrew) else (self.title if has_hebrew(self.title) else "")
         if not source:
             return False
+        self.ensure_nikud(replace=replace)
+        pointed = (self.title_he_nikud or "").strip() or source
         if allow_llm:
             import llm_client
 
@@ -965,9 +990,9 @@ class Book:
                     "llm" if llm_client.last_phonetic_report.succeeded else "model"
                 )
                 return True
-            generated = generated or hebrew_phonetic(source)
+            generated = generated or hebrew_phonetic(pointed)
         else:
-            generated = hebrew_phonetic(source)
+            generated = hebrew_phonetic(pointed)
         if not generated:
             return False
         if generated == current:
@@ -1157,6 +1182,10 @@ class Book:
         incoming_ph = str(other.title_phonetic or "").strip()
         if (not current_ph or has_hebrew(current_ph)) and incoming_ph and not has_hebrew(incoming_ph):
             self.title_phonetic = incoming_ph
+        current_nikud = str(self.title_he_nikud or "").strip()
+        incoming_nikud = str(other.title_he_nikud or "").strip()
+        if not current_nikud and incoming_nikud:
+            self.title_he_nikud = incoming_nikud
         if other.url:
             self.record_site_page(other.url)
         other_captured = other.captured_fields()
@@ -1234,6 +1263,8 @@ class Book:
             ).strip()
         if not str(self.description_en or "").strip():
             self.description_en = str(captured.get("description_en") or "").strip()
+        if not str(self.title_he_nikud or "").strip():
+            self.title_he_nikud = str(captured.get("title_he_nikud") or extra.get("title_he_nikud") or "").strip()
         for name in STORED_CATALOG_FIELDS:
             if name == "cat_number":
                 continue
@@ -1336,6 +1367,7 @@ class Book:
             "author_en": author_en,
             "title_en": title_en,
             "title_he": title_he,
+            "title_he_nikud": (self.title_he_nikud or "").strip(),
             "title_phonetic": phonetic,
             "author_he": author_he,
             "upc": clean(self.upc),
@@ -2016,7 +2048,20 @@ def reapply_model_phonetics(books: list[Book]) -> int:
     """Replace existing algorithm phonetics with the built-in model. Leaves LLM and manual spellings."""
     filled = 0
     for book in books:
-        if book.ensure_phonetic(replace=True):
+        nikud = book.ensure_nikud(replace=True)
+        phonetic = book.ensure_phonetic(replace=True)
+        if nikud or phonetic:
+            filled += 1
+    return filled
+
+
+def fill_nikud_and_phonetics(books: list[Book], *, replace: bool = False) -> int:
+    """Add menukad titles and refresh phonetics from them. Leaves LLM and manual spellings."""
+    filled = 0
+    for book in books:
+        nikud = book.ensure_nikud(replace=replace)
+        phonetic = book.ensure_phonetic(replace=replace)
+        if nikud or phonetic:
             filled += 1
     return filled
 

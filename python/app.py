@@ -34,9 +34,11 @@ from app_config import (
     build_settings_pack,
     enabled_search_urls,
     load_config,
+    mark_nikud_filled,
     mark_phonetic_model_prompted,
     merge_settings_pack,
     merged_publisher_rows,
+    nikud_fill_pending,
     normalize_site_url,
     parse_settings_pack,
     phonetic_model_prompt_pending,
@@ -122,6 +124,8 @@ WATCHED_FILES = (
     "nli_catalog.py",
     "hebrew_text.py",
     "hebrew_phonetic_model.py",
+    "hebrew_nikud.py",
+    "tts.py",
 )
 APP_NAME = "SISU Book Catalog Filler"
 
@@ -361,6 +365,7 @@ class BookCatalogApp(tk.Tk):
         self.after(900, self._watch_for_reload)
         self.after(UPDATE_CHECK_FIRST_MS, self._periodic_update_check)
         self.after(500, self._offer_phonetic_model_reapply)
+        self.after(700, self._fill_nikud_once)
 
     def _setup_style(self) -> None:
         style = ttk.Style(self)
@@ -2665,6 +2670,7 @@ class BookCatalogApp(tk.Tk):
                     "nli_api_key": nli_key.get().strip(),
                     "llm": current_llm,
                     "phonetic_model_prompted_id": current.get("phonetic_model_prompted_id") or 0,
+                    "nikud_fill_id": current.get("nikud_fill_id") or 0,
                 }
             )
             saved_sites = update_search_sites(sites)
@@ -6393,6 +6399,8 @@ class BookCatalogApp(tk.Tk):
         field_key: str = "",
         tone: str = "",
         rtl: bool = False,
+        speak: bool = False,
+        speak_hebrew: bool = False,
     ) -> None:
         del source
         row = self._detail_row
@@ -6460,39 +6468,62 @@ class BookCatalogApp(tk.Tk):
         if link and not empty:
             val.configure(cursor="hand2")
             val.bind("<Button-1>", lambda _e, target=link: self._open_in_browser(target))
-        if expandable:
-            full = str(value)
+        tools_needed = speak and not empty or expandable
+        if tools_needed:
+            tools = tk.Frame(self.detail_inner, bg=WHITE)
+            tools.grid(row=row, column=1, sticky="n", pady=4)
+            if speak and not empty:
+                speak_btn = tk.Button(
+                    tools,
+                    text="🔊",
+                    command=lambda spoken=str(value), hebrew=speak_hebrew: self._speak_text(spoken, hebrew=hebrew),
+                    bg=WHITE,
+                    fg="#1F3651",
+                    activebackground=WHITE,
+                    activeforeground="#1F3651",
+                    relief="flat",
+                    bd=0,
+                    highlightthickness=0,
+                    font=("Segoe UI", 11),
+                    cursor="hand2",
+                    padx=2,
+                    pady=0,
+                )
+                speak_btn.pack(side="top")
+                self._callout(speak_btn, "Read this title aloud.")
+            if expandable:
+                full = str(value)
 
-            def toggle(_key=key, _val=val, _full=full, _rtl=rtl) -> None:
-                from bidi_text import rtl_left_aligned
+                def toggle(_key=key, _val=val, _full=full, _rtl=rtl) -> None:
+                    from bidi_text import rtl_left_aligned
 
-                if _key in self._expanded_detail_keys:
-                    self._expanded_detail_keys.discard(_key)
-                    text = self._detail_preview(_full)
-                    _val.configure(text=rtl_left_aligned(text) if _rtl else text)
-                    more_btn.configure(text="More")
-                else:
-                    self._expanded_detail_keys.add(_key)
-                    _val.configure(text=rtl_left_aligned(_full) if _rtl else _full)
-                    more_btn.configure(text="Less")
+                    if _key in self._expanded_detail_keys:
+                        self._expanded_detail_keys.discard(_key)
+                        text = self._detail_preview(_full)
+                        _val.configure(text=rtl_left_aligned(text) if _rtl else text)
+                        more_btn.configure(text="More")
+                    else:
+                        self._expanded_detail_keys.add(_key)
+                        _val.configure(text=rtl_left_aligned(_full) if _rtl else _full)
+                        more_btn.configure(text="Less")
 
-            more_btn = tk.Button(
-                self.detail_inner,
-                text="Less" if expanded else "More",
-                command=toggle,
-                bg=WHITE,
-                fg="#0B57D0",
-                activebackground=WHITE,
-                activeforeground="#0B57D0",
-                relief="flat",
-                bd=0,
-                highlightthickness=0,
-                font=("Segoe UI", 8),
-                cursor="hand2",
-                padx=0,
-                pady=0,
-            )
-            more_btn.grid(row=row, column=1, sticky="n", pady=6)
+                more_btn = tk.Button(
+                    tools,
+                    text="Less" if expanded else "More",
+                    command=toggle,
+                    bg=WHITE,
+                    fg="#0B57D0",
+                    activebackground=WHITE,
+                    activeforeground="#0B57D0",
+                    relief="flat",
+                    bd=0,
+                    highlightthickness=0,
+                    font=("Segoe UI", 8),
+                    cursor="hand2",
+                    padx=0,
+                    pady=0,
+                )
+                more_btn.pack(side="top")
         self._detail_row += 1
 
     def _set_links(self, items: list[tuple[str, str]]) -> None:
@@ -6502,6 +6533,17 @@ class BookCatalogApp(tk.Tk):
             return
         for label, url in items:
             self._add_detail_row(label, url, link=url)
+
+    def _speak_text(self, text: str, *, hebrew: bool = False) -> None:
+        from tts import speak_text
+
+        spoken = str(text or "").strip()
+        if not spoken:
+            return
+        if speak_text(spoken, hebrew=hebrew):
+            self._set_status("Reading the title aloud.")
+        else:
+            messagebox.showinfo("Read aloud", "Windows speech could not start on this computer.")
 
     def _open_in_browser(self, url: str) -> None:
         if not url:
@@ -6565,26 +6607,29 @@ class BookCatalogApp(tk.Tk):
             )
         self._add_detail_section("Catalog fields")
 
-        def add_field(key: str, label: str, value: str) -> None:
+        def add_field(key: str, label: str, value: str, *, rtl: bool = False, speak: bool = False, speak_hebrew: bool = False) -> None:
             is_new = key in new_fields or book.is_external_source(_source_field_key(key))
             link = value if key in {"cover_image_url", "back_image_url"} and str(value or "").startswith("http") else ""
-            hebrew_title = key in {"title", "title_he"}
             self._add_detail_row(
                 label,
                 value,
                 is_new=is_new,
                 link=link,
                 field_key=key,
-                rtl=hebrew_title,
+                rtl=rtl,
+                speak=speak,
+                speak_hebrew=speak_hebrew,
             )
 
         title_he = fields.get("title_he") or book.title or ""
+        title_he_nikud = fields.get("title_he_nikud") or book.title_he_nikud or ""
         title_en = fields.get("title_en") or book.title_en or ""
         title_phonetic = fields.get("title_phonetic") or book.title_phonetic or ""
-        add_field("title", "Title (Hebrew)", title_he)
-        add_field("title_en", "Title in English", title_en)
-        add_field("title_phonetic", "Title (phonetics)", title_phonetic)
-        shown.update({"title", "title_he", "title_en", "title_phonetic"})
+        add_field("title", "Title (Hebrew)", title_he, rtl=True, speak=True, speak_hebrew=True)
+        add_field("title_he_nikud", "Title (Hebrew, menukad)", title_he_nikud, rtl=True, speak=True, speak_hebrew=True)
+        add_field("title_phonetic", "Title (phonetics)", title_phonetic, speak=True)
+        add_field("title_en", "Title in English", title_en, speak=True)
+        shown.update({"title", "title_he", "title_he_nikud", "title_en", "title_phonetic"})
 
         def field_value(key: str) -> str:
             value = fields.get(key, "") if key else ""
@@ -6628,7 +6673,7 @@ class BookCatalogApp(tk.Tk):
             for col in columns:
                 field = col.get("field") or ""
                 header = str(col.get("header") or "")
-                if field in shown or field in {"description_he", "scanner_id", "title", "title_he", "title_en", "title_phonetic"}:
+                if field in shown or field in {"description_he", "scanner_id", "title", "title_he", "title_he_nikud", "title_en", "title_phonetic"}:
                     if field:
                         shown.add(field)
                     continue
@@ -6898,6 +6943,27 @@ class BookCatalogApp(tk.Tk):
                 save_stash(stash)
                 updated += changed
         return updated
+
+    def _fill_nikud_once(self) -> None:
+        if not nikud_fill_pending():
+            return
+        if phonetic_model_prompt_pending():
+            self.after(400, self._fill_nikud_once)
+            return
+        if stored_book_count() <= 0:
+            mark_nikud_filled()
+            return
+        self._set_status("Adding Hebrew menukad titles and updating phonetic English…")
+        self.update_idletasks()
+        updated = self._reapply_phonetics_to_all_lists()
+        mark_nikud_filled()
+        self.table.set_books(self.books, keep_checks=True)
+        if self._selected_book:
+            self.show_book(self._selected_book)
+        if updated:
+            self._set_status(f"Added menukad Hebrew and updated phonetic titles for {updated:,} book(s).")
+        else:
+            self._set_status("Menukad Hebrew titles are ready for new books.")
 
     def _phonetic_fill_message(self, filled: int) -> str:
         import llm_client

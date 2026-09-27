@@ -22,6 +22,8 @@ PLACEHOLDER_URL_MARKERS = ("example.com", "example.org", "a.example")
 
 # Bump this if a later phonetic model should offer one more reapply of existing titles.
 PHONETIC_MODEL_PROMPT_ID = 1
+# Bump this to fill menukad titles and nikud-based phonetics once more on existing books.
+NIKUD_FILL_ID = 1
 
 BROWSERS: tuple[tuple[str, str], ...] = (
     ("chrome", "Google Chrome"),
@@ -95,6 +97,7 @@ def _defaults() -> dict:
         "nli_api_key": "",
         "llm": _llm_defaults(),
         "phonetic_model_prompted_id": 0,
+        "nikud_fill_id": 0,
     }
 
 
@@ -177,6 +180,14 @@ def _normalize(raw: dict) -> dict:
         data["phonetic_model_prompted_id"] = max(0, int(prompted_raw or 0))
     except (TypeError, ValueError):
         data["phonetic_model_prompted_id"] = 0
+    if "nikud_fill_id" in raw:
+        nikud_raw = raw.get("nikud_fill_id")
+    else:
+        nikud_raw = previous.get("nikud_fill_id")
+    try:
+        data["nikud_fill_id"] = max(0, int(nikud_raw or 0))
+    except (TypeError, ValueError):
+        data["nikud_fill_id"] = 0
     return data
 
 
@@ -277,6 +288,21 @@ def phonetic_model_prompt_pending() -> bool:
 def mark_phonetic_model_prompted() -> None:
     data = load_config()
     data["phonetic_model_prompted_id"] = PHONETIC_MODEL_PROMPT_ID
+    save_config(data)
+
+
+def nikud_fill_pending() -> bool:
+    data = load_config()
+    try:
+        filled = int(data.get("nikud_fill_id") or 0)
+    except (TypeError, ValueError):
+        filled = 0
+    return filled < NIKUD_FILL_ID
+
+
+def mark_nikud_filled() -> None:
+    data = load_config()
+    data["nikud_fill_id"] = NIKUD_FILL_ID
     save_config(data)
 
 

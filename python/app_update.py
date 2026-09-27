@@ -155,9 +155,32 @@ def _normalize_git_path(path: str) -> str:
     return path.replace("\\", "/").strip().lstrip("./")
 
 
+def _python_relative(path: str) -> str | None:
+    """Path inside python/, relative to that folder.
+
+    Git porcelain paths are from the repository root (`python/cache/...`).
+    Companion-app files at the root are outside this app and return None.
+    """
+    name = _normalize_git_path(path)
+    if not name or name.startswith(".."):
+        return None
+    if name.startswith("python/"):
+        return name[len("python/") :]
+    repo_root = APP_DIR.parent
+    under_app = APP_DIR / name
+    under_root = repo_root / name
+    if name.split("/", 1)[0] in {"cache", "lists"}:
+        return name
+    if under_app.exists() and not under_root.exists():
+        return name
+    if Path(name).name.lower() in _DATA_FILES and not under_root.exists():
+        return name
+    return None
+
+
 def is_data_json(path: str) -> bool:
     """Local scan cache / aliases JSON that should not block an update."""
-    name = _normalize_git_path(path)
+    name = _python_relative(path)
     if not name:
         return False
     if any(name == root.rstrip("/") or name.startswith(root) for root in _DATA_ROOTS):
@@ -190,6 +213,8 @@ def _classify_changes(paths: list[str] | None = None) -> tuple[list[str], list[s
     data: list[str] = []
     code: list[str] = []
     for path in paths if paths is not None else _changed_paths():
+        if _python_relative(path) is None:
+            continue
         if is_data_json(path):
             data.append(path)
         else:

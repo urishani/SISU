@@ -12,9 +12,12 @@ SISU stores a **phonetic English spelling**, not a translation. `של` is `Shel`
 
 The runtime model does **not** call an LLM:
 
-- `hebrew_phonetic_model.py` — lexicon lookup, Ha-/Be-/Le- prefixes, letter fallback
-- `hebrew_phonetic_lexicon.json` — catalog words learned from scan titles
-- Call `hebrew_phonetic(text)` from `hebrew_text`
+- `python/hebrew_nikud.py` — menukad (niqqud) titles, then English phonetics from those vowels
+- `python/hebrew_phonetic_model.py` — lexicon lookup, Ha-/Be-/Le- prefixes, letter fallback
+- `python/hebrew_phonetic_lexicon.json` — catalog words learned from scan titles
+- Call `hebrew_phonetic(text)` / `hebrew_menukad(text)` from `hebrew_text`
+
+Menukad is stored as `title_he_nikud`. Phonetics use apostrophes to split vowel hits (`Na'ar`, `Pa'am`, `Yisra'el`).
 
 ## Spelling conventions
 
@@ -27,8 +30,8 @@ The runtime model does **not** call an LLM:
 
 ## When a spelling is wrong
 
-1. Add the exact Hebrew token to `hebrew_phonetic_lexicon.json` under `words`
+1. Add the exact Hebrew token to `python/hebrew_phonetic_lexicon.json` under `words`
 2. Prefer a stem that prefixes can reuse (`מדריך` → `Madrikh` so `המדריך` becomes `Hamadrikh`)
-3. Run `python tests/test_hebrew_phonetic.py`
+3. From the `python` folder, run `python tests/test_hebrew_phonetic.py`
 
 Do not translate meaning. Do not replace a `phonetic_source` of `llm` or `manual`.
