@@ -92,6 +92,7 @@ def _defaults() -> dict:
         "browser": "chrome",
         "browser_path": "",
         "publishers": {},
+        "publisher_preferred": {},
         "search_sites": _default_search_sites(),
         "excel_dir": "",
         "nli_api_key": "",
@@ -166,6 +167,7 @@ def _normalize(raw: dict) -> dict:
                 continue
             publishers[label] = normalize_site_url(str(url or ""))
     data["publishers"] = publishers
+    data["publisher_preferred"] = _clean_publisher_preferred(raw.get("publisher_preferred"))
     if "search_sites" in raw:
         data["search_sites"] = _normalize_search_sites(raw.get("search_sites"), fallback=False)
     else:
@@ -348,6 +350,37 @@ def configured_publisher_site(
     return best_url
 
 
+def publisher_is_preferred(publisher: str, flags: dict | None = None) -> bool:
+    """Publishers are preferred unless a saved flag says otherwise.
+
+    The longest matching publisher name wins, so a specific row can differ
+    from a shorter name that also matches.
+    """
+    if flags is None:
+        raw = load_config().get("publisher_preferred") or {}
+        flags = raw if isinstance(raw, dict) else {}
+    if not flags:
+        return True
+    from publisher_sites import _haystack
+
+    hay = _haystack(publisher).strip()
+    best_len = -1
+    best: bool | None = None
+    for name, preferred in flags.items():
+        label = str(name or "").strip()
+        if not label:
+            continue
+        other = _haystack(label).strip()
+        if hay and other == hay:
+            return _pref_bool(preferred)
+        if hay and other and publishers_match(label, publisher) and len(other) > best_len:
+            best_len = len(other)
+            best = _pref_bool(preferred)
+    if best is not None:
+        return best
+    return True
+
+
 def merged_publisher_rows(extra_names: Iterable[str] | None = None) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
     seen: list[str] = []
@@ -455,6 +488,26 @@ def _clean_settings_sites(raw: object) -> list[dict]:
     return rows
 
 
+def _pref_bool(value: object, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _publisher_url_value(value: object) -> str:
+    if isinstance(value, dict):
+        return normalize_site_url(str(value.get("url") or ""))
+    return normalize_site_url(str(value or ""))
+
+
 def _clean_settings_publishers(raw: object) -> dict[str, str]:
     mapping: dict[str, str] = {}
     incoming = raw if isinstance(raw, dict) else {}
@@ -462,8 +515,25 @@ def _clean_settings_publishers(raw: object) -> dict[str, str]:
         label = str(name or "").strip()
         if not label:
             continue
-        mapping[label] = normalize_site_url(str(url or ""))
+        mapping[label] = _publisher_url_value(url)
     return mapping
+
+
+def _clean_publisher_preferred(raw: object, publishers: object = None) -> dict[str, bool]:
+    flags: dict[str, bool] = {}
+    incoming = raw if isinstance(raw, dict) else {}
+    for name, value in incoming.items():
+        label = str(name or "").strip()
+        if not label:
+            continue
+        flags[label] = _pref_bool(value)
+    nested = publishers if isinstance(publishers, dict) else {}
+    for name, value in nested.items():
+        label = str(name or "").strip()
+        if not label or not isinstance(value, dict) or "preferred" not in value:
+            continue
+        flags[label] = _pref_bool(value.get("preferred"))
+    return flags
 
 
 def build_settings_pack() -> dict:
@@ -476,6 +546,7 @@ def build_settings_pack() -> dict:
         "version": SETTINGS_PACK_VERSION,
         "search_sites": _clean_settings_sites(data.get("search_sites")),
         "publishers": _clean_settings_publishers(data.get("publishers")),
+        "publisher_preferred": _clean_publisher_preferred(data.get("publisher_preferred")),
         "aliases": dict(aliases.get("aliases") or {}),
         "cover_values": dict(aliases.get("cover_values") or {}),
     }
@@ -535,6 +606,10 @@ def parse_settings_pack(source: str | dict | None) -> dict | None:
         "version": SETTINGS_PACK_VERSION,
         "search_sites": _clean_settings_sites(data.get("search_sites")),
         "publishers": _clean_settings_publishers(data.get("publishers")),
+        "publisher_preferred": _clean_publisher_preferred(
+            data.get("publisher_preferred"),
+            data.get("publishers"),
+        ),
         "aliases": {
             str(label).strip(): str(field).strip()
             for label, field in aliases.items()
@@ -580,6 +655,8 @@ def merge_settings_pack(pack: dict | None) -> dict[str, int]:
         sites.append({"url": url, "enabled": bool(item.get("enabled", True))})
         sites_added += 1
     publishers = _clean_settings_publishers(current.get("publishers"))
+    preferred = _clean_publisher_preferred(current.get("publisher_preferred"))
+    incoming_preferred = _clean_publisher_preferred(parsed.get("publisher_preferred"))
     pub_added = pub_updated = 0
     for name, url in (parsed.get("publishers") or {}).items():
         label = str(name or "").strip()
@@ -587,14 +664,24 @@ def merge_settings_pack(pack: dict | None) -> dict[str, int]:
         if not label:
             continue
         matched = next((existing for existing in publishers if publishers_match(existing, label) or existing == label), None)
+        flag_key = label if label in incoming_preferred else matched
+        changed_pref = False
+        if flag_key and flag_key in incoming_preferred:
+            target = matched or label
+            flag = incoming_preferred[flag_key]
+            if preferred.get(target, True) != flag:
+                preferred[target] = flag
+                changed_pref = True
         if matched is None:
             publishers[label] = site
             pub_added += 1
-        elif site and publishers.get(matched) != site:
-            publishers[matched] = site
+        elif (site and publishers.get(matched) != site) or changed_pref:
+            if site and publishers.get(matched) != site:
+                publishers[matched] = site
             pub_updated += 1
     current["search_sites"] = sites
     current["publishers"] = publishers
+    current["publisher_preferred"] = preferred
     save_config(current)
     from field_map import merge_alias_payload
 

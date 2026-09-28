@@ -38,6 +38,7 @@ from app_config import (
     mark_phonetic_model_prompted,
     merge_settings_pack,
     merged_publisher_rows,
+    publisher_is_preferred,
     nikud_fill_pending,
     normalize_site_url,
     parse_settings_pack,
@@ -81,7 +82,12 @@ from field_map import (
     write_field_report,
 )
 from hebrew_view import HebrewDescription
-from publisher_sites import publishers_match, resolve_publisher_site
+from publisher_sites import (
+    publisher_name_matches_filter,
+    publishers_match,
+    resolve_publisher_site,
+    sort_publisher_rows,
+)
 from scanner_registry import attach_book, attach_books, persist_book_state
 from app_update import read_app_version
 from scan_lists import (
@@ -678,7 +684,7 @@ class BookCatalogApp(tk.Tk):
         self.deep_btn.pack(side="left", padx=(0, 4))
         self._callout(
             self.deep_btn,
-            "Group this list by publisher, then crawl each publisher website that has a URL to fill missing book fields.",
+            "Group this list by publisher, then crawl each publisher website that has a URL, including sites that are not marked Preferred.",
         )
         self.log_btn = ttk.Button(buttons, text="Show log", command=self.show_activity_log)
         self.log_btn.pack(side="left", padx=(0, 4))
@@ -1822,17 +1828,28 @@ class BookCatalogApp(tk.Tk):
 
         ttk.Label(
             publisher_tab,
-            text="Known publisher websites are filled in. Empty rows are publishers from the current list — add their site and Save. Open opens the site in your browser.",
+            text="Known publisher websites are filled in. Empty rows are publishers from the current list — add their site and Save. Checked Preferred publishers are searched from a book or More. Unchecked ones are skipped unless you run Deep search. Open opens the site in your browser.",
             wraplength=740,
         ).pack(anchor="w")
+        publisher_count = tk.StringVar(value="")
+        ttk.Label(publisher_tab, textvariable=publisher_count).pack(anchor="w", pady=(4, 0))
         table_wrap = tk.Frame(publisher_tab, bg=BG)
         table_wrap.pack(fill="both", expand=True, pady=(8, 6))
+        head_row = ttk.Frame(table_wrap)
+        head_row.pack(fill="x")
+        header = ttk.Frame(head_row)
+        header.pack(side="left", fill="x", expand=True)
+        ttk.Frame(head_row, width=18).pack(side="right", fill="y")
+        for column, minsize, weight in ((0, 92, 0), (1, 180, 1), (2, 180, 1), (3, 56, 0), (4, 72, 0)):
+            header.columnconfigure(column, minsize=minsize, weight=weight)
         table_holder = ttk.Frame(table_wrap)
         table_holder.pack(fill="both", expand=True)
-        inner = _settings_scroll_table(table_holder, columns=(1,))
+        inner = _settings_scroll_table(table_holder, columns=(1, 2))
+        for column, minsize, weight in ((0, 92, 0), (1, 180, 1), (2, 180, 1), (3, 56, 0), (4, 72, 0)):
+            inner.columnconfigure(column, minsize=minsize, weight=weight)
         publisher_overlay = _settings_busy_overlay(table_wrap)
 
-        rows: list[tuple[tk.StringVar, tk.StringVar]] = []
+        rows: list[tuple[tk.StringVar, tk.StringVar, tk.BooleanVar, tk.Entry]] = []
 
         def _paint_url(shell: tk.Frame, var: tk.StringVar) -> None:
             empty = not var.get().strip()
@@ -1841,16 +1858,62 @@ class BookCatalogApp(tk.Tk):
                 highlightthickness=2 if empty else 1,
             )
 
-        def _append_data_row(name: str = "", url: str = "", highlight: bool = False) -> None:
+        publisher_filter = tk.StringVar()
+        pub_sort_text = tk.StringVar(value="Publisher")
+        web_sort_text = tk.StringVar(value="Website")
+        pref_header = ttk.Label(header, text="Preferred", font=("Segoe UI", 9, "bold"))
+        pref_header.grid(row=0, column=0, sticky="w", padx=(0, 6), pady=(0, 4))
+        self._callout(
+            pref_header,
+            "Checked publishers with a website are searched from a book or More. Unchecked ones are skipped unless you run Deep search.",
+        )
+        pub_head = ttk.Frame(header)
+        pub_head.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=(0, 4))
+        pub_sort_btn = ttk.Button(pub_head, textvariable=pub_sort_text, command=lambda: _sort_publishers("name"))
+        pub_sort_btn.pack(side="left")
+        self._callout(pub_sort_btn, "Sort publisher names A to Z, then Z to A. Blank names stay at the bottom.")
+        publisher_filter_entry = ttk.Entry(pub_head, textvariable=publisher_filter)
+        publisher_filter_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self._callout(
+            publisher_filter_entry,
+            "Type to show only publishers whose name contains this text, anywhere in the name.",
+        )
+        web_sort_btn = ttk.Button(header, textvariable=web_sort_text, command=lambda: _sort_publishers("url"))
+        web_sort_btn.grid(row=0, column=2, sticky="w", padx=(0, 6), pady=(0, 4))
+        self._callout(web_sort_btn, "Sort websites A to Z, then Z to A. Blank websites stay at the bottom.")
+        _bind_entry_clipboard(publisher_filter_entry)
+        publisher_filter_entry.bind("<KeyRelease>", lambda _event: _on_publisher_filter())
+
+        publisher_store: list[list] = []
+        publisher_view_map: list[int] = []
+        publishers_state: dict[str, object] = {
+            "started": False,
+            "ready": False,
+            "job": None,
+            "filter_job": None,
+            "highlight": "",
+            "generation": 0,
+            "focus_new": False,
+            "sort_key": "",
+            "sort_desc": False,
+            "loaded": False,
+        }
+        add_pub_btn = ttk.Button(publisher_tab, text="Add publisher")
+        add_pub_btn.pack(anchor="w")
+        add_pub_btn.configure(state="disabled")
+
+        def _append_data_row(name: str = "", url: str = "", preferred: bool = True, highlight: bool = False) -> None:
             name_var = tk.StringVar(value=name)
             url_var = tk.StringVar(value=url)
-            grid_row = len(rows) + 1
-            name_entry = tk.Entry(inner, textvariable=name_var, font=("Segoe UI", 10), relief="solid", bd=1, width=28)
+            pref_var = tk.BooleanVar(value=bool(preferred))
+            grid_row = len(rows)
+            ttk.Checkbutton(inner, variable=pref_var).grid(row=grid_row, column=0, padx=(0, 6), pady=3)
+            name_entry = tk.Entry(inner, textvariable=name_var, font=("Segoe UI", 10), relief="solid", bd=1)
             url_shell = tk.Frame(inner, bg=WHITE, highlightbackground="#C9BBA8", highlightthickness=1)
             url_entry = tk.Entry(url_shell, textvariable=url_var, font=("Segoe UI", 10), relief="flat", bd=0, bg=WHITE)
             url_entry.pack(fill="x", ipady=4, padx=2, pady=1)
-            name_entry.grid(row=grid_row, column=0, sticky="ew", padx=(0, 6), pady=3, ipady=3)
-            url_shell.grid(row=grid_row, column=1, sticky="ew", padx=(0, 6), pady=3)
+            name_entry.grid(row=grid_row, column=1, sticky="ew", padx=(0, 6), pady=3, ipady=3)
+            url_shell.grid(row=grid_row, column=2, sticky="ew", padx=(0, 6), pady=3)
             _bind_entry_clipboard(name_entry)
             _bind_entry_clipboard(url_entry, as_url=True)
             _paint_url(url_shell, url_var)
@@ -1867,7 +1930,7 @@ class BookCatalogApp(tk.Tk):
                 cursor="hand2",
                 command=lambda item=url_var: self._open_publisher_site(item.get()),
             )
-            open_btn.grid(row=grid_row, column=2, padx=(0, 4), pady=3)
+            open_btn.grid(row=grid_row, column=3, padx=(0, 4), pady=3)
 
             def _sync_open(*_args: object, button=open_btn, var=url_var) -> None:
                 has_url = bool(var.get().strip())
@@ -1879,101 +1942,164 @@ class BookCatalogApp(tk.Tk):
 
             url_var.trace_add("write", _sync_open)
             _sync_open()
-            pair = (name_var, url_var)
-            ttk.Button(inner, text="Remove", command=lambda item=pair: _remove_and_rebuild(item)).grid(
-                row=grid_row, column=3, pady=3
+            pair = (name_var, url_var, pref_var, name_entry)
+            ttk.Button(inner, text="Remove", command=lambda item=pair: _remove_publisher_row(item)).grid(
+                row=grid_row, column=4, pady=3
             )
             rows.append(pair)
 
-        def _remove_and_rebuild(pair: tuple[tk.StringVar, tk.StringVar]) -> None:
-            _harvest_publishers()
-            try:
-                index = rows.index(pair)
-            except ValueError:
-                return
-            if 0 <= index < len(publisher_store):
-                del publisher_store[index]
-            snapshot = [(name, url) for name, url in publisher_store]
-            _fill_rows(snapshot, str(publishers_state.get("highlight") or ""))
-
-        publisher_store: list[list[str]] = []
-        publishers_state: dict[str, object] = {
-            "started": False,
-            "ready": False,
-            "job": None,
-            "highlight": "",
-        }
-        add_pub_btn = ttk.Button(publisher_tab, text="Add publisher")
-        add_pub_btn.pack(anchor="w")
-        add_pub_btn.configure(state="disabled")
-
         def _harvest_publishers() -> None:
-            for index, (name_var, url_var) in enumerate(rows):
-                if index < len(publisher_store):
-                    publisher_store[index][0] = name_var.get()
-                    publisher_store[index][1] = url_var.get()
-                else:
-                    publisher_store.append([name_var.get(), url_var.get()])
+            for widget_i, store_i in enumerate(publisher_view_map):
+                if widget_i < len(rows) and store_i < len(publisher_store):
+                    publisher_store[store_i][0] = rows[widget_i][0].get()
+                    publisher_store[store_i][1] = rows[widget_i][1].get()
+                    publisher_store[store_i][2] = bool(rows[widget_i][2].get())
+
+        def _visible_publisher_indices() -> list[int]:
+            needle = publisher_filter.get()
+            return [
+                index
+                for index, row in enumerate(publisher_store)
+                if publisher_name_matches_filter(str(row[0] if row else ""), needle)
+            ]
+
+        def _refresh_publisher_count(shown: int | None = None) -> None:
+            total = len(publisher_store)
+            visible = shown if shown is not None else len(publisher_view_map)
+            if publisher_filter.get().strip():
+                publisher_count.set(f"Showing {visible} of {total}")
+            else:
+                publisher_count.set(f"{total} publishers")
+
+        def _refresh_sort_labels() -> None:
+            key = str(publishers_state.get("sort_key") or "")
+            desc = bool(publishers_state.get("sort_desc"))
+            if key == "name":
+                pub_sort_text.set("Publisher Z–A" if desc else "Publisher A–Z")
+            else:
+                pub_sort_text.set("Publisher")
+            if key == "url":
+                web_sort_text.set("Website Z–A" if desc else "Website A–Z")
+            else:
+                web_sort_text.set("Website")
 
         def _cancel_publisher_job() -> None:
-            job = publishers_state.get("job")
-            if job is not None:
-                try:
-                    win.after_cancel(job)
-                except tk.TclError:
-                    pass
-                publishers_state["job"] = None
+            for key in ("job", "filter_job"):
+                job = publishers_state.get(key)
+                if job is not None:
+                    try:
+                        win.after_cancel(job)
+                    except tk.TclError:
+                        pass
+                    publishers_state[key] = None
 
-        def _publisher_headers() -> None:
-            ttk.Label(inner, text="Publisher", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
-            ttk.Label(inner, text="Website", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
-            ttk.Label(inner, text="").grid(row=0, column=2)
-
-        def _chunk_fill_publishers() -> None:
-            if not win.winfo_exists():
-                return
-            start = len(rows)
-            remaining = publisher_store[start:]
-            if not remaining:
-                publishers_state["ready"] = True
-                add_pub_btn.configure(state="normal")
-                publisher_overlay["hide"]()
-                publishers_state["job"] = None
-                return
-            publisher_overlay["show"]()
-            batch = remaining[:SETTINGS_FILL_BATCH]
-            highlight = str(publishers_state.get("highlight") or "")
-            _suspend_settings_table(inner, True)
-            for name, url in batch:
-                _append_data_row(
-                    name,
-                    url,
-                    highlight=bool(highlight) and publishers_match(name, highlight),
-                )
-            _suspend_settings_table(inner, False)
-            publishers_state["job"] = win.after(1, _chunk_fill_publishers)
-
-        def _fill_rows(items: list[tuple[str, str]], highlight_name: str = "") -> None:
-            _cancel_publisher_job()
-            publishers_state["highlight"] = highlight_name
-            publisher_store[:] = [[name, url] for name, url in items]
-            publishers_state["ready"] = False
-            add_pub_btn.configure(state="disabled")
-            publisher_overlay["show"]()
+        def _reset_publisher_table() -> None:
             _suspend_settings_table(inner, True)
             for child in inner.winfo_children():
                 child.destroy()
             rows.clear()
-            _publisher_headers()
+            publisher_view_map.clear()
             _suspend_settings_table(inner, False)
-            _chunk_fill_publishers()
+
+        def _chunk_fill_publishers(pending: list[int], pos: int, generation: int) -> None:
+            if not win.winfo_exists() or generation != publishers_state["generation"]:
+                return
+            if pos >= len(pending):
+                publishers_state["ready"] = True
+                publishers_state["job"] = None
+                add_pub_btn.configure(state="normal")
+                publisher_overlay["hide"]()
+                _refresh_publisher_count(len(pending))
+                if publishers_state.get("focus_new"):
+                    publishers_state["focus_new"] = False
+                    for name_var, _url_var, _pref_var, name_entry in reversed(rows):
+                        if not name_var.get().strip():
+                            name_entry.focus_set()
+                            break
+                return
+            publisher_overlay["show"]()
+            batch = pending[pos : pos + SETTINGS_FILL_BATCH]
+            highlight = str(publishers_state.get("highlight") or "")
+            _suspend_settings_table(inner, True)
+            for store_i in batch:
+                name, url, preferred = publisher_store[store_i]
+                _append_data_row(
+                    str(name),
+                    str(url),
+                    bool(preferred),
+                    highlight=bool(highlight) and publishers_match(str(name), highlight),
+                )
+                publisher_view_map.append(store_i)
+            _suspend_settings_table(inner, False)
+            publishers_state["job"] = win.after(
+                1, lambda: _chunk_fill_publishers(pending, pos + len(batch), generation)
+            )
+
+        def _fill_publisher_view(*, harvest: bool = True) -> None:
+            if harvest:
+                _harvest_publishers()
+            _cancel_publisher_job()
+            publishers_state["ready"] = False
+            publishers_state["generation"] = int(publishers_state["generation"] or 0) + 1
+            add_pub_btn.configure(state="disabled")
+            publisher_overlay["show"]()
+            _reset_publisher_table()
+            pending = _visible_publisher_indices()
+            _refresh_publisher_count(len(pending))
+            _chunk_fill_publishers(pending, 0, int(publishers_state["generation"]))
+
+        def _fill_rows(items: list[tuple], highlight_name: str = "") -> None:
+            _cancel_publisher_job()
+            publishers_state["highlight"] = highlight_name
+            publishers_state["loaded"] = True
+            publisher_store[:] = [
+                [name, url, bool(preferred)]
+                for name, url, *rest in items
+                for preferred in [rest[0] if rest else True]
+            ]
+            _fill_publisher_view(harvest=False)
+
+        def _remove_publisher_row(pair: tuple) -> None:
+            _harvest_publishers()
+            try:
+                widget_i = rows.index(pair)
+            except ValueError:
+                return
+            store_i = publisher_view_map[widget_i]
+            del publisher_store[store_i]
+            _fill_publisher_view(harvest=False)
 
         def _add_publisher() -> None:
             if not publishers_state["ready"]:
                 return
             _harvest_publishers()
-            publisher_store.append(["", ""])
-            _append_data_row("", "", highlight=True)
+            publisher_store.append(["", "", True])
+            publishers_state["focus_new"] = True
+            _fill_publisher_view(harvest=False)
+
+        def _sort_publishers(key: str) -> None:
+            if not publishers_state["ready"]:
+                return
+            if publishers_state.get("sort_key") == key:
+                publishers_state["sort_desc"] = not bool(publishers_state.get("sort_desc"))
+            else:
+                publishers_state["sort_key"] = key
+                publishers_state["sort_desc"] = False
+            _harvest_publishers()
+            sort_publisher_rows(publisher_store, key, bool(publishers_state.get("sort_desc")))
+            _refresh_sort_labels()
+            _fill_publisher_view(harvest=False)
+
+        def _on_publisher_filter() -> None:
+            if not publishers_state["started"]:
+                return
+            job = publishers_state.get("filter_job")
+            if job is not None:
+                try:
+                    win.after_cancel(job)
+                except tk.TclError:
+                    pass
+            publishers_state["filter_job"] = win.after(120, lambda: _fill_publisher_view(harvest=True))
 
         def _ensure_publishers() -> None:
             if publishers_state["ready"]:
@@ -1987,9 +2113,13 @@ class BookCatalogApp(tk.Tk):
             wanted = focus_publisher.strip()
 
             def work() -> None:
-                seed = merged_publisher_rows(extra)
-                if wanted and not any(publishers_match(wanted, name) for name, _url in seed):
-                    seed.insert(0, (wanted, ""))
+                flags = load_config().get("publisher_preferred") or {}
+                seed = [
+                    (name, url, publisher_is_preferred(name, flags))
+                    for name, url in merged_publisher_rows(extra)
+                ]
+                if wanted and not any(publishers_match(wanted, name) for name, _url, _pref in seed):
+                    seed.insert(0, (wanted, "", True))
 
                 def apply() -> None:
                     if not win.winfo_exists():
@@ -2538,15 +2668,18 @@ class BookCatalogApp(tk.Tk):
 
         def _live_settings_pack() -> dict:
             pack = build_settings_pack()
-            if publishers_state["started"] and publisher_store:
+            if publishers_state.get("loaded"):
                 _harvest_publishers()
                 publishers = {}
-                for name, url in publisher_store:
+                preferred_flags: dict[str, bool] = {}
+                for name, url, preferred in publisher_store:
                     name = str(name or "").strip()
                     if not name:
                         continue
                     publishers[name] = normalize_site_url(str(url or ""))
+                    preferred_flags[name] = bool(preferred)
                 pack["publishers"] = publishers
+                pack["publisher_preferred"] = preferred_flags
             if sites_state["loaded"]:
                 sites: list[dict] = []
                 seen: set[str] = set()
@@ -2609,18 +2742,25 @@ class BookCatalogApp(tk.Tk):
 
         def save() -> None:
             current = load_config()
-            if publishers_state["started"] and publisher_store:
+            if publishers_state.get("loaded"):
                 _harvest_publishers()
                 publishers = {}
-                for name, url in publisher_store:
+                preferred_flags = {}
+                for name, url, preferred in publisher_store:
                     name = str(name or "").strip()
                     if not name:
                         continue
                     publishers[name] = normalize_site_url(str(url or ""))
+                    preferred_flags[name] = bool(preferred)
             else:
                 publishers = {
                     str(name): str(url or "")
                     for name, url in (current.get("publishers") or {}).items()
+                    if str(name).strip()
+                }
+                preferred_flags = {
+                    str(name): bool(flag)
+                    for name, flag in (current.get("publisher_preferred") or {}).items()
                     if str(name).strip()
                 }
             previous_enabled = {
@@ -2665,6 +2805,7 @@ class BookCatalogApp(tk.Tk):
                     "browser": browser_var.get().strip() or "chrome",
                     "browser_path": custom_path.get().strip(),
                     "publishers": publishers,
+                    "publisher_preferred": preferred_flags,
                     "search_sites": sites,
                     "excel_dir": current.get("excel_dir") or "",
                     "nli_api_key": nli_key.get().strip(),
@@ -5023,6 +5164,9 @@ class BookCatalogApp(tk.Tk):
             messagebox.showinfo("Publisher", "This book has no publisher, so More cannot open a publisher site.")
             return
         site = resolve_publisher_site(book.publisher)
+        if not site and resolve_publisher_site(book.publisher, include_unpreferred=True):
+            messagebox.showinfo("Publisher", _unpreferred_publisher_message(book.publisher))
+            return
         if not site:
             if messagebox.askyesno(
                 "Publisher site missing",
@@ -5045,6 +5189,9 @@ class BookCatalogApp(tk.Tk):
         peers = [item for item in self.books if publishers_match(item.publisher, name)]
         needing = [item for item in peers if item.missing_fields()]
         site = resolve_publisher_site(name)
+        if not site and resolve_publisher_site(name, include_unpreferred=True):
+            messagebox.showinfo("Publisher", _unpreferred_publisher_message(name))
+            return
         if not needing:
             messagebox.showinfo(
                 "Publisher",
@@ -5390,7 +5537,7 @@ class BookCatalogApp(tk.Tk):
         order: list[str] = []
         for book in self.books:
             name = (book.publisher or "").strip()
-            url = resolve_publisher_site(name) if name else ""
+            url = resolve_publisher_site(name, include_unpreferred=True) if name else ""
             alias_key = _haystack(name).strip() if name else "__none__"
             if url:
                 key = "url:" + listing_url_key(url)
@@ -5461,7 +5608,7 @@ class BookCatalogApp(tk.Tk):
         body.rowconfigure(3, weight=1)
         ttk.Label(
             body,
-            text="Books on this list, grouped by publisher website. Catalog names that share a URL are one row (Name…). Hover or click a collection to see the names as they appear in the catalogs. Start crawls each website once. Skip leaves the current site and continues with the next. Stop cancels the crawl. Closing this window does not stop a run that is already going.",
+            text="Books on this list, grouped by publisher website. Catalog names that share a URL are one row (Name…). Hover or click a collection to see the names as they appear in the catalogs. Start crawls each website once, including publishers that are not marked Preferred. Skip leaves the current site and continues with the next. Stop cancels the crawl. Closing this window does not stop a run that is already going.",
             wraplength=940,
         ).grid(row=0, column=0, sticky="ew")
         ttk.Label(body, textvariable=self._deep_status, wraplength=940).grid(
@@ -8217,6 +8364,14 @@ def _field_source_label(book: Book, key: str) -> str:
     return book.source_display(_source_field_key(key))
 
 
+def _unpreferred_publisher_message(name: str) -> str:
+    return (
+        f"{name} is not marked Preferred.\n\n"
+        "Unchecked publisher sites are not searched. "
+        "Run Deep search to look them up."
+    )
+
+
 def _book_link_items(book: Book) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -8228,7 +8383,12 @@ def _book_link_items(book: Book) -> list[tuple[str, str]]:
         seen.add(value)
         items.append((label, value))
 
-    add("Publisher site", book.extra.get("publisher_site") or resolve_publisher_site(book.publisher) or "")
+    add(
+        "Publisher site",
+        book.extra.get("publisher_site")
+        or resolve_publisher_site(book.publisher, include_unpreferred=True)
+        or "",
+    )
     add("Publisher book page", book.extra.get("publisher_page") or "")
     if book.url:
         add(f"{site_display_name(book.url)} book page", book.url)

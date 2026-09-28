@@ -5332,12 +5332,15 @@ class BookCrawler:
         total = len(titled)
         groups: dict[str, dict[str, Any]] = {}
         order: list[str] = []
-        no_site: list[Book] = []
+        no_site: list[tuple[Book, str]] = []
         forced = (site_url or "").strip()
         for book in titled:
             publisher_url = forced or resolve_publisher_site(book.publisher) or ""
+            hidden = ""
+            if not publisher_url and not forced and (book.publisher or "").strip():
+                hidden = resolve_publisher_site(book.publisher, include_unpreferred=True) or ""
             if not publisher_url:
-                no_site.append(book)
+                no_site.append((book, hidden))
                 continue
             key = listing_url_key(publisher_url)
             row = groups.get(key)
@@ -5347,12 +5350,16 @@ class BookCrawler:
                 order.append(key)
             row["books"].append(book)
         try:
-            for book in no_site:
-                note = (
-                    f"No publisher website is known for {book.publisher}."
-                    if book.publisher
-                    else "This book has no publisher, so there is no publisher site to search."
-                )
+            for book, hidden in no_site:
+                if hidden:
+                    note = (
+                        f"{book.publisher} is not marked Preferred. "
+                        "Use Deep search to look it up."
+                    )
+                elif book.publisher:
+                    note = f"No publisher website is known for {book.publisher}."
+                else:
+                    note = "This book has no publisher, so there is no publisher site to search."
                 self.progress(note)
                 book.mark_publisher_lookup("", note=note)
                 book.refresh_scan_status()

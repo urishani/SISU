@@ -82,13 +82,53 @@ def resolve_builtin_publisher_site(publisher: str) -> str | None:
     return best_url
 
 
-def resolve_publisher_site(publisher: str) -> str | None:
+def publisher_name_matches_filter(name: str, needle: str) -> bool:
+    """True when the publisher row should stay visible.
+
+    Blank names stay visible so a new row is not hidden. Any other name stays
+    when the needle occurs anywhere in it, not only at the start.
+    """
+    text = (needle or "").strip().casefold()
+    if not text:
+        return True
+    label = (name or "").strip()
+    if not label:
+        return True
+    return text in label.casefold()
+
+
+def sort_publisher_rows(rows: list, key: str, descending: bool) -> None:
+    """Sort publisher rows by name or website. Blank values stay last."""
+
+    def value(item: object) -> tuple:
+        record = item if isinstance(item, (list, tuple)) else ("", "")
+        name = str(record[0] or "").strip().casefold()
+        url = str(record[1] or "").strip().casefold() if len(record) > 1 else ""
+        if key == "url":
+            primary, secondary, blank = url, name, not url
+        else:
+            primary, secondary, blank = name, url, not name
+        if descending:
+            return (blank, tuple(-ord(ch) for ch in primary), secondary)
+        return (blank, primary, secondary)
+
+    rows.sort(key=value)
+
+
+def resolve_publisher_site(publisher: str, *, include_unpreferred: bool = False) -> str | None:
     try:
-        from app_config import configured_publisher_site
+        from app_config import configured_publisher_site, publisher_is_preferred
 
         configured = configured_publisher_site(publisher)
         if configured:
-            return configured
+            url = configured
+        else:
+            url = resolve_builtin_publisher_site(publisher)
+        if not url:
+            return None
+        if include_unpreferred or publisher_is_preferred(publisher):
+            return url
+        return None
     except Exception:
         pass
     return resolve_builtin_publisher_site(publisher)
