@@ -54,6 +54,7 @@ from book_crawler import (
     BookCrawler,
     CrawlCancelled,
     CrawlReport,
+    DedupeReport,
     books_match,
     catalog_listing_url,
     dedupe_book_list,
@@ -230,7 +231,8 @@ ERROR_BG = "#FDECEC"
 FINAL_FG = "#0B57D0"
 FINAL_BG = "#E8F0FE"
 ICON_HEADER_BG = "#EDE6DA"
-ICON_HEADER_CANVAS = 33
+ICON_HEADER_CANVAS = 26
+ICON_HEADER_EDIT_FONT = 17
 ICON_OPEN = "\uE72D"
 ICON_OPEN_FALLBACK = "↗"
 ICON_EDIT = "\uE70F"
@@ -336,6 +338,10 @@ class BookCatalogApp(tk.Tk):
         self._log_live_popup: tk.Toplevel | None = None
         self._log_list: tk.Listbox | None = None
         self._log_view: tk.Text | None = None
+        self._log_rendered = ""
+        self._log_scroll_job: str | None = None
+        self._log_scroll_pending = None
+        self._log_scroll_suppress = 0
         self._log_live_summary: tk.StringVar | None = None
         self._log_live_detail: tk.StringVar | None = None
         self._log_live_summary_label: tk.Label | None = None
@@ -584,8 +590,7 @@ class BookCatalogApp(tk.Tk):
         self.site_bulk_btn.pack(side="right", padx=(0, 6), pady=2)
         self.site_edit_btn = self._site_header_icon(
             site_header,
-            glyph=ICON_EDIT,
-            fallback=ICON_EDIT_FALLBACK,
+            kind="edit",
             command=lambda: self.open_settings(focus_tab="sites"),
             tip="Add, remove, or reorder catalog sites in Settings.",
         )
@@ -936,6 +941,25 @@ class BookCatalogApp(tk.Tk):
         families = {name.casefold() for name in tkfont.families(self)}
         return any(name.casefold() in families for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"))
 
+    def _paint_edit_pencil(self, canvas: tk.Canvas, *, color: str, bg: str) -> None:
+        canvas.delete("all")
+        try:
+            width = max(int(canvas.cget("width") or 0), 22)
+            height = max(int(canvas.cget("height") or 0), 22)
+        except (tk.TclError, TypeError, ValueError):
+            width, height = ICON_HEADER_CANVAS, ICON_HEADER_CANVAS
+        family, _size = self._site_icon_font()
+        glyph = ICON_EDIT if self._icon_font_available() else ICON_EDIT_FALLBACK
+        canvas.create_rectangle(0, 0, width, height, fill=bg, outline=bg)
+        canvas.create_text(
+            width / 2,
+            height / 2,
+            text=glyph,
+            fill=color,
+            font=(family, ICON_HEADER_EDIT_FONT),
+            anchor="center",
+        )
+
     def _paint_share_nodes(self, canvas: tk.Canvas, *, color: str, bg: str) -> None:
         canvas.delete("all")
         try:
@@ -1030,6 +1054,7 @@ class BookCatalogApp(tk.Tk):
             command()
 
         painters = {
+            "edit": self._paint_edit_pencil,
             "share_nodes": self._paint_share_nodes,
             "import_sites": self._paint_import_sites,
         }
@@ -3950,7 +3975,7 @@ class BookCatalogApp(tk.Tk):
         self._excel_dir = Path(excel_dir) if excel_dir else self._default_excel_dir()
         self._bind_list_excel_path(rename_existing=False)
         self.books = books_from_payload(data)
-        cleanup = dedupe_book_list(self.books)
+        cleanup = self._dedupe_books_with_feedback(self.books)
         phonetic_filled = self._prepare_books(self.books)
         self.table.set_books(self.books, keep_checks=False)
         self._clear_selected_book()
@@ -3976,7 +4001,6 @@ class BookCatalogApp(tk.Tk):
             message = f"{message} {extra}"
         if cleanup.removed:
             message = f"{message} {cleanup.summary()}"
-            self.after(400, lambda report=cleanup: self._show_stats_report("Duplicate cleanup", report.report_text()))
         self._set_status(message)
         self._refresh_list_status()
 
@@ -4449,11 +4473,11 @@ class BookCatalogApp(tk.Tk):
             return
         self._live_latest = text
         ephemeral = slot_for(text) in {"check", "pages", "fill"}
+        try:
+            self._activity.log(text)
+        except Exception:
+            pass
         if not ephemeral:
-            try:
-                self._activity.log(text)
-            except Exception:
-                pass
             self._ui_queue.put(("status", text))
         if not self._live_queued:
             self._live_queued = True
@@ -4462,8 +4486,7 @@ class BookCatalogApp(tk.Tk):
     def show_activity_log(self) -> None:
         if self._log_popup is not None:
             try:
-                self._log_popup.lift()
-                self._log_popup.focus_force()
+                self._raise_window(self._log_popup)
                 self._lift_log_live()
                 self._reload_log_list(keep_selection=True)
                 return
@@ -4497,11 +4520,29 @@ class BookCatalogApp(tk.Tk):
         self._log_list = listbox
         ttk.Label(right, text="Log").pack(anchor="w")
         view = tk.Text(right, font=("Consolas", 10), wrap="word", state="disabled")
-        text_scroll = ttk.Scrollbar(right, orient="vertical", command=view.yview)
-        view.configure(yscrollcommand=text_scroll.set)
+        text_scroll = ttk.Scrollbar(right, orient="vertical")
+        view.configure(yscrollcommand=lambda first, last, bar=text_scroll: bar.set(first, last))
+        text_scroll.configure(command=lambda *args: self._queue_log_scroll(lambda a=args: view.yview(*a)))
         view.pack(side="left", fill="both", expand=True)
         text_scroll.pack(side="right", fill="y")
         self._log_view = view
+        self._log_rendered = ""
+
+        def on_wheel(event: tk.Event, widget: tk.Text = view) -> str:
+            delta = int(getattr(event, "delta", 0) or 0)
+            number = int(getattr(event, "num", 0) or 0)
+            if delta > 0 or number == 4:
+                steps = -1
+            elif delta < 0 or number == 5:
+                steps = 1
+            else:
+                return "break"
+            self._queue_log_scroll(lambda n=steps, w=widget: w.yview_scroll(n, "units"))
+            return "break"
+
+        view.bind("<MouseWheel>", on_wheel)
+        view.bind("<Button-4>", on_wheel)
+        view.bind("<Button-5>", on_wheel)
 
         def on_select(_event=None) -> None:
             selection = listbox.curselection()
@@ -4517,10 +4558,12 @@ class BookCatalogApp(tk.Tk):
 
         def close() -> None:
             self._stop_log_refresh()
+            self._cancel_log_scroll()
             self._close_log_live()
             self._log_popup = None
             self._log_list = None
             self._log_view = None
+            self._log_rendered = ""
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", close)
@@ -4532,6 +4575,29 @@ class BookCatalogApp(tk.Tk):
         self._reload_log_list()
         self._start_log_refresh()
         self.after_idle(self._sync_log_live_geom)
+        self._raise_window(win)
+
+    def _raise_window(self, win: tk.Misc) -> None:
+        try:
+            if not win.winfo_exists():
+                return
+            win.lift()
+            win.focus_force()
+        except tk.TclError:
+            return
+        try:
+            win.attributes("-topmost", True)
+            win.after(250, lambda widget=win: self._drop_topmost(widget))
+        except tk.TclError:
+            pass
+
+    def _drop_topmost(self, win: tk.Misc) -> None:
+        try:
+            if win.winfo_exists():
+                win.attributes("-topmost", False)
+                win.lift()
+        except tk.TclError:
+            pass
 
     def _open_log_live(self, log_win: tk.Toplevel) -> None:
         self._close_log_live()
@@ -4732,29 +4798,106 @@ class BookCatalogApp(tk.Tk):
         # the bottom after the user has scrolled away from the start.
         following = at_end and first > 0.01
         stick = following and not first_show
+        if first_show:
+            self._log_rendered = ""
         self._set_log_view(
             self._activity.render_run(run_id),
             stick_to_end=stick,
             restore_top=None if stick or first_show else first,
         )
 
+    def _log_top_line(self, view: tk.Text) -> int:
+        try:
+            return max(1, int(str(view.index("@0,0")).split(".", 1)[0]))
+        except (tk.TclError, ValueError):
+            return 1
+
+    def _queue_log_scroll(self, action) -> None:
+        """Remember only the newest scroll. Skip any scroll still waiting to run."""
+        self._log_scroll_pending = action
+        if self._log_scroll_job is not None or self._log_scroll_suppress:
+            return
+        view = self._log_view
+        if view is None:
+            self._log_scroll_pending = None
+            return
+        try:
+            self._log_scroll_job = view.after_idle(self._run_log_scroll)
+        except tk.TclError:
+            self._log_scroll_job = None
+            self._log_scroll_pending = None
+
+    def _run_log_scroll(self) -> None:
+        self._log_scroll_job = None
+        action = self._log_scroll_pending
+        self._log_scroll_pending = None
+        view = self._log_view
+        if action is None or view is None:
+            return
+        self._log_scroll_suppress += 1
+        try:
+            action()
+        except tk.TclError:
+            pass
+        finally:
+            self._log_scroll_suppress -= 1
+        if self._log_scroll_pending is not None and self._log_view is not None:
+            try:
+                self._log_scroll_job = self._log_view.after_idle(self._run_log_scroll)
+            except tk.TclError:
+                self._log_scroll_job = None
+                self._log_scroll_pending = None
+
+    def _cancel_log_scroll(self) -> None:
+        job = self._log_scroll_job
+        self._log_scroll_job = None
+        self._log_scroll_pending = None
+        view = self._log_view
+        if job and view is not None:
+            try:
+                view.after_cancel(job)
+            except tk.TclError:
+                pass
+
     def _set_log_view(self, text: str, *, stick_to_end: bool = False, restore_top: float | None = None) -> None:
         view = self._log_view
         if view is None:
             return
-        view.configure(state="normal")
-        view.delete("1.0", "end")
-        view.insert("1.0", text)
-        view.configure(state="disabled")
+        if text == self._log_rendered:
+            return
+        top_line = self._log_top_line(view)
+        bar_cmd = ""
+        try:
+            bar_cmd = str(view.cget("yscrollcommand") or "")
+        except tk.TclError:
+            bar_cmd = ""
+        self._log_scroll_suppress += 1
+        try:
+            view.configure(state="normal", yscrollcommand="")
+            view.delete("1.0", "end")
+            view.insert("1.0", text)
+            view.configure(state="disabled")
+            if bar_cmd:
+                view.configure(yscrollcommand=bar_cmd)
+        except tk.TclError:
+            return
+        finally:
+            self._log_scroll_suppress -= 1
+        self._log_rendered = text
         if stick_to_end:
-            view.see("end")
+            self._queue_log_scroll(lambda widget=view: widget.see("end"))
         elif restore_top is not None:
-            try:
-                view.yview_moveto(max(0.0, min(1.0, float(restore_top))))
-            except (tk.TclError, TypeError, ValueError):
-                view.yview_moveto(0.0)
+            self._queue_log_scroll(lambda widget=view, line=top_line: self._scroll_log_to_line(widget, line))
         else:
-            view.yview_moveto(0.0)
+            self._queue_log_scroll(lambda widget=view: widget.yview_moveto(0.0))
+
+    def _scroll_log_to_line(self, view: tk.Text, line: int) -> None:
+        try:
+            end_line = int(str(view.index("end-1c")).split(".", 1)[0])
+        except (tk.TclError, ValueError):
+            return
+        target = min(max(1, int(line)), max(1, end_line))
+        view.yview(f"{target}.0")
 
     def _start_log_refresh(self) -> None:
         self._stop_log_refresh()
@@ -4894,6 +5037,8 @@ class BookCatalogApp(tk.Tk):
                 continue
             if kind == "live":
                 latest_live = self._live_latest or str(payload or "")
+                if self._deep_running and latest_live:
+                    self._show_deep_activity(str(latest_live))
                 continue
             processed += 1
             if kind == "status":
@@ -5073,6 +5218,205 @@ class BookCatalogApp(tk.Tk):
                 ]
             )
         return "\n".join(lines)
+
+    def _dedupe_books_with_feedback(self, books: list[Book]) -> DedupeReport:
+        """Check for duplicate rows, and tell the user while a long check is running."""
+        if len(books) < 2:
+            return dedupe_book_list(books)
+        progress_q: queue.Queue = queue.Queue()
+        holder: dict = {"report": None, "error": None}
+
+        def worker() -> None:
+            try:
+                holder["report"] = dedupe_book_list(books, on_progress=progress_q.put)
+            except Exception as exc:
+                holder["error"] = exc
+            progress_q.put(None)
+
+        popup = None
+        pending: list[str] = []
+        started = time.monotonic()
+        done = tk.BooleanVar(master=self, value=False)
+        show_now = len(books) >= 40
+
+        def mark_done() -> None:
+            if not bool(done.get()):
+                done.set(True)
+
+        def ensure_popup():
+            nonlocal popup
+            if popup is not None:
+                return popup
+            popup = self._open_duplicate_cleanup_dialog()
+            self._begin_work("Working…")
+            for line in pending:
+                popup["add"](line)
+            pending.clear()
+            return popup
+
+        def finish() -> None:
+            error = holder["error"]
+            report = holder["report"]
+            if error is not None:
+                if popup is not None:
+                    popup["show_result"](f"Duplicate cleanup stopped.\n\n{error}", on_ok=mark_done)
+                    self._end_work("failed")
+                    return
+                self._idle_work_indicator()
+                messagebox.showerror("Duplicate cleanup", str(error))
+                mark_done()
+                return
+            if report is not None and report.removed:
+                dialog = ensure_popup()
+                dialog["show_result"](report.report_text(), on_ok=mark_done)
+                self._end_work("done")
+                self.update_idletasks()
+                return
+            if popup is not None:
+                popup["close"]()
+                self._idle_work_indicator()
+            mark_done()
+
+        def pump() -> None:
+            finished = False
+            while True:
+                try:
+                    item = progress_q.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    finished = True
+                    break
+                text = str(item)
+                if popup is None:
+                    pending.append(text)
+                else:
+                    popup["add"](text)
+            if finished:
+                finish()
+                return
+            if popup is None and (show_now or time.monotonic() - started >= 0.3):
+                ensure_popup()
+            self.after(40, pump)
+
+        if show_now:
+            try:
+                self.update()
+            except tk.TclError:
+                pass
+            ensure_popup()
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(40, pump)
+        self.wait_variable(done)
+        report = holder["report"]
+        if not isinstance(report, DedupeReport):
+            return DedupeReport(started_with=len(books), ended_with=len(books))
+        return report
+
+    def _open_duplicate_cleanup_dialog(self) -> dict:
+        win = tk.Toplevel(self)
+        win.title("Duplicate cleanup")
+        win.configure(bg=BG)
+        win.geometry("560x380")
+        win.minsize(420, 260)
+        win.transient(self)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        intro = tk.StringVar(
+            value=(
+                "Checking this list for duplicate books. "
+                "Details will fill in here while the duplicate check runs."
+            )
+        )
+        ttk.Label(frame, textvariable=intro, wraplength=520, justify="left").grid(row=0, column=0, sticky="ew")
+        status = tk.StringVar(value="Working…")
+        ttk.Label(frame, textvariable=status, font=("Segoe UI", 11, "bold")).grid(
+            row=1, column=0, sticky="w", pady=(8, 6)
+        )
+        view = tk.Text(frame, wrap="word", font=("Segoe UI", 10), padx=8, pady=8)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=view.yview)
+        view.configure(yscrollcommand=scroll.set)
+        view.grid(row=2, column=0, sticky="nsew")
+        scroll.grid(row=2, column=1, sticky="ns")
+        view.insert("1.0", "Working…\n")
+
+        def keep_readable(event: tk.Event) -> str | None:
+            if int(getattr(event, "state", 0) or 0) & 0x4 and str(event.keysym).lower() in {"c", "a"}:
+                return None
+            return "break"
+
+        view.bind("<Key>", keep_readable)
+        closed = {"value": False}
+        finished = {"value": False}
+        ok_callback = {"fn": None}
+
+        def close() -> None:
+            if closed["value"]:
+                return
+            if not finished["value"]:
+                return
+            closed["value"] = True
+            callback = ok_callback["fn"]
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self._idle_work_indicator()
+            if callback is not None:
+                callback()
+
+        def dismiss() -> None:
+            if closed["value"]:
+                return
+            closed["value"] = True
+            finished["value"] = True
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        def add(line: str) -> None:
+            if closed["value"] or finished["value"]:
+                return
+            view.insert("end", line + "\n")
+            view.see("end")
+
+        def show_result(body: str, on_ok=None) -> None:
+            finished["value"] = True
+            ok_callback["fn"] = on_ok
+            intro.set("Duplicate cleanup finished.")
+            status.set("Done")
+            view.delete("1.0", "end")
+            view.insert("1.0", body)
+            view.see("1.0")
+            ok_btn.configure(state="normal")
+            win.protocol("WM_DELETE_WINDOW", close)
+
+        ok_btn = ttk.Button(frame, text="OK", command=close, state="disabled")
+        ok_btn.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.update_idletasks()
+        width, height = 560, 380
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        win.focus_force()
+        return {"add": add, "show_result": show_result, "close": dismiss}
 
     def _show_stats_report(self, title: str, body: str) -> None:
         win = tk.Toplevel(self)
@@ -5665,6 +6009,12 @@ class BookCatalogApp(tk.Tk):
         self._deep_stop_btn.pack(side="left", padx=(8, 0))
         self._deep_skip_btn = ttk.Button(buttons, text="Skip", command=self.skip_current, state="disabled")
         self._deep_skip_btn.pack(side="left", padx=(8, 0))
+        deep_log_btn = ttk.Button(buttons, text="Show log", command=self.show_activity_log)
+        deep_log_btn.pack(side="left", padx=(8, 0))
+        self._callout(
+            deep_log_btn,
+            "Open the search log above this window. Use it while Deep search is running to see what it is doing between publishers.",
+        )
         ttk.Button(buttons, text="Add website…", command=self._deep_open_selected_site).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Close", command=self._close_deep_search).pack(side="right")
         self._callout(
@@ -6159,11 +6509,33 @@ class BookCatalogApp(tk.Tk):
             except tk.TclError:
                 pass
         if (payload or {}).get("refresh"):
+            label = str((row or {}).get("name") or "this publisher")
+            self._deep_status.set(f"Updating the book list after {label}…")
             self._prepare_books(self.books)
             self._persist_working()
             self.table.set_books(self.books, keep_checks=True)
             if self._selected_book:
                 self.show_book(self._selected_book)
+
+    def _show_deep_activity(self, text: str) -> None:
+        line = str(text or "").strip()
+        if not line or not self._deep_running:
+            return
+        self._deep_status.set(line)
+        row = next((item for item in self._deep_rows if str(item.get("tag") or "") == "running"), None)
+        if row is None:
+            return
+        short = line if len(line) <= 220 else line[:217] + "…"
+        if short == str(row.get("comment") or ""):
+            return
+        self._on_deep_row(
+            {
+                "iid": str(row.get("iid") or ""),
+                "used": str(row.get("used_label") or "Yes"),
+                "comment": short,
+                "tag": "running",
+            }
+        )
 
     def _finish_deep_search(self, payload: dict | None) -> None:
         self._deep_running = False
@@ -6180,32 +6552,32 @@ class BookCatalogApp(tk.Tk):
         sites = int(data.get("sites") or 0)
         if error:
             summary = f"Deep search failed. {error}"
-            self._end_work("failed")
             outcome = "failed"
         elif cancelled:
             summary = (
                 f"Deep search stopped after {sites} publisher site(s). "
                 f"Found {found} books. Updated {updated}."
             )
-            self._end_work("stopped")
             outcome = "stopped"
         else:
             summary = (
                 f"Deep search finished. {sites} publisher site(s). "
                 f"Found {found} books. Updated {updated}."
             )
-            self._end_work("done")
             outcome = "done"
-        self._deep_status.set(summary)
-        self._set_status(summary)
-        self._activity.finish(outcome, summary)
-        self._prepare_books(self.books)
-        self._persist_working()
-        if self._list_has_name() and not self._list_locked:
-            self._remember_named_list()
-        self.table.set_books(self.books, keep_checks=True)
-        if self._selected_book:
-            self.show_book(self._selected_book)
+        try:
+            self._deep_status.set(summary)
+            self._set_status(summary)
+            self._activity.finish(outcome, summary)
+            self._prepare_books(self.books)
+            self._persist_working()
+            if self._list_has_name() and not self._list_locked:
+                self._remember_named_list()
+            self.table.set_books(self.books, keep_checks=True)
+            if self._selected_book:
+                self.show_book(self._selected_book)
+        finally:
+            self._idle_work_indicator()
 
     def _run_publisher_lookup(self, books: list[Book], selected: Book | None, publisher: str) -> None:
         crawler = BookCrawler(
@@ -7653,11 +8025,7 @@ class BookCatalogApp(tk.Tk):
         self._set_progress_busy()
 
     def _end_work(self, outcome: str = "") -> None:
-        try:
-            self.progress.stop()
-        except tk.TclError:
-            pass
-        self._progress_determinate = True
+        self._stop_progress_bar()
         if outcome == "done":
             self.progress.configure(mode="determinate", maximum=100, value=100)
             self.work_hint.set("Done")
@@ -7670,6 +8038,31 @@ class BookCatalogApp(tk.Tk):
         else:
             self.progress.configure(mode="determinate", maximum=100, value=0)
             self.work_hint.set("")
+
+    def _idle_work_indicator(self) -> None:
+        """Clear the footer progress bar once a run is finished and the UI is idle."""
+        self._stop_progress_bar()
+        try:
+            self.progress.configure(mode="determinate", maximum=100, value=0)
+        except tk.TclError:
+            pass
+        self.work_hint.set("")
+        for widget in (self, self._deep_popup):
+            if widget is None:
+                continue
+            try:
+                widget.configure(cursor="")
+            except tk.TclError:
+                pass
+
+    def _stop_progress_bar(self) -> None:
+        self._progress_determinate = True
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress.stop()
+        except tk.TclError:
+            pass
 
     def _set_progress_busy(self) -> None:
         if (not self._progress_determinate) and str(self.progress.cget("mode")) == "indeterminate":

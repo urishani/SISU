@@ -1906,7 +1906,27 @@ def _created_rank(book: Book, index: int) -> tuple[int, str, int]:
     return (1, "", index)
 
 
-def _duplicate_index_groups(books: list[Book]) -> list[list[int]]:
+def _dedupe_note(on_progress: ProgressFn | None, line: str) -> None:
+    if on_progress is None:
+        return
+    on_progress(line)
+
+
+def _dedupe_step(on_progress: ProgressFn | None, phase: str, index: int, total: int, book: Book) -> None:
+    if on_progress is None or total <= 0:
+        return
+    if index % 20 != 0 and index + 1 != total:
+        return
+    title = (book.display_title() or "").replace("\n", " ").strip()
+    if len(title) > 90:
+        title = title[:89] + "…"
+    line = f"{phase} {index + 1:,} of {total:,}"
+    if title:
+        line = f"{line} — {title}"
+    on_progress(line)
+
+
+def _duplicate_index_groups(books: list[Book], on_progress: ProgressFn | None = None) -> list[list[int]]:
     n = len(books)
     parent = list(range(n))
     rank = [0] * n
@@ -1931,6 +1951,7 @@ def _duplicate_index_groups(books: list[Book]) -> list[list[int]]:
 
     buckets: dict[str, list[int]] = {}
     for i, book in enumerate(books):
+        _dedupe_step(on_progress, "Checking", i, n, book)
         keys = identity_keys(book)
         url = (book.url or "").strip()
         if url:
@@ -1943,6 +1964,7 @@ def _duplicate_index_groups(books: list[Book]) -> list[list[int]]:
 
     by_token: dict[str, list[int]] = {}
     for i, book in enumerate(books):
+        _dedupe_step(on_progress, "Comparing similar titles", i, n, book)
         name = normalize_name(book.title)
         token = name.split()[0] if name else ""
         if not token:
@@ -1963,17 +1985,29 @@ def _duplicate_index_groups(books: list[Book]) -> list[list[int]]:
     return [indexes for indexes in groups.values() if len(indexes) > 1]
 
 
-def dedupe_book_list(books: list[Book]) -> DedupeReport:
+def dedupe_book_list(books: list[Book], on_progress: ProgressFn | None = None) -> DedupeReport:
     """Keep the earliest book in each duplicate group and merge later copies into it."""
     report = DedupeReport(started_with=len(books), ended_with=len(books))
     if len(books) < 2:
         return report
-    groups = _duplicate_index_groups(books)
+    _dedupe_note(on_progress, f"Checking {len(books):,} book(s) for duplicate rows")
+    groups = _duplicate_index_groups(books, on_progress)
     if not groups:
+        _dedupe_note(on_progress, "No duplicate rows on this list.")
         return report
+    _dedupe_note(on_progress, f"Merging {len(groups):,} duplicate group(s)")
     drop: set[int] = set()
     modified_ids: set[int] = set()
-    for indexes in groups:
+    for group_index, indexes in enumerate(groups):
+        if on_progress is not None and (group_index % 10 == 0 or group_index + 1 == len(groups)):
+            keeper = books[indexes[0]]
+            title = (keeper.display_title() or "").replace("\n", " ").strip()
+            if len(title) > 90:
+                title = title[:89] + "…"
+            line = f"Merging group {group_index + 1:,} of {len(groups):,}"
+            if title:
+                line = f"{line} — {title}"
+            on_progress(line)
         ranked = sorted(indexes, key=lambda i: _created_rank(books[i], i))
         keeper_index = ranked[0]
         keeper = books[keeper_index]

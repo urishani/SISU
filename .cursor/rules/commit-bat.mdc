@@ -1,0 +1,21 @@
+---
+description: Commit and push SISU with python/commit.bat so the version number updates
+alwaysApply: true
+---
+
+# Commits use commit.bat
+
+When the user asks to commit, or to commit and push, run `python/commit.bat`. Do not call `git add` / `git commit` / `git push` yourself. The script bumps `python/version.json` before it commits.
+
+- Commit only: `commit.bat "description"`
+- Commit and push: `commit.bat -p "description"`
+
+Run it from `python/` (the script switches to its own folder and expects `app.py` there). Pass one description string. The script then asks `Final commit message [Enter keeps draft]:`. Send a blank line so that draft is accepted as-is.
+
+```powershell
+cmd /c "echo.| commit.bat -p `"Short description of why this changed`""
+```
+
+Working directory: the repo's `python` folder.
+
+Still check status and diff before choosing the description. Do not commit secrets. Do not force-push. Do not skip hooks.
